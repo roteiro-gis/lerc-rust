@@ -13,3 +13,4 @@ categories = ["compression", "science"]
 
 [dependencies]
 lerc-core = { version = "0.1.0", path = "../lerc-core" }
+ndarray = { workspace = true }
