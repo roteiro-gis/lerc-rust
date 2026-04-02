@@ -1,63 +1,92 @@
 # lerc-rust
 
-`lerc-rust` is a pure-Rust implementation of the LERC raster codec.
+Pure-Rust LERC decoding for raster and elevation data. No C/C++ FFI, no build
+scripts, and a decoder-first API designed to be reused by container crates such
+as `geotiff-rust`.
 
-This crate is intended to be the Rust counterpart to Esri's LERC repository,
-with a Rust-native API and no C or C++ FFI layer.
+## Crates
 
-Workspace layout:
+| Crate | Description |
+|---|---|
+| `lerc-core` | Shared types and errors for LERC blobs, decoded pixels, masks, and ndarray conversion |
+| `lerc-reader` | Pure-Rust LERC inspection and decode paths for Lerc1 and Lerc2 blobs |
 
-- `lerc-core`: shared types and errors
-- `lerc-reader`: pure-Rust LERC inspection and decode paths
+## Usage
 
-Design goals:
+```rust
+use lerc_reader::{decode_ndarray, decode_mask_ndarray, get_blob_info};
 
-- no FFI, no generated bindings, no C++ dependency
-- stable shared metadata and pixel buffer types in `lerc-core`
-- decoder-first architecture in `lerc-reader`
-- first-class `ndarray::ArrayD` integration for downstream engines
-- clean separation so container crates such as `geotiff-rust` depend on this
-  workspace instead of embedding codec logic
+let blob = std::fs::read("elevation.lerc2")?;
+let info = get_blob_info(&blob)?;
+println!(
+    "version={:?} size={}x{} depth={} dtype={:?}",
+    info.version, info.width, info.height, info.depth, info.data_type
+);
 
-Implemented in `lerc-reader` today:
+let raster: ndarray::ArrayD<f32> = decode_ndarray(&blob)?;
+let mask = decode_mask_ndarray(&blob)?;
+println!("shape={:?} has_mask={}", raster.shape(), mask.is_some());
+```
 
-- Lerc1 header parsing
-- Lerc1 mask decoding
-- Lerc1 tiled block decode
-- Lerc1 shared-mask concatenated band counting
-- concatenated Lerc1 band-set decode
-- Lerc2 header parsing
-- concatenated Lerc2 band counting
-- pure-Rust Fletcher32 checksum verification
-- Lerc2 mask decoding
-- Lerc2 constant-surface decode
-- Lerc2 one-sweep raw decode
-- Lerc2 tiled decode
-- Lerc2 bit-stuffed block decode
-- Lerc2 Huffman decode
-- concatenated Lerc2 band-set decode, including shared-mask multi-band blobs
-- public inspection and decode entry points for native and `f64` output buffers
-- direct decode helpers into `ndarray::ArrayD`
-- direct decode helpers into bands-last multi-band `ndarray::ArrayD`
-- shape helpers for raster and mask arrays
+Concatenated band sets decode to bands-last arrays:
 
-Verified coverage:
+```rust
+let rgb: ndarray::ArrayD<u8> = lerc_reader::decode_band_set_ndarray(&blob)?;
+assert_eq!(rgb.shape(), &[height, width, bands]);
+```
 
-- synthetic unit fixtures for Lerc1 bit-stuffed blocks and shared-mask
-  concatenated bands
-- synthetic unit fixtures for constant, one-sweep, concatenated-band, and
-  per-depth-range cases
-- ndarray conversion tests for 2D rasters, 3D rasters, and masks
-- official Esri `testData` fixtures for `world.lerc1`,
-  `california_400_400_1_float.lerc2`, and
-  `bluemarble_256_256_3_byte.lerc2`
-- an interoperability fixture from Esri's JavaScript sanity test exercising a
-  real upstream multi-depth Lerc2 blob
+## Supported Now
 
-The crate is designed so those remaining decode paths can be added without
-breaking the public metadata or pixel-buffer APIs.
+- Lerc1 header parsing, mask decoding, tiled block decode, and concatenated
+  shared-mask band sets
+- Lerc2 header parsing, Fletcher32 verification, mask decoding, constant/raw,
+  tiled, bit-stuffed, and Huffman decode paths
+- Native typed decode and type-promoting `f64` decode
+- Direct `ndarray::ArrayD` conversion for rasters, band sets, and masks
+- Shape helpers and shared metadata types in `lerc-core`
 
-Planned next:
+## Testing
 
-- additional interoperability fixtures covering more tiled and masked blobs
-- writer support in a future `lerc-writer` crate
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Interop fixtures are vendored under
+[`testdata/interoperability`](testdata/interoperability/README.md). The default
+test suite covers:
+
+- synthetic decoder-path unit tests embedded in `lerc-reader`
+- official Esri fixtures for Lerc1, masked Lerc2, and concatenated multi-band
+  Lerc2
+- an Esri JavaScript sanity fixture for `depth > 1`
+
+Reference-library parity tests compare `lerc-reader` against Esri's official
+`libLerc` decoder when a compiled helper path is configured; otherwise they
+self-skip:
+
+```sh
+LERC_READER_REFERENCE_HELPER="$(./scripts/build-reference-helper.sh)" \
+  cargo test -p lerc-reader --test reference_parity
+```
+
+For a reproducible reference environment, run the Docker harness:
+
+```sh
+./scripts/run-reference-parity.sh
+```
+
+Criterion comparison benches against `libLerc` live in
+`lerc-reader/benches/reference_compare_bench.rs`:
+
+```sh
+./scripts/run-reference-benchmarks.sh
+```
+
+For methodology and current benchmark notes, see
+[docs/benchmark-report.md](docs/benchmark-report.md).
+
+## License
+
+MIT OR Apache-2.0

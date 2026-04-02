@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "../README.md"
+documentation = "https://docs.rs/lerc-core"
 keywords = ["lerc", "raster", "compression", "gis", "geospatial"]
 categories = ["compression", "science"]
 
