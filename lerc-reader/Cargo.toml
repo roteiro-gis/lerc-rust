@@ -1,0 +1,15 @@
+[package]
+name = "lerc-reader"
+description = "Pure-Rust decoder for the LERC raster compression format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+keywords = ["lerc", "raster", "compression", "gis", "geospatial"]
+categories = ["compression", "science"]
+
+[dependencies]
+lerc-core = { version = "0.1.0", path = "../lerc-core" }
