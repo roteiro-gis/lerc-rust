@@ -7,13 +7,17 @@
 //! - count concatenated blobs with [`get_band_count`]
 //! - decode native pixel buffers with [`decode`]
 //! - decode promoted `f64` buffers with [`decode_to_f64`]
+//! - decode directly into `ndarray::ArrayD` with [`decode_ndarray`]
 
 mod io;
 
 use std::cmp;
 
 use io::Cursor;
-use lerc_core::{BlobInfo, DataType, Decoded, DecodedF64, Error, PixelData, Result, Version};
+use lerc_core::{
+    BlobInfo, DataType, Decoded, DecodedF64, Error, NdArrayElement, PixelData, Result, Version,
+};
+use ndarray::ArrayD;
 
 const MAGIC_LERC1_PREFIX: &[u8; 9] = b"CntZImage";
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
@@ -193,6 +197,18 @@ pub fn decode_to_f64(blob: &[u8]) -> Result<DecodedF64> {
         pixels: decoded.pixels.to_f64(),
         mask: decoded.mask,
     })
+}
+
+pub fn decode_ndarray<T: NdArrayElement>(blob: &[u8]) -> Result<ArrayD<T>> {
+    decode(blob)?.into_ndarray()
+}
+
+pub fn decode_ndarray_f64(blob: &[u8]) -> Result<ArrayD<f64>> {
+    decode_to_f64(blob)?.into_ndarray()
+}
+
+pub fn decode_mask_ndarray(blob: &[u8]) -> Result<Option<ArrayD<u8>>> {
+    decode(blob)?.into_mask_ndarray()
 }
 
 fn parse_lerc1(blob: &[u8], shared_mask: Option<&Option<Vec<u8>>>) -> Result<Lerc1Blob> {
@@ -1891,6 +1907,7 @@ fn fletcher32(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::IxDyn;
 
     fn build_header_v2(
         width: u32,
@@ -2120,5 +2137,63 @@ mod tests {
         merged.extend_from_slice(&blob2);
 
         assert_eq!(get_band_count(&merged).unwrap(), 2);
+    }
+
+    #[test]
+    fn decodes_lerc2_to_ndarray() {
+        let mut blob = build_header_v2(2, 2, 4, 1, 0.0, 1.0, 4.0, 1 + 4);
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.push(1);
+        blob.extend_from_slice(&[1, 2, 3, 4]);
+
+        let array = decode_ndarray::<u8>(&blob).unwrap();
+        assert_eq!(array.shape(), &[2, 2]);
+        assert_eq!(array[IxDyn(&[0, 0])], 1);
+        assert_eq!(array[IxDyn(&[0, 1])], 2);
+        assert_eq!(array[IxDyn(&[1, 0])], 3);
+        assert_eq!(array[IxDyn(&[1, 1])], 4);
+    }
+
+    #[test]
+    fn decodes_multidimensional_lerc2_to_f64_ndarray() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC_LERC2);
+        bytes.extend_from_slice(&4i32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&8i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&6i32.to_le_bytes());
+        bytes.extend_from_slice(&0.0f64.to_le_bytes());
+        bytes.extend_from_slice(&10.0f64.to_le_bytes());
+        bytes.extend_from_slice(&20.0f64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&10.0f32.to_le_bytes());
+        bytes.extend_from_slice(&20.0f32.to_le_bytes());
+        bytes.extend_from_slice(&10.0f32.to_le_bytes());
+        bytes.extend_from_slice(&20.0f32.to_le_bytes());
+
+        let blob = finalize_v4_with_checksum(bytes);
+        let array = decode_ndarray_f64(&blob).unwrap();
+        assert_eq!(array.shape(), &[1, 2, 2]);
+        assert_eq!(array[IxDyn(&[0, 0, 0])], 10.0);
+        assert_eq!(array[IxDyn(&[0, 0, 1])], 20.0);
+        assert_eq!(array[IxDyn(&[0, 1, 0])], 10.0);
+        assert_eq!(array[IxDyn(&[0, 1, 1])], 20.0);
+    }
+
+    #[test]
+    fn decodes_lerc1_mask_to_ndarray() {
+        let blob = build_lerc1_blob(true, Some(&[1, 0, 1, 1]), &[1.0, 3.0, 4.0], 0.5, 4.0);
+
+        let mask = decode_mask_ndarray(&blob).unwrap().unwrap();
+        assert_eq!(mask.shape(), &[2, 2]);
+        assert_eq!(mask[IxDyn(&[0, 0])], 1);
+        assert_eq!(mask[IxDyn(&[0, 1])], 0);
+        assert_eq!(mask[IxDyn(&[1, 0])], 1);
+        assert_eq!(mask[IxDyn(&[1, 1])], 1);
     }
 }

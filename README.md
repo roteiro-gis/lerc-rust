@@ -15,6 +15,7 @@ Design goals:
 - no FFI, no generated bindings, no C++ dependency
 - stable shared metadata and pixel buffer types in `lerc-core`
 - decoder-first architecture in `lerc-reader`
+- first-class `ndarray::ArrayD` integration for downstream engines
 - clean separation so container crates such as `geotiff-rust` depend on this
   workspace instead of embedding codec logic
 
@@ -34,6 +35,8 @@ Implemented in `lerc-reader` today:
 - Lerc2 bit-stuffed block decode
 - Lerc2 Huffman decode
 - public inspection and decode entry points for native and `f64` output buffers
+- direct decode helpers into `ndarray::ArrayD`
+- shape helpers for raster and mask arrays
 
 Verified coverage:
 
@@ -41,6 +44,7 @@ Verified coverage:
   concatenated bands
 - synthetic unit fixtures for constant, one-sweep, concatenated-band, and
   per-depth-range cases
+- ndarray conversion tests for 2D rasters, 3D rasters, and masks
 - an interoperability fixture from Esri's JavaScript sanity test exercising a
   real upstream Lerc2 blob
 

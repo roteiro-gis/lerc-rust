@@ -11,3 +11,4 @@ repository = "https://github.com/i-norden/lerc-rust"
 homepage = "https://github.com/i-norden/lerc-rust"
 
 [workspace.dependencies]
+ndarray = "0.17"

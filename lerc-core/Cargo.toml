@@ -12,3 +12,4 @@ keywords = ["lerc", "raster", "compression", "gis", "geospatial"]
 categories = ["compression", "science"]
 
 [dependencies]
+ndarray = { workspace = true }

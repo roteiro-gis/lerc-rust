@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use ndarray::{ArrayD, IxDyn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
@@ -48,6 +49,19 @@ impl DataType {
             Self::I16 | Self::U16 => 2,
             Self::I32 | Self::U32 | Self::F32 => 4,
             Self::F64 => 8,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::I8 => "i8",
+            Self::U8 => "u8",
+            Self::I16 => "i16",
+            Self::U16 => "u16",
+            Self::I32 => "i32",
+            Self::U32 => "u32",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
         }
     }
 }
@@ -107,6 +121,12 @@ impl PixelData {
             Self::F64(v) => v.clone(),
         }
     }
+
+    pub fn into_ndarray<T: NdArrayElement>(self, shape: &[usize]) -> Result<ArrayD<T>> {
+        ArrayD::from_shape_vec(IxDyn(shape), T::from_pixel_data(self)?).map_err(|e| {
+            Error::InvalidBlob(format!("failed to build ndarray from decoded pixels: {e}"))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +169,22 @@ impl BlobInfo {
             .checked_mul(self.depth as usize)
             .ok_or_else(|| Error::InvalidBlob("sample count overflows usize".into()))
     }
+
+    pub fn ndarray_shape(&self) -> Vec<usize> {
+        if self.depth <= 1 {
+            vec![self.height as usize, self.width as usize]
+        } else {
+            vec![
+                self.height as usize,
+                self.width as usize,
+                self.depth as usize,
+            ]
+        }
+    }
+
+    pub fn mask_ndarray_shape(&self) -> Vec<usize> {
+        vec![self.height as usize, self.width as usize]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,9 +194,81 @@ pub struct Decoded {
     pub mask: Option<Vec<u8>>,
 }
 
+impl Decoded {
+    pub fn into_ndarray<T: NdArrayElement>(self) -> Result<ArrayD<T>> {
+        let shape = self.info.ndarray_shape();
+        self.pixels.into_ndarray(&shape)
+    }
+
+    pub fn into_mask_ndarray(self) -> Result<Option<ArrayD<u8>>> {
+        let shape = self.info.mask_ndarray_shape();
+        self.mask
+            .map(|mask| {
+                ArrayD::from_shape_vec(IxDyn(&shape), mask).map_err(|e| {
+                    Error::InvalidBlob(format!("failed to build ndarray from decoded mask: {e}"))
+                })
+            })
+            .transpose()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedF64 {
     pub info: BlobInfo,
     pub pixels: Vec<f64>,
     pub mask: Option<Vec<u8>>,
+}
+
+impl DecodedF64 {
+    pub fn into_ndarray(self) -> Result<ArrayD<f64>> {
+        ArrayD::from_shape_vec(IxDyn(&self.info.ndarray_shape()), self.pixels).map_err(|e| {
+            Error::InvalidBlob(format!("failed to build ndarray from decoded pixels: {e}"))
+        })
+    }
+
+    pub fn into_mask_ndarray(self) -> Result<Option<ArrayD<u8>>> {
+        let shape = self.info.mask_ndarray_shape();
+        self.mask
+            .map(|mask| {
+                ArrayD::from_shape_vec(IxDyn(&shape), mask).map_err(|e| {
+                    Error::InvalidBlob(format!("failed to build ndarray from decoded mask: {e}"))
+                })
+            })
+            .transpose()
+    }
+}
+
+pub trait NdArrayElement: Sized {
+    fn from_pixel_data(pixels: PixelData) -> Result<Vec<Self>>;
+}
+
+macro_rules! impl_exact_ndarray_element {
+    ($ty:ty, $variant:ident, $name:literal) => {
+        impl NdArrayElement for $ty {
+            fn from_pixel_data(pixels: PixelData) -> Result<Vec<Self>> {
+                match pixels {
+                    PixelData::$variant(values) => Ok(values),
+                    other => Err(Error::InvalidBlob(format!(
+                        "cannot decode {} pixels into ndarray<{}>",
+                        other.data_type().name(),
+                        $name
+                    ))),
+                }
+            }
+        }
+    };
+}
+
+impl_exact_ndarray_element!(i8, I8, "i8");
+impl_exact_ndarray_element!(u8, U8, "u8");
+impl_exact_ndarray_element!(i16, I16, "i16");
+impl_exact_ndarray_element!(u16, U16, "u16");
+impl_exact_ndarray_element!(i32, I32, "i32");
+impl_exact_ndarray_element!(u32, U32, "u32");
+impl_exact_ndarray_element!(f32, F32, "f32");
+
+impl NdArrayElement for f64 {
+    fn from_pixel_data(pixels: PixelData) -> Result<Vec<Self>> {
+        Ok(pixels.to_f64())
+    }
 }
