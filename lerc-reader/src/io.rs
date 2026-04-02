@@ -48,6 +48,10 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_le_bytes(self.read_bytes(4)?.try_into().unwrap()))
     }
 
+    pub(crate) fn read_f32(&mut self) -> Result<f32> {
+        Ok(f32::from_le_bytes(self.read_bytes(4)?.try_into().unwrap()))
+    }
+
     pub(crate) fn read_i16(&mut self) -> Result<i16> {
         Ok(i16::from_le_bytes(self.read_bytes(2)?.try_into().unwrap()))
     }

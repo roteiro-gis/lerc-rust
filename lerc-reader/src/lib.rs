@@ -15,6 +15,7 @@ use std::cmp;
 use io::Cursor;
 use lerc_core::{BlobInfo, DataType, Decoded, DecodedF64, Error, PixelData, Result, Version};
 
+const MAGIC_LERC1_PREFIX: &[u8; 9] = b"CntZImage";
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
 const HUFFMAN_LUT_BITS_MAX: u8 = 12;
 
@@ -55,7 +56,59 @@ struct HuffmanStream<'a> {
     bit_pos: u8,
 }
 
+#[derive(Debug, Clone)]
+struct Lerc1PixelsHeader {
+    num_blocks_y: usize,
+    num_blocks_x: usize,
+    max_value: f32,
+}
+
+#[derive(Debug, Clone)]
+enum Lerc1Block {
+    Zero,
+    Constant(f32),
+    Raw(Vec<f32>),
+    Stuffed {
+        offset: f32,
+        bits_per_pixel: u8,
+        num_valid_pixels: usize,
+        stuffed_data: Vec<u32>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct Lerc1Blob {
+    info: BlobInfo,
+    mask: Option<Vec<u8>>,
+    pixels: Lerc1PixelsHeader,
+    blocks: Vec<Lerc1Block>,
+    actual_num_blocks_y: usize,
+    actual_num_blocks_x: usize,
+    base_block_height: usize,
+    base_block_width: usize,
+    eof_offset: usize,
+}
+
+fn is_lerc1(blob: &[u8]) -> bool {
+    blob.starts_with(MAGIC_LERC1_PREFIX)
+}
+
+fn is_lerc2(blob: &[u8]) -> bool {
+    blob.starts_with(MAGIC_LERC2)
+}
+
 pub fn get_blob_info(blob: &[u8]) -> Result<BlobInfo> {
+    if is_lerc1(blob) {
+        let mut parsed = parse_lerc1(blob, None)?;
+        if parsed.info.valid_pixel_count != 0 {
+            let pixels = decode_lerc1_pixels(&parsed)?;
+            let (z_min, z_max) = scan_range(&pixels, parsed.mask.as_deref())?;
+            parsed.info.z_min = z_min;
+            parsed.info.z_max = z_max;
+        }
+        return Ok(parsed.info);
+    }
+
     let (mut info, mut cursor) = parse_lerc2(blob)?;
     let _mask = read_mask(&mut cursor, &info)?;
     if should_read_depth_ranges(&info) {
@@ -69,32 +122,54 @@ pub fn get_blob_info(blob: &[u8]) -> Result<BlobInfo> {
 pub fn get_band_count(blob: &[u8]) -> Result<usize> {
     let mut offset = 0usize;
     let mut count = 0usize;
-    while blob.len().saturating_sub(offset) >= 58 {
-        let (info, _) = parse_lerc2(&blob[offset..])?;
+    let mut lerc1_mask: Option<Option<Vec<u8>>> = None;
+
+    while offset < blob.len() {
+        let slice = &blob[offset..];
+        let next_len = if is_lerc1(slice) {
+            let parsed = parse_lerc1(slice, lerc1_mask.as_ref())?;
+            lerc1_mask = Some(parsed.mask.clone());
+            parsed.eof_offset
+        } else if is_lerc2(slice) {
+            let (info, _) = parse_lerc2(slice)?;
+            lerc1_mask = None;
+            info.blob_size
+        } else {
+            return Err(Error::InvalidMagic);
+        };
+
         let next = offset
-            .checked_add(info.blob_size)
+            .checked_add(next_len)
             .ok_or_else(|| Error::InvalidBlob("band offset overflow".into()))?;
         if next <= offset || next > blob.len() {
             return Err(Error::InvalidBlob(
                 "invalid concatenated band blob size".into(),
             ));
         }
+
         offset = next;
         count += 1;
-        if offset == blob.len() {
-            return Ok(count);
-        }
     }
-    if offset == blob.len() {
-        Ok(count)
-    } else {
-        Err(Error::InvalidBlob(
-            "trailing bytes remain after counting LERC bands".into(),
-        ))
-    }
+
+    Ok(count)
 }
 
 pub fn decode(blob: &[u8]) -> Result<Decoded> {
+    if is_lerc1(blob) {
+        let mut parsed = parse_lerc1(blob, None)?;
+        let pixels = decode_lerc1_pixels(&parsed)?;
+        if parsed.info.valid_pixel_count != 0 {
+            let (z_min, z_max) = scan_range(&pixels, parsed.mask.as_deref())?;
+            parsed.info.z_min = z_min;
+            parsed.info.z_max = z_max;
+        }
+        return Ok(Decoded {
+            info: parsed.info,
+            pixels,
+            mask: parsed.mask,
+        });
+    }
+
     let (mut info, mut cursor) = parse_lerc2(blob)?;
     let mask = read_mask(&mut cursor, &info)?;
 
@@ -118,6 +193,335 @@ pub fn decode_to_f64(blob: &[u8]) -> Result<DecodedF64> {
         pixels: decoded.pixels.to_f64(),
         mask: decoded.mask,
     })
+}
+
+fn parse_lerc1(blob: &[u8], shared_mask: Option<&Option<Vec<u8>>>) -> Result<Lerc1Blob> {
+    let mut cursor = Cursor::new(blob);
+    let magic = cursor.read_bytes(10)?;
+    if !magic.starts_with(MAGIC_LERC1_PREFIX) {
+        return Err(Error::InvalidMagic);
+    }
+
+    let version = cursor.read_i32()?;
+    if version < 0 {
+        return Err(Error::UnsupportedVersion(version as u32));
+    }
+    let image_type = cursor.read_i32()?;
+    let height = cursor.read_u32()?;
+    let width = cursor.read_u32()?;
+    let max_z_error = cursor.read_f64()?;
+
+    let mask = if let Some(shared_mask) = shared_mask {
+        shared_mask.clone()
+    } else {
+        read_lerc1_mask(&mut cursor, width, height)?
+    };
+
+    let pixels_num_blocks_y = cursor.read_u32()? as usize;
+    let pixels_num_blocks_x = cursor.read_u32()? as usize;
+    let _pixels_num_bytes = cursor.read_u32()? as usize;
+    let pixels_max_value = cursor.read_f32()?;
+
+    if pixels_num_blocks_x == 0 || pixels_num_blocks_y == 0 {
+        return Err(Error::InvalidHeader("Lerc1 block grid must be non-zero"));
+    }
+
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let num_pixels = width_usize
+        .checked_mul(height_usize)
+        .ok_or_else(|| Error::InvalidBlob("pixel count overflows usize".into()))?;
+    let base_block_width = width_usize / pixels_num_blocks_x;
+    let base_block_height = height_usize / pixels_num_blocks_y;
+    let actual_num_blocks_x =
+        pixels_num_blocks_x + usize::from(width_usize % pixels_num_blocks_x != 0);
+    let actual_num_blocks_y =
+        pixels_num_blocks_y + usize::from(height_usize % pixels_num_blocks_y != 0);
+
+    let valid_pixel_count = match mask.as_deref() {
+        Some(mask) => mask.iter().map(|&value| u32::from(value != 0)).sum(),
+        None => num_pixels as u32,
+    };
+
+    let mut blocks = Vec::with_capacity(actual_num_blocks_x * actual_num_blocks_y);
+    for block_y in 0..actual_num_blocks_y {
+        let this_block_height =
+            if block_y + 1 == actual_num_blocks_y && height_usize % pixels_num_blocks_y != 0 {
+                height_usize % pixels_num_blocks_y
+            } else {
+                base_block_height
+            };
+        if this_block_height == 0 {
+            continue;
+        }
+        for block_x in 0..actual_num_blocks_x {
+            let this_block_width =
+                if block_x + 1 == actual_num_blocks_x && width_usize % pixels_num_blocks_x != 0 {
+                    width_usize % pixels_num_blocks_x
+                } else {
+                    base_block_width
+                };
+            if this_block_width == 0 {
+                continue;
+            }
+
+            let block_valid_pixels = if let Some(mask) = mask.as_deref() {
+                count_valid_in_block(
+                    mask,
+                    width_usize,
+                    block_x * base_block_width,
+                    block_y * base_block_height,
+                    this_block_width,
+                    this_block_height,
+                )
+            } else {
+                this_block_width * this_block_height
+            };
+
+            let header_byte = cursor.read_u8()?;
+            let encoding = header_byte & 63;
+            if encoding > 3 {
+                return Err(Error::InvalidBlob(format!(
+                    "invalid Lerc1 block encoding {encoding}"
+                )));
+            }
+            if encoding == 2 {
+                blocks.push(Lerc1Block::Zero);
+                continue;
+            }
+
+            let offset = if header_byte != 0 && header_byte != 2 {
+                Some(read_lerc1_offset(&mut cursor, header_byte >> 6)?)
+            } else {
+                None
+            };
+
+            if encoding == 3 {
+                blocks.push(Lerc1Block::Constant(offset.ok_or(Error::InvalidBlob(
+                    "Lerc1 constant block is missing its offset".into(),
+                ))?));
+                continue;
+            }
+
+            if encoding == 0 {
+                let byte_len = block_valid_pixels.checked_mul(4).ok_or_else(|| {
+                    Error::InvalidBlob("Lerc1 raw block byte count overflows usize".into())
+                })?;
+                let values = cursor
+                    .read_bytes(byte_len)?
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                blocks.push(Lerc1Block::Raw(values));
+                continue;
+            }
+
+            let packed_header = cursor.read_u8()?;
+            let bits_per_pixel = packed_header & 63;
+            let num_valid_pixels = match packed_header >> 6 {
+                0 => cursor.read_u32()? as usize,
+                1 => read_u16(cursor.read_bytes(2)?)? as usize,
+                2 => cursor.read_u8()? as usize,
+                other => {
+                    return Err(Error::InvalidBlob(format!(
+                        "invalid Lerc1 valid pixel count type {other}"
+                    )))
+                }
+            };
+            let data_bytes = (num_valid_pixels * usize::from(bits_per_pixel)).div_ceil(8);
+            let stuffed_data = words_from_padded(cursor.read_bytes(data_bytes)?);
+            blocks.push(Lerc1Block::Stuffed {
+                offset: offset.ok_or(Error::InvalidBlob(
+                    "Lerc1 bit-stuffed block is missing its offset".into(),
+                ))?,
+                bits_per_pixel,
+                num_valid_pixels,
+                stuffed_data,
+            });
+        }
+    }
+
+    let eof_offset = cursor.offset();
+    let info = BlobInfo {
+        version: Version::Lerc1(version as u32),
+        data_type: map_lerc1_data_type(image_type),
+        width,
+        height,
+        depth: 1,
+        min_values: None,
+        max_values: None,
+        valid_pixel_count,
+        micro_block_size: 0,
+        blob_size: eof_offset,
+        max_z_error,
+        z_min: 0.0,
+        z_max: pixels_max_value as f64,
+    };
+
+    Ok(Lerc1Blob {
+        info,
+        mask,
+        pixels: Lerc1PixelsHeader {
+            num_blocks_y: pixels_num_blocks_y,
+            num_blocks_x: pixels_num_blocks_x,
+            max_value: pixels_max_value,
+        },
+        blocks,
+        actual_num_blocks_y,
+        actual_num_blocks_x,
+        base_block_height,
+        base_block_width,
+        eof_offset,
+    })
+}
+
+fn map_lerc1_data_type(_image_type: i32) -> DataType {
+    DataType::F32
+}
+
+fn read_lerc1_offset(cursor: &mut Cursor<'_>, offset_type: u8) -> Result<f32> {
+    match offset_type {
+        0 => cursor.read_f32(),
+        1 => Ok(cursor.read_i16()? as f32),
+        2 => Ok(i8::from_le_bytes([cursor.read_u8()?]) as f32),
+        _ => Err(Error::InvalidBlob(format!(
+            "invalid Lerc1 block offset type {offset_type}"
+        ))),
+    }
+}
+
+fn read_lerc1_mask(cursor: &mut Cursor<'_>, width: u32, height: u32) -> Result<Option<Vec<u8>>> {
+    let num_blocks_y = cursor.read_u32()?;
+    let num_blocks_x = cursor.read_u32()?;
+    let num_bytes = cursor.read_u32()? as usize;
+    let max_value = cursor.read_f32()?;
+
+    let num_pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::InvalidBlob("pixel count overflows usize".into()))?;
+    let bitset_len = num_pixels.div_ceil(8);
+
+    if num_bytes > 0 {
+        let bitset = decode_mask_rle(cursor.read_bytes(num_bytes)?, bitset_len)?;
+        return Ok(Some(unpack_mask_bitset(&bitset, num_pixels)));
+    }
+
+    if num_blocks_y == 0 && num_blocks_x == 0 && max_value == 0.0 {
+        return Ok(Some(vec![0; num_pixels]));
+    }
+
+    Ok(None)
+}
+
+fn decode_lerc1_pixels(parsed: &Lerc1Blob) -> Result<PixelData> {
+    let width = parsed.info.width as usize;
+    let height = parsed.info.height as usize;
+    let mask = parsed.mask.as_deref();
+    let mut result = vec![0.0f32; width * height];
+    let mut block_buffer = vec![0.0f64; parsed.base_block_width * parsed.base_block_height];
+    let mut block_index = 0usize;
+
+    for block_y in 0..parsed.actual_num_blocks_y {
+        let this_block_height = if block_y + 1 == parsed.actual_num_blocks_y
+            && height % parsed.pixels.num_blocks_y != 0
+        {
+            height % parsed.pixels.num_blocks_y
+        } else {
+            parsed.base_block_height
+        };
+        if this_block_height == 0 {
+            continue;
+        }
+
+        for block_x in 0..parsed.actual_num_blocks_x {
+            let this_block_width = if block_x + 1 == parsed.actual_num_blocks_x
+                && width % parsed.pixels.num_blocks_x != 0
+            {
+                width % parsed.pixels.num_blocks_x
+            } else {
+                parsed.base_block_width
+            };
+            if this_block_width == 0 {
+                continue;
+            }
+
+            let block = &parsed.blocks[block_index];
+            block_index += 1;
+
+            let mut stuffed_values: Option<&[f64]> = None;
+            let (raw_values, constant_value) = match block {
+                Lerc1Block::Zero => (None, Some(0.0f32)),
+                Lerc1Block::Constant(value) => (None, Some(*value)),
+                Lerc1Block::Raw(values) => (Some(values.as_slice()), None),
+                Lerc1Block::Stuffed {
+                    offset,
+                    bits_per_pixel,
+                    num_valid_pixels,
+                    stuffed_data,
+                } => {
+                    if *num_valid_pixels > block_buffer.len() {
+                        return Err(Error::InvalidBlob(
+                            "Lerc1 stuffed block expands beyond its output buffer".into(),
+                        ));
+                    }
+                    block_buffer[..*num_valid_pixels].fill(0.0);
+                    unstuff_v2(
+                        stuffed_data,
+                        &mut block_buffer[..*num_valid_pixels],
+                        *bits_per_pixel,
+                        *num_valid_pixels,
+                        None,
+                        Some(*offset as f64),
+                        2.0 * parsed.info.max_z_error,
+                        parsed.pixels.max_value as f64,
+                    );
+                    stuffed_values = Some(&block_buffer[..*num_valid_pixels]);
+                    (None, None)
+                }
+            };
+
+            let mut value_index = 0usize;
+            for row in 0..this_block_height {
+                let pixel_row = block_y * parsed.base_block_height + row;
+                for col in 0..this_block_width {
+                    let pixel = pixel_row * width + block_x * parsed.base_block_width + col;
+                    if mask.map(|mask| mask[pixel] != 0).unwrap_or(true) {
+                        let value = if let Some(value) = constant_value {
+                            value
+                        } else if let Some(values) = raw_values {
+                            let value = values.get(value_index).copied().ok_or_else(|| {
+                                Error::InvalidBlob("Lerc1 raw block payload ended early".into())
+                            })?;
+                            value
+                        } else if let Some(values) = stuffed_values {
+                            values.get(value_index).copied().ok_or_else(|| {
+                                Error::InvalidBlob("Lerc1 stuffed block payload ended early".into())
+                            })? as f32
+                        } else {
+                            unreachable!()
+                        };
+                        result[pixel] = value;
+                        value_index += 1;
+                    }
+                }
+            }
+
+            let expected_values = match block {
+                Lerc1Block::Zero | Lerc1Block::Constant(_) => 0,
+                Lerc1Block::Raw(values) => values.len(),
+                Lerc1Block::Stuffed {
+                    num_valid_pixels, ..
+                } => *num_valid_pixels,
+            };
+            if expected_values != 0 && value_index != expected_values {
+                return Err(Error::InvalidBlob(
+                    "Lerc1 block payload does not match the block mask".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(PixelData::F32(result))
 }
 
 fn parse_lerc2(blob: &[u8]) -> Result<(BlobInfo, Cursor<'_>)> {
@@ -232,8 +636,11 @@ fn read_mask(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<Option<Vec<u8>>
         ));
     }
 
-    let encoded = cursor.read_bytes(num_bytes)?;
-    let bitset_len = num_pixels.div_ceil(8);
+    let bitset = decode_mask_rle(cursor.read_bytes(num_bytes)?, num_pixels.div_ceil(8))?;
+    Ok(Some(unpack_mask_bitset(&bitset, num_pixels)))
+}
+
+fn decode_mask_rle(encoded: &[u8], bitset_len: usize) -> Result<Vec<u8>> {
     let mut bitset = vec![0u8; bitset_len];
     let mut inner = Cursor::new(encoded);
     let mut out = 0usize;
@@ -285,13 +692,17 @@ fn read_mask(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<Option<Vec<u8>>
         ));
     }
 
+    Ok(bitset)
+}
+
+fn unpack_mask_bitset(bitset: &[u8], num_pixels: usize) -> Vec<u8> {
     let mut mask = vec![0u8; num_pixels];
     for (i, item) in mask.iter_mut().enumerate() {
         let byte = bitset[i >> 3];
         let bit = 7 - (i & 7);
         *item = ((byte >> bit) & 1) as u8;
     }
-    Ok(Some(mask))
+    mask
 }
 
 fn read_depth_ranges(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<DepthRanges> {
@@ -349,6 +760,7 @@ fn decode_pixels(
 
     let version = match info.version {
         Version::Lerc2(version) => version,
+        _ => unreachable!("Lerc2 decode called with a non-Lerc2 blob"),
     };
 
     if version > 1 && info.data_type.code() <= 1 && (info.max_z_error - 0.5).abs() < 1e-5 {
@@ -428,6 +840,7 @@ fn decode_tiles(
     let mut block_buffer = vec![0.0; micro_block_size * micro_block_size];
     let version = match info.version {
         Version::Lerc2(version) => version,
+        _ => unreachable!("Lerc2 tile decode called with a non-Lerc2 blob"),
     };
     let file_version_check_num = if version >= 5 { 14u8 } else { 15u8 };
 
@@ -733,6 +1146,7 @@ fn read_huffman_tree(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<Huffman
         cursor,
         match info.version {
             Version::Lerc2(version) => version,
+            _ => unreachable!("Lerc2 Huffman decode called with a non-Lerc2 blob"),
         },
         &mut code_lengths,
         None,
@@ -1422,6 +1836,28 @@ fn cast_pixels(data_type: DataType, values: Vec<f64>) -> PixelData {
     }
 }
 
+fn scan_range(pixels: &PixelData, mask: Option<&[u8]>) -> Result<(f64, f64)> {
+    let values = pixels.to_f64();
+    let mut min_value = f64::INFINITY;
+    let mut max_value = f64::NEG_INFINITY;
+
+    for (index, value) in values.into_iter().enumerate() {
+        if mask.map(|mask| mask[index] == 0).unwrap_or(false) {
+            continue;
+        }
+        min_value = min_value.min(value);
+        max_value = max_value.max(value);
+    }
+
+    if !min_value.is_finite() || !max_value.is_finite() {
+        return Err(Error::InvalidBlob(
+            "cannot compute a value range for an empty LERC pixel buffer".into(),
+        ));
+    }
+
+    Ok((min_value, max_value))
+}
+
 fn fletcher32(bytes: &[u8]) -> u32 {
     let mut sum1 = 0xffffu32;
     let mut sum2 = 0xffffu32;
@@ -1487,6 +1923,96 @@ mod tests {
         bytes[34..38].copy_from_slice(&blob_size.to_le_bytes());
         let checksum = fletcher32(&bytes[14..blob_size as usize]);
         bytes[10..14].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    fn encode_mask_rle(mask: &[u8]) -> Vec<u8> {
+        let bitset_len = mask.len().div_ceil(8);
+        let mut bitset = vec![0u8; bitset_len];
+        for (index, &value) in mask.iter().enumerate() {
+            if value != 0 {
+                bitset[index >> 3] |= 1 << (7 - (index & 7));
+            }
+        }
+
+        let mut encoded = Vec::with_capacity(bitset_len + 4);
+        encoded.extend_from_slice(&(bitset_len as i16).to_le_bytes());
+        encoded.extend_from_slice(&bitset);
+        encoded.extend_from_slice(&i16::MIN.to_le_bytes());
+        encoded
+    }
+
+    fn pack_msb_bits(values: &[u32], bits_per_pixel: u8) -> Vec<u8> {
+        let total_bits = values.len() * usize::from(bits_per_pixel);
+        let mut bytes = vec![0u8; total_bits.div_ceil(8)];
+        let mut bit_offset = 0usize;
+        for &value in values {
+            for bit in (0..bits_per_pixel).rev() {
+                if ((value >> bit) & 1) != 0 {
+                    let byte_index = bit_offset / 8;
+                    let bit_index = 7 - (bit_offset % 8);
+                    bytes[byte_index] |= 1 << bit_index;
+                }
+                bit_offset += 1;
+            }
+        }
+        bytes
+    }
+
+    fn build_lerc1_blob(
+        include_mask_header: bool,
+        mask: Option<&[u8]>,
+        values: &[f32],
+        max_z_error: f64,
+        max_value: f32,
+    ) -> Vec<u8> {
+        let width = 2u32;
+        let height = 2u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"CntZImage ");
+        bytes.extend_from_slice(&11i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&max_z_error.to_le_bytes());
+
+        if include_mask_header {
+            if let Some(mask) = mask {
+                let encoded_mask = encode_mask_rle(mask);
+                bytes.extend_from_slice(&1u32.to_le_bytes());
+                bytes.extend_from_slice(&1u32.to_le_bytes());
+                bytes.extend_from_slice(&(encoded_mask.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(&1.0f32.to_le_bytes());
+                bytes.extend_from_slice(&encoded_mask);
+            } else {
+                bytes.extend_from_slice(&1u32.to_le_bytes());
+                bytes.extend_from_slice(&1u32.to_le_bytes());
+                bytes.extend_from_slice(&0u32.to_le_bytes());
+                bytes.extend_from_slice(&1.0f32.to_le_bytes());
+            }
+        }
+
+        let valid_count = mask
+            .map(|mask| mask.iter().filter(|&&value| value != 0).count())
+            .unwrap_or(values.len());
+        let offset = values.iter().copied().reduce(f32::min).unwrap_or(0.0);
+        let quantized: Vec<u32> = values
+            .iter()
+            .map(|&value| ((value - offset) / (2.0 * max_z_error as f32)).round() as u32)
+            .collect();
+        let max_quantized = quantized.iter().copied().max().unwrap_or(0);
+        let bits_per_pixel = bits_required(max_quantized as usize).max(1);
+        let payload = pack_msb_bits(&quantized, bits_per_pixel);
+        let pixel_section_len = 1 + 4 + 1 + 1 + payload.len();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(pixel_section_len as u32).to_le_bytes());
+        bytes.extend_from_slice(&max_value.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&offset.to_le_bytes());
+        bytes.push((bits_per_pixel & 63) | (2 << 6));
+        bytes.push(valid_count as u8);
+        bytes.extend_from_slice(&payload);
         bytes
     }
 
@@ -1560,6 +2086,39 @@ mod tests {
 
         let mut merged = blob1;
         merged.extend_from_slice(&blob2);
+        assert_eq!(get_band_count(&merged).unwrap(), 2);
+    }
+
+    #[test]
+    fn reads_blob_info_for_lerc1() {
+        let blob = build_lerc1_blob(true, None, &[1.0, 2.0, 3.0, 4.0], 0.5, 4.0);
+
+        let info = get_blob_info(&blob).unwrap();
+        assert_eq!(info.version, Version::Lerc1(11));
+        assert_eq!(info.width, 2);
+        assert_eq!(info.height, 2);
+        assert_eq!(info.depth, 1);
+        assert_eq!(info.data_type, DataType::F32);
+    }
+
+    #[test]
+    fn decodes_lerc1_masked_bitstuffed_block() {
+        let blob = build_lerc1_blob(true, Some(&[1, 0, 1, 1]), &[1.0, 3.0, 4.0], 0.5, 4.0);
+
+        let decoded = decode(&blob).unwrap();
+        assert_eq!(decoded.mask, Some(vec![1, 0, 1, 1]));
+        assert_eq!(decoded.pixels, PixelData::F32(vec![1.0, 0.0, 3.0, 4.0]));
+        assert_eq!(decoded.info.z_min, 1.0);
+        assert_eq!(decoded.info.z_max, 4.0);
+    }
+
+    #[test]
+    fn counts_concatenated_lerc1_bands_with_shared_mask() {
+        let blob1 = build_lerc1_blob(true, Some(&[1, 0, 1, 1]), &[1.0, 3.0, 4.0], 0.5, 4.0);
+        let blob2 = build_lerc1_blob(false, None, &[1.0, 3.0, 4.0], 0.5, 4.0);
+        let mut merged = blob1;
+        merged.extend_from_slice(&blob2);
+
         assert_eq!(get_band_count(&merged).unwrap(), 2);
     }
 }

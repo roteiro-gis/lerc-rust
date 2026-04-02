@@ -20,6 +20,10 @@ Design goals:
 
 Implemented in `lerc-reader` today:
 
+- Lerc1 header parsing
+- Lerc1 mask decoding
+- Lerc1 tiled block decode
+- Lerc1 shared-mask concatenated band counting
 - Lerc2 header parsing
 - concatenated Lerc2 band counting
 - pure-Rust Fletcher32 checksum verification
@@ -33,6 +37,8 @@ Implemented in `lerc-reader` today:
 
 Verified coverage:
 
+- synthetic unit fixtures for Lerc1 bit-stuffed blocks and shared-mask
+  concatenated bands
 - synthetic unit fixtures for constant, one-sweep, concatenated-band, and
   per-depth-range cases
 - an interoperability fixture from Esri's JavaScript sanity test exercising a
@@ -43,6 +49,5 @@ breaking the public metadata or pixel-buffer APIs.
 
 Planned next:
 
-- Lerc1 read support
 - additional interoperability fixtures covering more tiled and masked blobs
 - writer support in a future `lerc-writer` crate

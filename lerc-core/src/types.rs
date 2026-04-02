@@ -111,6 +111,7 @@ impl PixelData {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
+    Lerc1(u32),
     Lerc2(u32),
 }
 
