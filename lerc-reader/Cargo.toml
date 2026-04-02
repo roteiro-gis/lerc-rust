@@ -8,9 +8,18 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "../README.md"
+documentation = "https://docs.rs/lerc-reader"
 keywords = ["lerc", "raster", "compression", "gis", "geospatial"]
 categories = ["compression", "science"]
 
 [dependencies]
 lerc-core = { version = "0.1.0", path = "../lerc-core" }
 ndarray = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+serde_json = "1"
+
+[[bench]]
+name = "reference_compare_bench"
+harness = false

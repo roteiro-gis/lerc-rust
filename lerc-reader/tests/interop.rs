@@ -1,8 +1,17 @@
 use lerc_core::{DataType, PixelData};
 use ndarray::IxDyn;
 
+fn fixture_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("testdata")
+        .join("interoperability")
+        .join(name)
+}
+
 fn load_esri_js_sanity_fixture() -> Vec<u8> {
-    include_str!("data/esri_js_sanity_u8_3d.csv")
+    std::fs::read_to_string(fixture_path("esri_js_sanity_u8_3d.csv"))
+        .unwrap()
         .trim()
         .split(',')
         .map(|value| value.parse::<u8>().unwrap())
@@ -10,7 +19,7 @@ fn load_esri_js_sanity_fixture() -> Vec<u8> {
 }
 
 fn load_binary_fixture(path: &str) -> Vec<u8> {
-    std::fs::read(path).unwrap()
+    std::fs::read(fixture_path(path)).unwrap()
 }
 
 #[test]
@@ -37,7 +46,7 @@ fn decodes_esri_js_sanity_fixture() {
 
 #[test]
 fn decodes_official_world_lerc1_fixture() {
-    let blob = load_binary_fixture("tests/data/world.lerc1");
+    let blob = load_binary_fixture("world.lerc1");
 
     let info = lerc_reader::get_blob_info(&blob).unwrap();
     assert_eq!(info.version, lerc_core::Version::Lerc1(11));
@@ -62,7 +71,7 @@ fn decodes_official_world_lerc1_fixture() {
 
 #[test]
 fn decodes_official_california_lerc2_fixture() {
-    let blob = load_binary_fixture("tests/data/california_400_400_1_float.lerc2");
+    let blob = load_binary_fixture("california_400_400_1_float.lerc2");
 
     let info = lerc_reader::get_blob_info(&blob).unwrap();
     assert_eq!(info.version, lerc_core::Version::Lerc2(3));
@@ -86,7 +95,7 @@ fn decodes_official_california_lerc2_fixture() {
 
 #[test]
 fn decodes_official_bluemarble_band_set_fixture() {
-    let blob = load_binary_fixture("tests/data/bluemarble_256_256_3_byte.lerc2");
+    let blob = load_binary_fixture("bluemarble_256_256_3_byte.lerc2");
 
     assert_eq!(lerc_reader::get_band_count(&blob).unwrap(), 3);
 

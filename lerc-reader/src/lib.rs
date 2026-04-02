@@ -557,11 +557,13 @@ fn decode_lerc1_pixels(parsed: &Lerc1Blob) -> Result<PixelData> {
                         stuffed_data,
                         &mut block_buffer[..*num_valid_pixels],
                         *bits_per_pixel,
-                        *num_valid_pixels,
-                        None,
-                        Some(*offset as f64),
-                        2.0 * parsed.info.max_z_error,
-                        parsed.pixels.max_value as f64,
+                        UnstuffOptions {
+                            num_pixels: *num_valid_pixels,
+                            lut_values: None,
+                            offset: Some(*offset as f64),
+                            scale: 2.0 * parsed.info.max_z_error,
+                            max_value: parsed.pixels.max_value as f64,
+                        },
                     );
                     stuffed_values = Some(&block_buffer[..*num_valid_pixels]);
                     (None, None)
@@ -804,9 +806,18 @@ fn unpack_mask_bitset(bitset: &[u8], num_pixels: usize) -> Vec<u8> {
     for (i, item) in mask.iter_mut().enumerate() {
         let byte = bitset[i >> 3];
         let bit = 7 - (i & 7);
-        *item = ((byte >> bit) & 1) as u8;
+        *item = (byte >> bit) & 1;
     }
     mask
+}
+
+#[derive(Clone, Copy)]
+struct UnstuffOptions<'a> {
+    num_pixels: usize,
+    lut_values: Option<&'a [f64]>,
+    offset: Option<f64>,
+    scale: f64,
+    max_value: f64,
 }
 
 fn read_depth_ranges(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<DepthRanges> {
@@ -1454,22 +1465,26 @@ fn decode_bits(
                 &stuffed_words,
                 &mut out[..num_elements],
                 lut_bits_per_element,
-                num_elements,
-                Some(&lut_values),
-                None,
-                0.0,
-                max_value,
+                UnstuffOptions {
+                    num_pixels: num_elements,
+                    lut_values: Some(&lut_values),
+                    offset: None,
+                    scale: 0.0,
+                    max_value,
+                },
             );
         } else {
             unstuff_v2(
                 &stuffed_words,
                 &mut out[..num_elements],
                 lut_bits_per_element,
-                num_elements,
-                Some(&lut_values),
-                None,
-                0.0,
-                max_value,
+                UnstuffOptions {
+                    num_pixels: num_elements,
+                    lut_values: Some(&lut_values),
+                    offset: None,
+                    scale: 0.0,
+                    max_value,
+                },
             );
         }
         return Ok(num_elements);
@@ -1487,38 +1502,33 @@ fn decode_bits(
             &stuffed_words,
             &mut out[..num_elements],
             num_bits,
-            num_elements,
-            None,
-            Some(offset),
-            2.0 * max_z_error,
-            max_value,
+            UnstuffOptions {
+                num_pixels: num_elements,
+                lut_values: None,
+                offset: Some(offset),
+                scale: 2.0 * max_z_error,
+                max_value,
+            },
         ),
         (true, None) => original_unstuff_v3(&stuffed_words, &mut out[..num_elements], num_bits),
         (false, Some(offset)) => unstuff_v2(
             &stuffed_words,
             &mut out[..num_elements],
             num_bits,
-            num_elements,
-            None,
-            Some(offset),
-            2.0 * max_z_error,
-            max_value,
+            UnstuffOptions {
+                num_pixels: num_elements,
+                lut_values: None,
+                offset: Some(offset),
+                scale: 2.0 * max_z_error,
+                max_value,
+            },
         ),
         (false, None) => original_unstuff_v2(&stuffed_words, &mut out[..num_elements], num_bits),
     }
     Ok(num_elements)
 }
 
-fn unstuff_v2(
-    src: &[u32],
-    dest: &mut [f64],
-    bits_per_pixel: u8,
-    num_pixels: usize,
-    lut_values: Option<&[f64]>,
-    offset: Option<f64>,
-    scale: f64,
-    max_value: f64,
-) {
+fn unstuff_v2(src: &[u32], dest: &mut [f64], bits_per_pixel: u8, options: UnstuffOptions<'_>) {
     let bit_mask = if bits_per_pixel == 32 {
         u32::MAX
     } else {
@@ -1526,7 +1536,7 @@ fn unstuff_v2(
     };
     let mut words = src.to_vec();
     let num_invalid_tail_bytes =
-        words.len() * 4 - (usize::from(bits_per_pixel) * num_pixels).div_ceil(8);
+        words.len() * 4 - (usize::from(bits_per_pixel) * options.num_pixels).div_ceil(8);
     if let Some(last) = words.last_mut() {
         *last <<= 8 * num_invalid_tail_bytes;
     }
@@ -1534,9 +1544,11 @@ fn unstuff_v2(
     let mut index = 0usize;
     let mut bits_left = 0usize;
     let mut buffer = 0u32;
-    let nmax = offset.map(|offset| quantized_nmax(offset, scale, max_value));
+    let nmax = options
+        .offset
+        .map(|offset| quantized_nmax(offset, options.scale, options.max_value));
 
-    for item in dest.iter_mut().take(num_pixels) {
+    for item in dest.iter_mut().take(options.num_pixels) {
         if bits_left == 0 {
             buffer = words[index];
             index += 1;
@@ -1555,24 +1567,17 @@ fn unstuff_v2(
             n += buffer >> bits_left;
             n
         };
-        *item = match (lut_values, offset) {
+        *item = match (options.lut_values, options.offset) {
             (Some(lut_values), _) => lut_values[n as usize],
-            (None, Some(offset)) => quantized_value(offset, scale, max_value, n, nmax.unwrap()),
+            (None, Some(offset)) => {
+                quantized_value(offset, options.scale, options.max_value, n, nmax.unwrap())
+            }
             (None, None) => n as f64,
         };
     }
 }
 
-fn unstuff_v3(
-    src: &[u32],
-    dest: &mut [f64],
-    bits_per_pixel: u8,
-    num_pixels: usize,
-    lut_values: Option<&[f64]>,
-    offset: Option<f64>,
-    scale: f64,
-    max_value: f64,
-) {
+fn unstuff_v3(src: &[u32], dest: &mut [f64], bits_per_pixel: u8, options: UnstuffOptions<'_>) {
     let bit_mask = if bits_per_pixel == 32 {
         u32::MAX
     } else {
@@ -1582,9 +1587,11 @@ fn unstuff_v3(
     let mut bits_left = 0usize;
     let mut bit_pos = 0usize;
     let mut buffer = 0u32;
-    let nmax = offset.map(|offset| quantized_nmax(offset, scale, max_value));
+    let nmax = options
+        .offset
+        .map(|offset| quantized_nmax(offset, options.scale, options.max_value));
 
-    for item in dest.iter_mut().take(num_pixels) {
+    for item in dest.iter_mut().take(options.num_pixels) {
         if bits_left == 0 {
             buffer = src[index];
             index += 1;
@@ -1607,20 +1614,44 @@ fn unstuff_v3(
             bit_pos = missing_bits;
             n
         };
-        *item = match (lut_values, offset) {
+        *item = match (options.lut_values, options.offset) {
             (Some(lut_values), _) => lut_values[n as usize],
-            (None, Some(offset)) => quantized_value(offset, scale, max_value, n, nmax.unwrap()),
+            (None, Some(offset)) => {
+                quantized_value(offset, options.scale, options.max_value, n, nmax.unwrap())
+            }
             (None, None) => n as f64,
         };
     }
 }
 
 fn original_unstuff_v2(src: &[u32], dest: &mut [f64], bits_per_pixel: u8) {
-    unstuff_v2(src, dest, bits_per_pixel, dest.len(), None, None, 0.0, 0.0);
+    unstuff_v2(
+        src,
+        dest,
+        bits_per_pixel,
+        UnstuffOptions {
+            num_pixels: dest.len(),
+            lut_values: None,
+            offset: None,
+            scale: 0.0,
+            max_value: 0.0,
+        },
+    );
 }
 
 fn original_unstuff_v3(src: &[u32], dest: &mut [f64], bits_per_pixel: u8) {
-    unstuff_v3(src, dest, bits_per_pixel, dest.len(), None, None, 0.0, 0.0);
+    unstuff_v3(
+        src,
+        dest,
+        bits_per_pixel,
+        UnstuffOptions {
+            num_pixels: dest.len(),
+            lut_values: None,
+            offset: None,
+            scale: 0.0,
+            max_value: 0.0,
+        },
+    );
 }
 
 fn unstuff_lut_v2(
@@ -1636,11 +1667,13 @@ fn unstuff_lut_v2(
         src,
         &mut values,
         bits_per_pixel,
-        num_pixels,
-        None,
-        Some(offset),
-        scale,
-        max_value,
+        UnstuffOptions {
+            num_pixels,
+            lut_values: None,
+            offset: Some(offset),
+            scale,
+            max_value,
+        },
     );
     let mut out = Vec::with_capacity(values.len() + 1);
     out.push(offset);
@@ -1661,11 +1694,13 @@ fn unstuff_lut_v3(
         src,
         &mut values,
         bits_per_pixel,
-        num_pixels,
-        None,
-        Some(offset),
-        scale,
-        max_value,
+        UnstuffOptions {
+            num_pixels,
+            lut_values: None,
+            offset: Some(offset),
+            scale,
+            max_value,
+        },
     );
     let mut out = Vec::with_capacity(values.len() + 1);
     out.push(offset);
@@ -1850,8 +1885,8 @@ fn constant_pixels(
     match (depth, values) {
         (_, ConstantValues::Single(value)) => {
             if let Some(mask) = mask {
-                for pixel in 0..num_pixels {
-                    if mask[pixel] != 0 {
+                for (pixel, &mask_value) in mask.iter().enumerate().take(num_pixels) {
+                    if mask_value != 0 {
                         let base = pixel * depth;
                         out[base..base + depth].fill(value);
                     }
@@ -1862,8 +1897,8 @@ fn constant_pixels(
         }
         (depth, ConstantValues::PerDepth(values)) => {
             if let Some(mask) = mask {
-                for pixel in 0..num_pixels {
-                    if mask[pixel] != 0 {
+                for (pixel, &mask_value) in mask.iter().enumerate().take(num_pixels) {
+                    if mask_value != 0 {
                         let base = pixel * depth;
                         out[base..base + depth].copy_from_slice(&values);
                     }
@@ -1994,6 +2029,7 @@ mod tests {
     use super::*;
     use ndarray::IxDyn;
 
+    #[allow(clippy::too_many_arguments)]
     fn build_header_v2(
         width: u32,
         height: u32,
