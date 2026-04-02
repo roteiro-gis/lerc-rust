@@ -53,9 +53,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Interop fixtures are vendored under
-[`testdata/interoperability`](testdata/interoperability/README.md). The default
-test suite covers:
+Interop fixtures are vendored in the repository under
+[`testdata/interoperability`](https://github.com/i-norden/lerc-rust/tree/main/testdata/interoperability).
+The default test suite covers:
 
 - synthetic decoder-path unit tests embedded in `lerc-reader`
 - official Esri fixtures for Lerc1, masked Lerc2, and concatenated multi-band
@@ -84,8 +84,8 @@ Criterion comparison benches against `libLerc` live in
 ./scripts/run-reference-benchmarks.sh
 ```
 
-For methodology and current benchmark notes, see
-[docs/benchmark-report.md](docs/benchmark-report.md).
+For methodology and current benchmark notes, see the repository copy of
+[docs/benchmark-report.md](https://github.com/i-norden/lerc-rust/blob/main/docs/benchmark-report.md).
 
 ## License
 
