@@ -15,7 +15,8 @@ use std::cmp;
 
 use io::Cursor;
 use lerc_core::{
-    BlobInfo, DataType, Decoded, DecodedF64, Error, NdArrayElement, PixelData, Result, Version,
+    BandSetInfo, BlobInfo, DataType, Decoded, DecodedBandSet, DecodedF64, Error, NdArrayElement,
+    PixelData, Result, Version,
 };
 use ndarray::ArrayD;
 
@@ -114,7 +115,7 @@ pub fn get_blob_info(blob: &[u8]) -> Result<BlobInfo> {
     }
 
     let (mut info, mut cursor) = parse_lerc2(blob)?;
-    let _mask = read_mask(&mut cursor, &info)?;
+    let _mask = read_mask(&mut cursor, &info, None)?;
     if should_read_depth_ranges(&info) {
         let ranges = read_depth_ranges(&mut cursor, &info)?;
         info.min_values = Some(ranges.min_values);
@@ -126,16 +127,20 @@ pub fn get_blob_info(blob: &[u8]) -> Result<BlobInfo> {
 pub fn get_band_count(blob: &[u8]) -> Result<usize> {
     let mut offset = 0usize;
     let mut count = 0usize;
-    let mut lerc1_mask: Option<Option<Vec<u8>>> = None;
+    let mut lerc1_mask: Option<Vec<u8>> = None;
+    let mut lerc2_mask: Option<Vec<u8>> = None;
 
     while offset < blob.len() {
         let slice = &blob[offset..];
         let next_len = if is_lerc1(slice) {
-            let parsed = parse_lerc1(slice, lerc1_mask.as_ref())?;
-            lerc1_mask = Some(parsed.mask.clone());
+            let parsed = parse_lerc1(slice, lerc1_mask.as_deref())?;
+            lerc1_mask = parsed.mask.clone();
+            lerc2_mask = None;
             parsed.eof_offset
         } else if is_lerc2(slice) {
-            let (info, _) = parse_lerc2(slice)?;
+            let (info, mut cursor) = parse_lerc2(slice)?;
+            let mask = read_mask(&mut cursor, &info, lerc2_mask.as_deref())?;
+            lerc2_mask = mask;
             lerc1_mask = None;
             info.blob_size
         } else {
@@ -159,8 +164,74 @@ pub fn get_band_count(blob: &[u8]) -> Result<usize> {
 }
 
 pub fn decode(blob: &[u8]) -> Result<Decoded> {
+    decode_single(blob, None, None)
+}
+
+pub fn decode_band_set(blob: &[u8]) -> Result<DecodedBandSet> {
+    let mut offset = 0usize;
+    let mut pixels = Vec::new();
+    let mut infos = Vec::new();
+    let mut band_masks = Vec::new();
+    let mut lerc1_mask: Option<Vec<u8>> = None;
+    let mut lerc2_mask: Option<Vec<u8>> = None;
+
+    while offset < blob.len() {
+        let slice = &blob[offset..];
+        let decoded = if is_lerc1(slice) {
+            let decoded = decode_single(slice, lerc1_mask.as_deref(), None)?;
+            lerc1_mask = decoded.mask.clone();
+            lerc2_mask = None;
+            decoded
+        } else if is_lerc2(slice) {
+            let decoded = decode_single(slice, None, lerc2_mask.as_deref())?;
+            lerc2_mask = decoded.mask.clone();
+            lerc1_mask = None;
+            decoded
+        } else {
+            return Err(Error::InvalidMagic);
+        };
+
+        let next = offset
+            .checked_add(decoded.info.blob_size)
+            .ok_or_else(|| Error::InvalidBlob("band offset overflow".into()))?;
+        if next <= offset || next > blob.len() {
+            return Err(Error::InvalidBlob(
+                "invalid concatenated band blob size".into(),
+            ));
+        }
+
+        infos.push(decoded.info);
+        pixels.push(decoded.pixels);
+        band_masks.push(decoded.mask);
+        offset = next;
+    }
+
+    Ok(DecodedBandSet {
+        info: BandSetInfo::new(infos)?,
+        bands: pixels,
+        band_masks,
+    })
+}
+
+pub fn decode_band_set_ndarray<T: NdArrayElement>(blob: &[u8]) -> Result<ArrayD<T>> {
+    decode_band_set(blob)?.into_ndarray()
+}
+
+pub fn decode_band_set_ndarray_f64(blob: &[u8]) -> Result<ArrayD<f64>> {
+    decode_band_set(blob)?.into_ndarray()
+}
+
+pub fn decode_band_mask_ndarray(blob: &[u8]) -> Result<Option<ArrayD<u8>>> {
+    decode_band_set(blob)?.into_band_mask_ndarray()
+}
+
+fn decode_single(
+    blob: &[u8],
+    lerc1_shared_mask: Option<&[u8]>,
+    lerc2_shared_mask: Option<&[u8]>,
+) -> Result<Decoded> {
     if is_lerc1(blob) {
-        let mut parsed = parse_lerc1(blob, None)?;
+        let mut parsed = parse_lerc1(blob, lerc1_shared_mask)?;
         let pixels = decode_lerc1_pixels(&parsed)?;
         if parsed.info.valid_pixel_count != 0 {
             let (z_min, z_max) = scan_range(&pixels, parsed.mask.as_deref())?;
@@ -174,8 +245,9 @@ pub fn decode(blob: &[u8]) -> Result<Decoded> {
         });
     }
 
-    let (mut info, mut cursor) = parse_lerc2(blob)?;
-    let mask = read_mask(&mut cursor, &info)?;
+    let (info, _) = parse_lerc2(blob)?;
+    let (mut info, mut cursor) = parse_lerc2(&blob[..info.blob_size])?;
+    let mask = read_mask(&mut cursor, &info, lerc2_shared_mask)?;
 
     let depth_ranges = if should_read_depth_ranges(&info) {
         let ranges = read_depth_ranges(&mut cursor, &info)?;
@@ -211,7 +283,7 @@ pub fn decode_mask_ndarray(blob: &[u8]) -> Result<Option<ArrayD<u8>>> {
     decode(blob)?.into_mask_ndarray()
 }
 
-fn parse_lerc1(blob: &[u8], shared_mask: Option<&Option<Vec<u8>>>) -> Result<Lerc1Blob> {
+fn parse_lerc1(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Lerc1Blob> {
     let mut cursor = Cursor::new(blob);
     let magic = cursor.read_bytes(10)?;
     if !magic.starts_with(MAGIC_LERC1_PREFIX) {
@@ -228,7 +300,7 @@ fn parse_lerc1(blob: &[u8], shared_mask: Option<&Option<Vec<u8>>>) -> Result<Ler
     let max_z_error = cursor.read_f64()?;
 
     let mask = if let Some(shared_mask) = shared_mask {
-        shared_mask.clone()
+        Some(shared_mask.to_vec())
     } else {
         read_lerc1_mask(&mut cursor, width, height)?
     };
@@ -621,7 +693,11 @@ fn should_read_depth_ranges(info: &BlobInfo) -> bool {
         && info.z_min != info.z_max
 }
 
-fn read_mask(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<Option<Vec<u8>>> {
+fn read_mask(
+    cursor: &mut Cursor<'_>,
+    info: &BlobInfo,
+    inherited_mask: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>> {
     let num_pixels = info.pixel_count()?;
     let num_valid = info.valid_pixel_count as usize;
     if num_valid > num_pixels {
@@ -647,9 +723,21 @@ fn read_mask(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<Option<Vec<u8>>
     }
 
     if num_bytes == 0 {
-        return Err(Error::UnsupportedFeature(
+        let mask = inherited_mask.ok_or(Error::UnsupportedFeature(
             "external masks are not yet supported",
-        ));
+        ))?;
+        if mask.len() != num_pixels {
+            return Err(Error::InvalidBlob(
+                "inherited mask length does not match the current LERC blob".into(),
+            ));
+        }
+        let inherited_valid = mask.iter().filter(|&&value| value != 0).count();
+        if inherited_valid != num_valid {
+            return Err(Error::InvalidBlob(
+                "inherited mask valid count does not match the current LERC blob".into(),
+            ));
+        }
+        return Ok(Some(mask.to_vec()));
     }
 
     let bitset = decode_mask_rle(cursor.read_bytes(num_bytes)?, num_pixels.div_ceil(8))?;
@@ -1126,9 +1214,6 @@ fn decode_huffman(
             }
         }
     }
-
-    let consumed_bytes = (stream.src_ptr + 1) * 4 + usize::from(stream.bit_pos > 0) * 4;
-    cursor.skip(consumed_bytes)?;
 
     let values = if depth > 1 {
         swap_bsq_to_bip(&result_bsq, num_pixels, depth)

@@ -4,4 +4,7 @@ mod error;
 mod types;
 
 pub use error::{Error, Result};
-pub use types::{BlobInfo, DataType, Decoded, DecodedF64, NdArrayElement, PixelData, Version};
+pub use types::{
+    BandSetInfo, BlobInfo, DataType, Decoded, DecodedBandSet, DecodedF64, NdArrayElement,
+    PixelData, Version,
+};

@@ -25,6 +25,7 @@ Implemented in `lerc-reader` today:
 - Lerc1 mask decoding
 - Lerc1 tiled block decode
 - Lerc1 shared-mask concatenated band counting
+- concatenated Lerc1 band-set decode
 - Lerc2 header parsing
 - concatenated Lerc2 band counting
 - pure-Rust Fletcher32 checksum verification
@@ -34,8 +35,10 @@ Implemented in `lerc-reader` today:
 - Lerc2 tiled decode
 - Lerc2 bit-stuffed block decode
 - Lerc2 Huffman decode
+- concatenated Lerc2 band-set decode, including shared-mask multi-band blobs
 - public inspection and decode entry points for native and `f64` output buffers
 - direct decode helpers into `ndarray::ArrayD`
+- direct decode helpers into bands-last multi-band `ndarray::ArrayD`
 - shape helpers for raster and mask arrays
 
 Verified coverage:
@@ -45,8 +48,11 @@ Verified coverage:
 - synthetic unit fixtures for constant, one-sweep, concatenated-band, and
   per-depth-range cases
 - ndarray conversion tests for 2D rasters, 3D rasters, and masks
+- official Esri `testData` fixtures for `world.lerc1`,
+  `california_400_400_1_float.lerc2`, and
+  `bluemarble_256_256_3_byte.lerc2`
 - an interoperability fixture from Esri's JavaScript sanity test exercising a
-  real upstream Lerc2 blob
+  real upstream multi-depth Lerc2 blob
 
 The crate is designed so those remaining decode paths can be added without
 breaking the public metadata or pixel-buffer APIs.
