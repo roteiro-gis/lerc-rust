@@ -407,15 +407,37 @@ impl DecodedBandSet {
         layout: BandLayout,
         out: &mut [T],
     ) -> Result<()> {
-        let values = self.into_vec_with_layout(layout)?;
-        if out.len() != values.len() {
+        let pixel_count = self.info.bands[0].pixel_count()?;
+        let depth = self.info.depth() as usize;
+        let band_count = self.info.band_count();
+        let expected_len = pixel_count
+            .checked_mul(band_count)
+            .and_then(|n| n.checked_mul(depth.max(1)))
+            .ok_or_else(|| Error::InvalidBlob("LERC ndarray size overflows usize".into()))?;
+        if out.len() != expected_len {
             return Err(Error::InvalidBlob(format!(
                 "output slice length {} does not match decoded band set length {}",
                 out.len(),
-                values.len()
+                expected_len
             )));
         }
-        out.clone_from_slice(&values);
+
+        let bands: Vec<Vec<T>> = self
+            .bands
+            .into_iter()
+            .map(T::from_pixel_data)
+            .collect::<Result<_>>()?;
+        for (band_index, band) in bands.iter().enumerate() {
+            copy_band_values_into_slice(
+                out,
+                band,
+                pixel_count,
+                depth,
+                band_index,
+                band_count,
+                layout,
+            )?;
+        }
         Ok(())
     }
 
@@ -457,6 +479,48 @@ impl DecodedBandSet {
                 ))
             })
     }
+}
+
+fn copy_band_values_into_slice<T: Clone>(
+    out: &mut [T],
+    values: &[T],
+    pixel_count: usize,
+    depth: usize,
+    band_index: usize,
+    band_count: usize,
+    layout: BandLayout,
+) -> Result<()> {
+    let band_len = pixel_count
+        .checked_mul(depth.max(1))
+        .ok_or_else(|| Error::InvalidBlob("LERC ndarray size overflows usize".into()))?;
+    if values.len() != band_len {
+        return Err(Error::InvalidBlob(
+            "LERC band set pixel buffers have inconsistent lengths".into(),
+        ));
+    }
+
+    match layout {
+        BandLayout::Interleaved => {
+            if depth <= 1 {
+                for pixel in 0..pixel_count {
+                    out[pixel * band_count + band_index] = values[pixel].clone();
+                }
+            } else {
+                for pixel in 0..pixel_count {
+                    let src_base = pixel * depth;
+                    let dst_base = (pixel * band_count + band_index) * depth;
+                    out[dst_base..dst_base + depth]
+                        .clone_from_slice(&values[src_base..src_base + depth]);
+                }
+            }
+        }
+        BandLayout::Bsq => {
+            let dst_base = band_index * band_len;
+            out[dst_base..dst_base + band_len].clone_from_slice(values);
+        }
+    }
+
+    Ok(())
 }
 
 pub trait NdArrayElement: Sized + Clone {

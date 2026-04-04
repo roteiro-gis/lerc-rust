@@ -1,6 +1,7 @@
 use lerc_core::{DataType, Error, PixelData, Result};
 
 pub(crate) trait Sample: Copy + Default {
+    fn data_type() -> DataType;
     fn from_f64(value: f64) -> Self;
     fn to_f64(self) -> f64;
     fn read_vec(bytes: &[u8]) -> Result<Vec<Self>>;
@@ -10,6 +11,10 @@ pub(crate) trait Sample: Copy + Default {
 macro_rules! impl_sample {
     ($ty:ty, $size:expr, $variant:ident) => {
         impl Sample for $ty {
+            fn data_type() -> DataType {
+                DataType::$variant
+            }
+
             fn from_f64(value: f64) -> Self {
                 value as $ty
             }
@@ -38,6 +43,10 @@ macro_rules! impl_sample {
 }
 
 impl Sample for u8 {
+    fn data_type() -> DataType {
+        DataType::U8
+    }
+
     fn from_f64(value: f64) -> Self {
         value as u8
     }
@@ -56,6 +65,10 @@ impl Sample for u8 {
 }
 
 impl Sample for i8 {
+    fn data_type() -> DataType {
+        DataType::I8
+    }
+
     fn from_f64(value: f64) -> Self {
         value as i8
     }
@@ -82,6 +95,36 @@ impl_sample!(i32, 4, I32);
 impl_sample!(u32, 4, U32);
 impl_sample!(f32, 4, F32);
 impl_sample!(f64, 8, F64);
+
+pub(crate) fn read_values_as<T: Sample>(bytes: &[u8], source_type: DataType) -> Result<Vec<T>> {
+    if source_type == T::data_type() {
+        return T::read_vec(bytes);
+    }
+
+    read_typed_values(bytes, source_type)
+        .map(|values| values.into_iter().map(T::from_f64).collect())
+}
+
+pub(crate) fn coerce_f64_to_data_type(value: f64, data_type: DataType) -> f64 {
+    match data_type {
+        DataType::I8 => (value as i8) as f64,
+        DataType::U8 => (value as u8) as f64,
+        DataType::I16 => (value as i16) as f64,
+        DataType::U16 => (value as u16) as f64,
+        DataType::I32 => (value as i32) as f64,
+        DataType::U32 => (value as u32) as f64,
+        DataType::F32 => (value as f32) as f64,
+        DataType::F64 => value,
+    }
+}
+
+pub(crate) fn output_value<T: Sample>(value: f64, source_type: DataType) -> T {
+    if T::data_type() == DataType::F64 && source_type != DataType::F64 {
+        T::from_f64(coerce_f64_to_data_type(value, source_type))
+    } else {
+        T::from_f64(value)
+    }
+}
 
 pub(crate) fn read_scalar(bytes: &[u8], data_type: DataType) -> Result<f64> {
     Ok(match data_type {

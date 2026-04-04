@@ -1,9 +1,12 @@
-use lerc_core::{BlobInfo, DataType, Decoded, Error, PixelData, Result, Version};
+use lerc_core::{BlobInfo, DataType, Decoded, DecodedF64, Error, PixelData, Result, Version};
 
 use crate::bitstuff::{data_type_used, decode_bits, read_typed_scalar};
 use crate::huffman::decode_huffman;
 use crate::io::Cursor;
-use crate::pixel::{count_valid_in_block, fletcher32, read_typed_values, sample_index, Sample};
+use crate::pixel::{
+    count_valid_in_block, fletcher32, output_value, read_typed_values, read_values_as,
+    sample_index, Sample,
+};
 
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
 
@@ -37,8 +40,7 @@ pub(crate) fn inspect_with_mask(
 }
 
 pub(crate) fn decode(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<Decoded> {
-    let (info, _) = parse(blob)?;
-    let (mut info, mut cursor) = parse(&blob[..info.blob_size])?;
+    let (mut info, mut cursor) = parse(blob)?;
     let mask = read_mask(&mut cursor, &info, inherited_mask)?;
 
     let depth_ranges = if should_read_depth_ranges(&info) {
@@ -52,6 +54,31 @@ pub(crate) fn decode(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<Decod
 
     let pixels = decode_pixels(&mut cursor, &info, depth_ranges.as_ref(), mask.as_deref())?;
     Ok(Decoded { info, pixels, mask })
+}
+
+pub(crate) fn decode_f64(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<DecodedF64> {
+    let (mut info, mut cursor) = parse(blob)?;
+    let mask = read_mask(&mut cursor, &info, inherited_mask)?;
+
+    let depth_ranges = if should_read_depth_ranges(&info) {
+        let ranges = read_depth_ranges(&mut cursor, &info)?;
+        info.min_values = Some(ranges.min_values.clone());
+        info.max_values = Some(ranges.max_values.clone());
+        Some(ranges)
+    } else {
+        None
+    };
+
+    let pixels = match decode_pixels_typed::<f64>(
+        &mut cursor,
+        &info,
+        depth_ranges.as_ref(),
+        mask.as_deref(),
+    )? {
+        PixelData::F64(values) => values,
+        _ => unreachable!("f64 decode must produce an f64 buffer"),
+    };
+    Ok(DecodedF64 { info, pixels, mask })
 }
 
 pub(crate) fn parse(blob: &[u8]) -> Result<(BlobInfo, Cursor<'_>)> {
@@ -297,6 +324,7 @@ fn decode_pixels_typed<T: Sample>(
 
     if info.z_min == info.z_max {
         return Ok(T::into_pixel_data(constant_pixels::<T>(
+            info.data_type,
             num_pixels,
             info.depth as usize,
             mask,
@@ -307,6 +335,7 @@ fn decode_pixels_typed<T: Sample>(
     if let Some(ranges) = depth_ranges {
         if ranges.min_values == ranges.max_values {
             return Ok(T::into_pixel_data(constant_pixels::<T>(
+                info.data_type,
                 num_pixels,
                 info.depth as usize,
                 mask,
@@ -346,6 +375,7 @@ enum ConstantValues<'a> {
 }
 
 fn constant_pixels<T: Sample>(
+    data_type: DataType,
     num_pixels: usize,
     depth: usize,
     mask: Option<&[u8]>,
@@ -354,7 +384,7 @@ fn constant_pixels<T: Sample>(
     let mut out = vec![T::default(); num_pixels * depth];
     match values {
         ConstantValues::Single(value) => {
-            let value = T::from_f64(value);
+            let value = output_value::<T>(value, data_type);
             if let Some(mask) = mask {
                 for (pixel, &mask_value) in mask.iter().enumerate().take(num_pixels) {
                     if mask_value != 0 {
@@ -372,7 +402,7 @@ fn constant_pixels<T: Sample>(
                     if mask_value != 0 {
                         let base = pixel * depth;
                         for (offset, &value) in values.iter().enumerate() {
-                            out[base + offset] = T::from_f64(value);
+                            out[base + offset] = output_value::<T>(value, data_type);
                         }
                     }
                 }
@@ -380,7 +410,7 @@ fn constant_pixels<T: Sample>(
                 for pixel in 0..num_pixels {
                     let base = pixel * depth;
                     for (offset, &value) in values.iter().enumerate() {
-                        out[base + offset] = T::from_f64(value);
+                        out[base + offset] = output_value::<T>(value, data_type);
                     }
                 }
             }
@@ -403,7 +433,7 @@ fn decode_one_sweep<T: Sample>(
         .checked_mul(num_valid)
         .and_then(|v| v.checked_mul(depth))
         .ok_or_else(|| Error::InvalidBlob("one-sweep byte count overflows usize".into()))?;
-    let raw = T::read_vec(cursor.read_bytes(sample_len)?)?;
+    let raw = read_values_as::<T>(cursor.read_bytes(sample_len)?, info.data_type)?;
 
     if num_valid == num_pixels {
         return Ok(T::into_pixel_data(raw));
@@ -554,7 +584,8 @@ fn decode_tiles<T: Sample>(
                                     "uncompressed block byte length overflows usize".into(),
                                 )
                             })?;
-                        let raw_values = T::read_vec(cursor.read_bytes(byte_len)?)?;
+                        let raw_values =
+                            read_values_as::<T>(cursor.read_bytes(byte_len)?, info.data_type)?;
                         let mut src = 0usize;
                         for row in 0..this_block_height {
                             let pixel_row = block_y * micro_block_size + row;
@@ -598,7 +629,7 @@ fn decode_tiles<T: Sample>(
                                             offset
                                         };
                                         result[sample_index(pixel, depth, dim)] =
-                                            T::from_f64(value);
+                                            output_value::<T>(value, info.data_type);
                                     }
                                 }
                             }
@@ -627,7 +658,7 @@ fn decode_tiles<T: Sample>(
                                             block_buffer[src]
                                         };
                                         result[sample_index(pixel, depth, dim)] =
-                                            T::from_f64(value);
+                                            output_value::<T>(value, info.data_type);
                                         src += 1;
                                     }
                                 }

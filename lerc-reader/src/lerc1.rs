@@ -1,8 +1,8 @@
-use lerc_core::{BlobInfo, DataType, Decoded, Error, PixelData, Result, Version};
+use lerc_core::{BlobInfo, DataType, Decoded, DecodedF64, Error, PixelData, Result, Version};
 
 use crate::bitstuff::{unstuff_v2, UnstuffOptions};
 use crate::io::Cursor;
-use crate::pixel::{count_valid_in_block, words_from_padded};
+use crate::pixel::{count_valid_in_block, words_from_padded, Sample};
 
 const MAGIC_LERC1_PREFIX: &[u8; 9] = b"CntZImage";
 
@@ -30,6 +30,9 @@ struct Lerc1Block {
     encoding: Lerc1BlockEncoding,
     valid_pixel_count: usize,
 }
+
+type ValueRange = Option<(f64, f64)>;
+type TypedPixels<T> = (Vec<T>, ValueRange);
 
 #[derive(Debug, Clone)]
 pub(crate) struct Lerc1Blob {
@@ -59,7 +62,7 @@ pub(crate) fn inspect(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<BlobInf
 
 pub(crate) fn decode(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Decoded> {
     let mut parsed = parse(blob, shared_mask)?;
-    let (pixels, z_range) = decode_pixels(&parsed)?;
+    let (pixels, z_range) = decode_pixels::<f32>(&parsed)?;
     if parsed.info.valid_pixel_count != 0 {
         let (z_min, z_max) = z_range.ok_or_else(|| {
             Error::InvalidBlob("Lerc1 decode produced pixels but not a value range".into())
@@ -68,6 +71,23 @@ pub(crate) fn decode(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Decoded>
         parsed.info.z_max = z_max;
     }
     Ok(Decoded {
+        info: parsed.info,
+        pixels: PixelData::F32(pixels),
+        mask: parsed.mask,
+    })
+}
+
+pub(crate) fn decode_f64(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<DecodedF64> {
+    let mut parsed = parse(blob, shared_mask)?;
+    let (pixels, z_range) = decode_pixels::<f64>(&parsed)?;
+    if parsed.info.valid_pixel_count != 0 {
+        let (z_min, z_max) = z_range.ok_or_else(|| {
+            Error::InvalidBlob("Lerc1 decode produced pixels but not a value range".into())
+        })?;
+        parsed.info.z_min = z_min;
+        parsed.info.z_max = z_max;
+    }
+    Ok(DecodedF64 {
         info: parsed.info,
         pixels,
         mask: parsed.mask,
@@ -302,11 +322,11 @@ fn read_mask(cursor: &mut Cursor<'_>, width: u32, height: u32) -> Result<Option<
     Ok(None)
 }
 
-fn decode_pixels(parsed: &Lerc1Blob) -> Result<(PixelData, Option<(f64, f64)>)> {
+fn decode_pixels<T: Sample>(parsed: &Lerc1Blob) -> Result<TypedPixels<T>> {
     let width = parsed.info.width as usize;
     let height = parsed.info.height as usize;
     let mask = parsed.mask.as_deref();
-    let mut result = vec![0.0f32; width * height];
+    let mut result = vec![T::default(); width * height];
     let mut block_buffer = vec![0.0f64; parsed.base_block_width * parsed.base_block_height];
     let mut block_index = 0usize;
     let mut min_value = f64::INFINITY;
@@ -391,8 +411,8 @@ fn decode_pixels(parsed: &Lerc1Blob) -> Result<(PixelData, Option<(f64, f64)>)> 
                         } else {
                             unreachable!()
                         };
-                        result[pixel] = value;
                         let value_f64 = f64::from(value);
+                        result[pixel] = T::from_f64(value_f64);
                         min_value = min_value.min(value_f64);
                         max_value = max_value.max(value_f64);
                         value_index += 1;
@@ -419,7 +439,7 @@ fn decode_pixels(parsed: &Lerc1Blob) -> Result<(PixelData, Option<(f64, f64)>)> 
         None
     };
 
-    Ok((PixelData::F32(result), z_range))
+    Ok((result, z_range))
 }
 
 fn scan_range(parsed: &Lerc1Blob) -> Result<(f64, f64)> {

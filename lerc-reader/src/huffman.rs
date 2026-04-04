@@ -4,7 +4,7 @@ use lerc_core::{BlobInfo, Error, PixelData, Result, Version};
 
 use crate::bitstuff::decode_bits;
 use crate::io::Cursor;
-use crate::pixel::{sample_index, words_from_padded, Sample};
+use crate::pixel::{output_value, sample_index, words_from_padded, Sample};
 
 const HUFFMAN_LUT_BITS_MAX: u8 = 12;
 
@@ -92,7 +92,8 @@ pub(crate) fn decode_huffman<T: Sample>(
                         } else {
                             value
                         };
-                        result[sample_index(pixel, depth, dim)] = T::from_f64(decoded);
+                        result[sample_index(pixel, depth, dim)] =
+                            output_value::<T>(decoded, info.data_type);
                     }
                 }
             }
@@ -104,7 +105,8 @@ pub(crate) fn decode_huffman<T: Sample>(
                 if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
                     for dim in 0..depth {
                         let value = read_huffman_symbol(&mut stream, &huffman)? as f64 - offset;
-                        result[sample_index(pixel, depth, dim)] = T::from_f64(value);
+                        result[sample_index(pixel, depth, dim)] =
+                            output_value::<T>(value, info.data_type);
                     }
                 }
             }
