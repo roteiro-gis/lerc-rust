@@ -18,14 +18,22 @@ pub(crate) fn is_lerc2(blob: &[u8]) -> bool {
 }
 
 pub(crate) fn inspect(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<BlobInfo> {
+    let (info, _) = inspect_with_mask(blob, inherited_mask)?;
+    Ok(info)
+}
+
+pub(crate) fn inspect_with_mask(
+    blob: &[u8],
+    inherited_mask: Option<&[u8]>,
+) -> Result<(BlobInfo, Option<Vec<u8>>)> {
     let (mut info, mut cursor) = parse(blob)?;
-    let _mask = read_mask(&mut cursor, &info, inherited_mask)?;
+    let mask = read_mask(&mut cursor, &info, inherited_mask)?;
     if should_read_depth_ranges(&info) {
         let ranges = read_depth_ranges(&mut cursor, &info)?;
         info.min_values = Some(ranges.min_values);
         info.max_values = Some(ranges.max_values);
     }
-    Ok(info)
+    Ok((info, mask))
 }
 
 pub(crate) fn decode(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<Decoded> {

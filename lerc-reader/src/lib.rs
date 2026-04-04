@@ -45,32 +45,7 @@ pub fn get_blob_info(blob: &[u8]) -> Result<BlobInfo> {
 }
 
 pub fn get_band_count(blob: &[u8]) -> Result<usize> {
-    let mut offset = 0usize;
-    let mut count = 0usize;
-    let mut lerc1_mask: Option<Vec<u8>> = None;
-    let mut lerc2_mask: Option<Vec<u8>> = None;
-
-    while offset < blob.len() {
-        let slice = &blob[offset..];
-        let next_len = if lerc1::is_lerc1(slice) {
-            let parsed = lerc1::parse(slice, lerc1_mask.as_deref())?;
-            lerc1_mask = parsed.mask.clone();
-            lerc2_mask = None;
-            parsed.eof_offset
-        } else if lerc2::is_lerc2(slice) {
-            let decoded = lerc2::decode(slice, lerc2_mask.as_deref())?;
-            lerc2_mask = decoded.mask;
-            lerc1_mask = None;
-            decoded.info.blob_size
-        } else {
-            return Err(Error::InvalidMagic);
-        };
-
-        offset = checked_next_offset(offset, next_len, blob.len())?;
-        count += 1;
-    }
-
-    Ok(count)
+    Ok(scan_band_infos(blob)?.band_count())
 }
 
 pub fn decode_first(blob: &[u8]) -> Result<Decoded> {
@@ -134,10 +109,19 @@ pub fn decode_band_set_into<T: NdArrayElement>(
     layout: BandLayout,
     out: &mut [T],
 ) -> Result<BandSetInfo> {
-    let band_count = get_band_count(blob)?;
+    let band_info = scan_band_infos(blob)?;
+    let band_count = band_info.band_count();
+    let expected_len = band_set_value_len(&band_info.bands[0], band_count)?;
+    if out.len() != expected_len {
+        return Err(Error::InvalidBlob(format!(
+            "output slice length {} does not match decoded band set length {}",
+            out.len(),
+            expected_len
+        )));
+    }
+
     let mut offset = 0usize;
     let mut band_index = 0usize;
-    let mut infos = Vec::with_capacity(band_count);
     let mut lerc1_mask: Option<Vec<u8>> = None;
     let mut lerc2_mask: Option<Vec<u8>> = None;
 
@@ -147,14 +131,6 @@ pub fn decode_band_set_into<T: NdArrayElement>(
         let decoded = decode_first_with_masks(slice, lerc1_mask.as_deref(), lerc2_mask.as_deref())?;
         let pixel_count = decoded.info.pixel_count()?;
         let depth = decoded.info.depth as usize;
-        let expected_len = band_set_value_len(&decoded.info, band_count)?;
-        if out.len() != expected_len {
-            return Err(Error::InvalidBlob(format!(
-                "output slice length {} does not match decoded band set length {}",
-                out.len(),
-                expected_len
-            )));
-        }
 
         let values = T::from_pixel_data(decoded.pixels)?;
         write_band_into_slice(
@@ -176,11 +152,10 @@ pub fn decode_band_set_into<T: NdArrayElement>(
         }
 
         offset = checked_next_offset(offset, decoded.info.blob_size, blob.len())?;
-        infos.push(decoded.info);
         band_index += 1;
     }
 
-    BandSetInfo::new(infos)
+    Ok(band_info)
 }
 
 pub fn decode_band_set_ndarray<T: NdArrayElement>(blob: &[u8]) -> Result<ArrayD<T>> {
@@ -235,6 +210,35 @@ fn decode_first_with_masks(
         return lerc2::decode(blob, lerc2_shared_mask);
     }
     Err(Error::InvalidMagic)
+}
+
+fn scan_band_infos(blob: &[u8]) -> Result<BandSetInfo> {
+    let mut offset = 0usize;
+    let mut infos = Vec::new();
+    let mut lerc1_mask: Option<Vec<u8>> = None;
+    let mut lerc2_mask: Option<Vec<u8>> = None;
+
+    while offset < blob.len() {
+        let slice = &blob[offset..];
+        let (info, next_lerc1_mask, next_lerc2_mask) = if lerc1::is_lerc1(slice) {
+            let parsed = lerc1::parse(slice, lerc1_mask.as_deref())?;
+            let info = parsed.info;
+            let next_mask = parsed.mask;
+            (info, next_mask, None)
+        } else if lerc2::is_lerc2(slice) {
+            let (info, mask) = lerc2::inspect_with_mask(slice, lerc2_mask.as_deref())?;
+            (info, None, mask)
+        } else {
+            return Err(Error::InvalidMagic);
+        };
+
+        offset = checked_next_offset(offset, info.blob_size, blob.len())?;
+        lerc1_mask = next_lerc1_mask;
+        lerc2_mask = next_lerc2_mask;
+        infos.push(info);
+    }
+
+    BandSetInfo::new(infos)
 }
 
 fn ensure_single_blob_consumed(

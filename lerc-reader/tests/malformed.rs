@@ -1,6 +1,6 @@
 use lerc_core::Error;
 
-fn build_header_v2(
+struct HeaderV2 {
     width: u32,
     height: u32,
     valid_pixel_count: u32,
@@ -9,20 +9,22 @@ fn build_header_v2(
     z_min: f64,
     z_max: f64,
     payload_len: usize,
-) -> Vec<u8> {
-    let blob_size = 58 + 4 + payload_len;
+}
+
+fn build_header_v2(header: HeaderV2) -> Vec<u8> {
+    let blob_size = 58 + 4 + header.payload_len;
     let mut bytes = Vec::with_capacity(blob_size);
     bytes.extend_from_slice(b"Lerc2 ");
     bytes.extend_from_slice(&2i32.to_le_bytes());
-    bytes.extend_from_slice(&height.to_le_bytes());
-    bytes.extend_from_slice(&width.to_le_bytes());
-    bytes.extend_from_slice(&valid_pixel_count.to_le_bytes());
+    bytes.extend_from_slice(&header.height.to_le_bytes());
+    bytes.extend_from_slice(&header.width.to_le_bytes());
+    bytes.extend_from_slice(&header.valid_pixel_count.to_le_bytes());
     bytes.extend_from_slice(&8i32.to_le_bytes());
     bytes.extend_from_slice(&(blob_size as i32).to_le_bytes());
-    bytes.extend_from_slice(&image_type.to_le_bytes());
-    bytes.extend_from_slice(&max_z_error.to_le_bytes());
-    bytes.extend_from_slice(&z_min.to_le_bytes());
-    bytes.extend_from_slice(&z_max.to_le_bytes());
+    bytes.extend_from_slice(&header.image_type.to_le_bytes());
+    bytes.extend_from_slice(&header.max_z_error.to_le_bytes());
+    bytes.extend_from_slice(&header.z_min.to_le_bytes());
+    bytes.extend_from_slice(&header.z_max.to_le_bytes());
     bytes
 }
 
@@ -101,9 +103,27 @@ fn build_lerc1_blob_with_stuffed_count(
 
 #[test]
 fn strict_single_blob_api_rejects_concatenated_payload() {
-    let mut blob1 = build_header_v2(1, 1, 1, 1, 0.0, 3.0, 3.0, 0);
+    let mut blob1 = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 3.0,
+        z_max: 3.0,
+        payload_len: 0,
+    });
     blob1.extend_from_slice(&0u32.to_le_bytes());
-    let mut blob2 = build_header_v2(1, 1, 1, 1, 0.0, 4.0, 4.0, 0);
+    let mut blob2 = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 4.0,
+        z_max: 4.0,
+        payload_len: 0,
+    });
     blob2.extend_from_slice(&0u32.to_le_bytes());
     let mut merged = blob1;
     merged.extend_from_slice(&blob2);
@@ -122,7 +142,16 @@ fn strict_single_blob_api_rejects_concatenated_payload() {
 fn rejects_mask_rle_with_trailing_bytes_after_sentinel() {
     let mut mask = encode_mask_rle(&[1, 1, 1, 0]);
     mask.push(0xAA);
-    let mut blob = build_header_v2(2, 2, 3, 1, 0.0, 1.0, 3.0, mask.len() + 1 + 3);
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 2,
+        height: 2,
+        valid_pixel_count: 3,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 1.0,
+        z_max: 3.0,
+        payload_len: mask.len() + 1 + 3,
+    });
     blob.extend_from_slice(&(mask.len() as u32).to_le_bytes());
     blob.extend_from_slice(&mask);
     blob.push(1);
@@ -145,7 +174,16 @@ fn rejects_lerc1_stuffed_block_with_mismatched_valid_count() {
 
 #[test]
 fn rejects_invalid_huffman_table_header() {
-    let mut blob = build_header_v2(1, 1, 1, 1, 0.5, 0.0, 255.0, 1 + 1 + 16);
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.5,
+        z_min: 0.0,
+        z_max: 255.0,
+        payload_len: 1 + 1 + 16,
+    });
     blob.extend_from_slice(&0u32.to_le_bytes());
     blob.push(0);
     blob.push(1);
@@ -162,7 +200,16 @@ fn rejects_invalid_huffman_table_header() {
 
 #[test]
 fn rejects_non_lerc_trailing_segment_in_band_count() {
-    let mut blob = build_header_v2(1, 1, 1, 1, 0.0, 3.0, 3.0, 0);
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 3.0,
+        z_max: 3.0,
+        payload_len: 0,
+    });
     blob.extend_from_slice(&0u32.to_le_bytes());
     blob.extend_from_slice(b"junk");
 

@@ -41,7 +41,6 @@ pub(crate) struct Lerc1Blob {
     actual_num_blocks_x: usize,
     base_block_height: usize,
     base_block_width: usize,
-    pub(crate) eof_offset: usize,
 }
 
 pub(crate) fn is_lerc1(blob: &[u8]) -> bool {
@@ -60,9 +59,11 @@ pub(crate) fn inspect(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<BlobInf
 
 pub(crate) fn decode(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Decoded> {
     let mut parsed = parse(blob, shared_mask)?;
-    let pixels = decode_pixels(&parsed)?;
+    let (pixels, z_range) = decode_pixels(&parsed)?;
     if parsed.info.valid_pixel_count != 0 {
-        let (z_min, z_max) = scan_range(&parsed)?;
+        let (z_min, z_max) = z_range.ok_or_else(|| {
+            Error::InvalidBlob("Lerc1 decode produced pixels but not a value range".into())
+        })?;
         parsed.info.z_min = z_min;
         parsed.info.z_max = z_max;
     }
@@ -253,7 +254,6 @@ pub(crate) fn parse(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Lerc1Blob
         actual_num_blocks_x,
         base_block_height,
         base_block_width,
-        eof_offset,
     })
 }
 
@@ -302,13 +302,15 @@ fn read_mask(cursor: &mut Cursor<'_>, width: u32, height: u32) -> Result<Option<
     Ok(None)
 }
 
-fn decode_pixels(parsed: &Lerc1Blob) -> Result<PixelData> {
+fn decode_pixels(parsed: &Lerc1Blob) -> Result<(PixelData, Option<(f64, f64)>)> {
     let width = parsed.info.width as usize;
     let height = parsed.info.height as usize;
     let mask = parsed.mask.as_deref();
     let mut result = vec![0.0f32; width * height];
     let mut block_buffer = vec![0.0f64; parsed.base_block_width * parsed.base_block_height];
     let mut block_index = 0usize;
+    let mut min_value = f64::INFINITY;
+    let mut max_value = f64::NEG_INFINITY;
 
     for block_y in 0..parsed.actual_num_blocks_y {
         let this_block_height = block_height(
@@ -390,6 +392,9 @@ fn decode_pixels(parsed: &Lerc1Blob) -> Result<PixelData> {
                             unreachable!()
                         };
                         result[pixel] = value;
+                        let value_f64 = f64::from(value);
+                        min_value = min_value.min(value_f64);
+                        max_value = max_value.max(value_f64);
                         value_index += 1;
                     }
                 }
@@ -408,7 +413,13 @@ fn decode_pixels(parsed: &Lerc1Blob) -> Result<PixelData> {
         }
     }
 
-    Ok(PixelData::F32(result))
+    let z_range = if min_value.is_finite() && max_value.is_finite() {
+        Some((min_value, max_value))
+    } else {
+        None
+    };
+
+    Ok((PixelData::F32(result), z_range))
 }
 
 fn scan_range(parsed: &Lerc1Blob) -> Result<(f64, f64)> {
