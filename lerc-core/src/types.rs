@@ -130,6 +130,12 @@ impl PixelData {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandLayout {
+    Interleaved,
+    Bsq,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
     Lerc1(u32),
     Lerc2(u32),
@@ -276,16 +282,28 @@ impl BandSetInfo {
     }
 
     pub fn ndarray_shape(&self) -> Vec<usize> {
+        self.ndarray_shape_for_layout(BandLayout::Interleaved)
+    }
+
+    pub fn ndarray_shape_for_layout(&self, layout: BandLayout) -> Vec<usize> {
         let height = self.height() as usize;
         let width = self.width() as usize;
         let depth = self.depth() as usize;
         let band_count = self.band_count();
 
-        match (band_count, depth) {
-            (1, 0 | 1) => vec![height, width],
-            (1, depth) => vec![height, width, depth],
-            (_, 0 | 1) => vec![height, width, band_count],
-            (_, depth) => vec![height, width, band_count, depth],
+        match layout {
+            BandLayout::Interleaved => match (band_count, depth) {
+                (1, 0 | 1) => vec![height, width],
+                (1, depth) => vec![height, width, depth],
+                (_, 0 | 1) => vec![height, width, band_count],
+                (_, depth) => vec![height, width, band_count, depth],
+            },
+            BandLayout::Bsq => match (band_count, depth) {
+                (1, 0 | 1) => vec![height, width],
+                (1, depth) => vec![height, width, depth],
+                (_, 0 | 1) => vec![band_count, height, width],
+                (_, depth) => vec![band_count, height, width, depth],
+            },
         }
     }
 
@@ -308,64 +326,97 @@ pub struct DecodedBandSet {
 
 impl DecodedBandSet {
     pub fn into_ndarray<T: NdArrayElement>(self) -> Result<ArrayD<T>> {
-        let shape = self.info.ndarray_shape();
-        if self.bands.len() == 1 {
-            return self.bands.into_iter().next().unwrap().into_ndarray(&shape);
-        }
+        self.into_ndarray_with_layout(BandLayout::Interleaved)
+    }
 
-        let pixel_count = self.info.bands[0].pixel_count()?;
-        let depth = self.info.depth() as usize;
-        let bands: Vec<Vec<T>> = self
-            .bands
-            .into_iter()
-            .map(T::from_pixel_data)
-            .collect::<Result<_>>()?;
-        let mut merged = Vec::with_capacity(
-            pixel_count
-                .checked_mul(self.info.band_count())
-                .and_then(|n| n.checked_mul(depth.max(1)))
-                .ok_or_else(|| Error::InvalidBlob("LERC ndarray size overflows usize".into()))?,
-        );
-
-        if depth <= 1 {
-            for pixel in 0..pixel_count {
-                for band in &bands {
-                    merged.push(
-                        band.get(pixel)
-                            .ok_or_else(|| {
-                                Error::InvalidBlob(
-                                    "LERC band set pixel buffers have inconsistent lengths".into(),
-                                )
-                            })?
-                            .to_owned(),
-                    );
-                }
-            }
-        } else {
-            for pixel in 0..pixel_count {
-                let base = pixel * depth;
-                for band in &bands {
-                    for offset in 0..depth {
-                        merged.push(
-                            band.get(base + offset)
-                                .ok_or_else(|| {
-                                    Error::InvalidBlob(
-                                        "LERC band set pixel buffers have inconsistent lengths"
-                                            .into(),
-                                    )
-                                })?
-                                .to_owned(),
-                        );
-                    }
-                }
-            }
-        }
-
+    pub fn into_ndarray_with_layout<T: NdArrayElement>(
+        self,
+        layout: BandLayout,
+    ) -> Result<ArrayD<T>> {
+        let shape = self.info.ndarray_shape_for_layout(layout);
+        let merged = self.into_vec_with_layout(layout)?;
         ArrayD::from_shape_vec(IxDyn(&shape), merged).map_err(|e| {
             Error::InvalidBlob(format!(
                 "failed to build ndarray from decoded band set: {e}"
             ))
         })
+    }
+
+    pub fn into_vec_with_layout<T: NdArrayElement>(self, layout: BandLayout) -> Result<Vec<T>> {
+        let info = self.info.clone();
+        if self.bands.len() == 1 {
+            return T::from_pixel_data(self.bands.into_iter().next().unwrap());
+        }
+
+        let pixel_count = info.bands[0].pixel_count()?;
+        let depth = info.depth() as usize;
+        let sample_count = pixel_count
+            .checked_mul(info.band_count())
+            .and_then(|n| n.checked_mul(depth.max(1)))
+            .ok_or_else(|| Error::InvalidBlob("LERC ndarray size overflows usize".into()))?;
+        let bands: Vec<Vec<T>> = self
+            .bands
+            .into_iter()
+            .map(T::from_pixel_data)
+            .collect::<Result<_>>()?;
+        let mut merged = Vec::with_capacity(sample_count);
+
+        match layout {
+            BandLayout::Interleaved => {
+                if depth <= 1 {
+                    for pixel in 0..pixel_count {
+                        for band in &bands {
+                            merged.push(
+                                band.get(pixel)
+                                    .ok_or_else(|| {
+                                        Error::InvalidBlob(
+                                            "LERC band set pixel buffers have inconsistent lengths"
+                                                .into(),
+                                        )
+                                    })?
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                } else {
+                    for pixel in 0..pixel_count {
+                        let base = pixel * depth;
+                        for band in &bands {
+                            let slice = band.get(base..base + depth).ok_or_else(|| {
+                                Error::InvalidBlob(
+                                    "LERC band set pixel buffers have inconsistent lengths".into(),
+                                )
+                            })?;
+                            merged.extend_from_slice(slice);
+                        }
+                    }
+                }
+            }
+            BandLayout::Bsq => {
+                for band in &bands {
+                    merged.extend_from_slice(band);
+                }
+            }
+        }
+
+        Ok(merged)
+    }
+
+    pub fn copy_into_slice<T: NdArrayElement>(
+        self,
+        layout: BandLayout,
+        out: &mut [T],
+    ) -> Result<()> {
+        let values = self.into_vec_with_layout(layout)?;
+        if out.len() != values.len() {
+            return Err(Error::InvalidBlob(format!(
+                "output slice length {} does not match decoded band set length {}",
+                out.len(),
+                values.len()
+            )));
+        }
+        out.clone_from_slice(&values);
+        Ok(())
     }
 
     pub fn into_band_mask_ndarray(self) -> Result<Option<ArrayD<u8>>> {

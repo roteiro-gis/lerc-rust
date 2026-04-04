@@ -28,11 +28,20 @@ let mask = decode_mask_ndarray(&blob)?;
 println!("shape={:?} has_mask={}", raster.shape(), mask.is_some());
 ```
 
-Concatenated band sets decode to bands-last arrays:
+Single-blob entry points are strict. If you intentionally want first-blob
+inspection or decode from a concatenated payload, use `inspect_first()` or
+`decode_first()`.
+
+Concatenated band sets decode to bands-last arrays by default, and can also be
+requested in BSQ order:
 
 ```rust
 let rgb: ndarray::ArrayD<u8> = lerc_reader::decode_band_set_ndarray(&blob)?;
 assert_eq!(rgb.shape(), &[height, width, bands]);
+
+let (info, bsq): (_, Vec<u8>) =
+    lerc_reader::decode_band_set_vec(&blob, lerc_core::BandLayout::Bsq)?;
+assert_eq!(bsq.len(), (info.width() * info.height() * info.band_count() as u32) as usize);
 ```
 
 ## Supported Now
@@ -42,7 +51,8 @@ assert_eq!(rgb.shape(), &[height, width, bands]);
 - Lerc2 header parsing, Fletcher32 verification, mask decoding, constant/raw,
   tiled, bit-stuffed, and Huffman decode paths
 - Native typed decode and type-promoting `f64` decode
-- Direct `ndarray::ArrayD` conversion for rasters, band sets, and masks
+- Strict single-blob APIs plus permissive first-blob adapters for concatenated payloads
+- Direct `ndarray::ArrayD` conversion for rasters, band sets, and masks, with selectable band layout
 - Shape helpers and shared metadata types in `lerc-core`
 
 ## Testing
@@ -61,6 +71,8 @@ The default test suite covers:
 - official Esri fixtures for Lerc1, masked Lerc2, and concatenated multi-band
   Lerc2
 - an Esri JavaScript sanity fixture for `depth > 1`
+- malformed-input regression coverage for strict parsing, mask RLE, Huffman tables,
+  bit-stuffed payloads, and concatenated parsing
 
 Reference-library parity tests compare `lerc-reader` against Esri's official
 `libLerc` decoder when a compiled helper path is configured; otherwise they
@@ -86,6 +98,16 @@ Criterion comparison benches against `libLerc` live in
 
 For methodology and current benchmark notes, see the repository copy of
 [docs/benchmark-report.md](https://github.com/i-norden/lerc-rust/blob/main/docs/benchmark-report.md).
+
+`cargo-fuzz` targets for decoder hardening live under [`fuzz/`](./fuzz):
+
+```sh
+cargo fuzz run headers
+cargo fuzz run mask_rle
+cargo fuzz run huffman_tables
+cargo fuzz run bitstuff_blocks
+cargo fuzz run concatenated
+```
 
 ## License
 

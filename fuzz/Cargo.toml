@@ -1,0 +1,47 @@
+[package]
+name = "lerc-rust-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lerc-reader = { path = "../lerc-reader" }
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mask_rle"
+path = "fuzz_targets/mask_rle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "huffman_tables"
+path = "fuzz_targets/huffman_tables.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bitstuff_blocks"
+path = "fuzz_targets/bitstuff_blocks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "concatenated"
+path = "fuzz_targets/concatenated.rs"
+test = false
+doc = false
+bench = false
