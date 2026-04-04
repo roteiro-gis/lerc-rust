@@ -92,13 +92,15 @@ The default test suite covers:
 - malformed-input regression coverage for strict parsing, mask RLE, Huffman tables,
   bit-stuffed payloads, concatenated parsing, and writer roundtrips/output sizing
 
-Reference-library parity tests compare `lerc-reader` against Esri's official
-`libLerc` decoder when a compiled helper path is configured; otherwise they
-self-skip:
+Reference-library parity tests compare both decode and writer output against
+Esri's official `libLerc` decoder when a compiled helper path is configured;
+otherwise they self-skip:
 
 ```sh
 LERC_READER_REFERENCE_HELPER="$(./scripts/build-reference-helper.sh)" \
   cargo test -p lerc-reader --test reference_parity
+LERC_READER_REFERENCE_HELPER="$(./scripts/build-reference-helper.sh)" \
+  cargo test -p lerc-writer --test reference_parity
 ```
 
 For a reproducible reference environment, run the Docker harness:
@@ -107,8 +109,8 @@ For a reproducible reference environment, run the Docker harness:
 ./scripts/run-reference-parity.sh
 ```
 
-Criterion comparison benches against `libLerc` live in
-`lerc-reader/benches/reference_compare_bench.rs`:
+Criterion benchmark entry points live in `lerc-reader` for decode-vs-`libLerc`
+comparison and in `lerc-writer` for encode / encode+decode throughput:
 
 ```sh
 ./scripts/run-reference-benchmarks.sh

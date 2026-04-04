@@ -1,7 +1,4 @@
-use lerc_core::{
-    append_value_as, bits_required, fletcher32, DataType, Error, MaskView, RasterView, Result,
-    Sample,
-};
+use lerc_core::{bits_required, fletcher32, DataType, Error, MaskView, RasterView, Result, Sample};
 
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
 const VERSION: i32 = 4;
@@ -24,21 +21,93 @@ impl Default for EncodeOptions {
 }
 
 #[derive(Debug, Clone)]
-struct EncodePlan {
+struct RasterAnalysis {
     data_type: DataType,
     width: u32,
     height: u32,
     depth: u32,
     valid_pixel_count: u32,
-    micro_block_size: u32,
     max_z_error: f64,
+    micro_block_size: u32,
     z_min: f64,
     z_max: f64,
-    mask_bytes: Vec<u8>,
     min_values: Option<Vec<f64>>,
     max_values: Option<Vec<f64>>,
-    body: Vec<u8>,
-    exact_len: usize,
+}
+
+trait ByteSink {
+    fn push(&mut self, byte: u8) -> Result<()>;
+    fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<()>;
+    fn len(&self) -> usize;
+}
+
+#[derive(Debug, Default)]
+struct CountSink {
+    len: usize,
+}
+
+impl ByteSink for CountSink {
+    fn push(&mut self, _byte: u8) -> Result<()> {
+        self.len += 1;
+        Ok(())
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| Error::InvalidArgument("encoded blob size overflows usize".into()))?;
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+struct SliceSink<'a> {
+    out: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> SliceSink<'a> {
+    fn new(out: &'a mut [u8]) -> Self {
+        Self { out, len: 0 }
+    }
+}
+
+impl ByteSink for SliceSink<'_> {
+    fn push(&mut self, byte: u8) -> Result<()> {
+        if self.len >= self.out.len() {
+            return Err(Error::OutputTooSmall {
+                needed: self.len + 1,
+                available: self.out.len(),
+            });
+        }
+        self.out[self.len] = byte;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
+        let end = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| Error::InvalidArgument("encoded blob size overflows usize".into()))?;
+        if end > self.out.len() {
+            return Err(Error::OutputTooSmall {
+                needed: end,
+                available: self.out.len(),
+            });
+        }
+        self.out[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
 }
 
 pub fn encoded_len_upper_bound<T: Sample>(
@@ -46,7 +115,39 @@ pub fn encoded_len_upper_bound<T: Sample>(
     mask: Option<MaskView<'_>>,
     options: EncodeOptions,
 ) -> Result<usize> {
-    Ok(build_plan(raster, mask, options)?.exact_len)
+    validate_options(raster, mask, options)?;
+
+    let pixel_count = raster.pixel_count()?;
+    let valid_pixel_count = mask.map(|mask| mask.valid_count()).unwrap_or(pixel_count);
+    let depth = raster.depth() as usize;
+    let num_tiles = tile_count(raster.width() as usize, raster.height() as usize, options)?;
+    let byte_len = raster.data_type().byte_len();
+    let mask_len = mask_payload_len(pixel_count, valid_pixel_count)?;
+    let range_len = if valid_pixel_count == 0 {
+        0
+    } else {
+        depth
+            .checked_mul(2)
+            .and_then(|len| len.checked_mul(byte_len))
+            .ok_or_else(|| Error::InvalidArgument("range byte count overflows usize".into()))?
+    };
+    let prefix_len = body_prefix_len(raster.data_type(), options.max_z_error);
+    let tile_header_len = num_tiles
+        .checked_mul(depth)
+        .ok_or_else(|| Error::InvalidArgument("tile header length overflows usize".into()))?;
+    let raw_data_len = valid_pixel_count
+        .checked_mul(depth)
+        .and_then(|len| len.checked_mul(byte_len))
+        .ok_or_else(|| Error::InvalidArgument("raw tile payload length overflows usize".into()))?;
+
+    FIXED_HEADER_LEN
+        .checked_add(MASK_COUNT_LEN)
+        .and_then(|len| len.checked_add(mask_len))
+        .and_then(|len| len.checked_add(range_len))
+        .and_then(|len| len.checked_add(prefix_len))
+        .and_then(|len| len.checked_add(tile_header_len))
+        .and_then(|len| len.checked_add(raw_data_len))
+        .ok_or_else(|| Error::InvalidArgument("encoded upper bound overflows usize".into()))
 }
 
 pub fn encode<T: Sample>(
@@ -54,8 +155,18 @@ pub fn encode<T: Sample>(
     mask: Option<MaskView<'_>>,
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
-    let plan = build_plan(raster, mask, options)?;
-    serialize_plan(&plan)
+    let analysis = analyze_raster(raster, mask, options)?;
+    let exact_len = exact_encoded_len(raster, mask.map(MaskView::data), options, &analysis)?;
+    let mut out = vec![0u8; exact_len];
+    let written = encode_into_with_analysis(
+        raster,
+        mask.map(MaskView::data),
+        options,
+        &analysis,
+        &mut out,
+    )?;
+    debug_assert_eq!(written, exact_len);
+    Ok(out)
 }
 
 pub fn encode_into<T: Sample>(
@@ -64,44 +175,41 @@ pub fn encode_into<T: Sample>(
     options: EncodeOptions,
     out: &mut [u8],
 ) -> Result<usize> {
-    let encoded = encode(raster, mask, options)?;
-    if out.len() < encoded.len() {
+    let analysis = analyze_raster(raster, mask, options)?;
+    let exact_len = exact_encoded_len(raster, mask.map(MaskView::data), options, &analysis)?;
+    if out.len() < exact_len {
         return Err(Error::OutputTooSmall {
-            needed: encoded.len(),
+            needed: exact_len,
             available: out.len(),
         });
     }
-    out[..encoded.len()].copy_from_slice(&encoded);
-    Ok(encoded.len())
+    encode_into_with_analysis(raster, mask.map(MaskView::data), options, &analysis, out)
 }
 
-fn build_plan<T: Sample>(
+fn analyze_raster<T: Sample>(
     raster: RasterView<'_, T>,
     mask: Option<MaskView<'_>>,
     options: EncodeOptions,
-) -> Result<EncodePlan> {
+) -> Result<RasterAnalysis> {
     validate_options(raster, mask, options)?;
 
-    let width = raster.width();
-    let height = raster.height();
-    let depth = raster.depth();
     let pixel_count = raster.pixel_count()?;
-    let depth_usize = depth as usize;
+    let depth = raster.depth() as usize;
     let mask_slice = mask.map(MaskView::data);
     let data_type = raster.data_type();
 
     let mut valid_pixel_count = 0usize;
     let mut z_min = f64::INFINITY;
     let mut z_max = f64::NEG_INFINITY;
-    let mut min_values = vec![f64::INFINITY; depth_usize];
-    let mut max_values = vec![f64::NEG_INFINITY; depth_usize];
+    let mut min_values = vec![f64::INFINITY; depth];
+    let mut max_values = vec![f64::NEG_INFINITY; depth];
 
     for pixel in 0..pixel_count {
         if !pixel_is_valid(mask_slice, pixel) {
             continue;
         }
         valid_pixel_count += 1;
-        for dim in 0..depth_usize {
+        for dim in 0..depth {
             let value = raster.sample(pixel, dim).to_f64();
             if !value.is_finite() {
                 return Err(Error::InvalidArgument(
@@ -122,64 +230,78 @@ fn build_plan<T: Sample>(
         z_max = 0.0;
     }
 
-    let mask_bytes = if valid_pixel_count == 0 || valid_pixel_count == pixel_count as u32 {
-        Vec::new()
+    let (min_values, max_values) = if valid_pixel_count != 0 && z_min != z_max {
+        (Some(min_values), Some(max_values))
     } else {
-        encode_mask_rle(mask_slice.expect("partial-valid rasters require a mask"))
+        (None, None)
     };
 
-    let per_depth_ranges = if valid_pixel_count != 0 && z_min != z_max {
-        Some((min_values, max_values))
-    } else {
-        None
-    };
-    let has_per_depth_constant = per_depth_ranges
-        .as_ref()
-        .map(|(mins, maxs)| mins == maxs)
-        .unwrap_or(false);
+    Ok(RasterAnalysis {
+        data_type,
+        width: raster.width(),
+        height: raster.height(),
+        depth: raster.depth(),
+        valid_pixel_count,
+        max_z_error: options.max_z_error,
+        micro_block_size: options.micro_block_size,
+        z_min,
+        z_max,
+        min_values,
+        max_values,
+    })
+}
 
-    let body = if valid_pixel_count == 0 || z_min == z_max || has_per_depth_constant {
-        Vec::new()
-    } else {
-        encode_tile_body(raster, mask_slice, options)?
-    };
-
-    let range_len = per_depth_ranges
-        .as_ref()
-        .map(|(mins, maxs)| (mins.len() + maxs.len()) * data_type.byte_len())
-        .unwrap_or(0);
-    let exact_len = FIXED_HEADER_LEN
+fn exact_encoded_len<T: Sample>(
+    raster: RasterView<'_, T>,
+    mask: Option<&[u8]>,
+    options: EncodeOptions,
+    analysis: &RasterAnalysis,
+) -> Result<usize> {
+    let mut body = CountSink::default();
+    write_tile_body(&mut body, raster, mask, options, analysis)?;
+    let mask_len = mask_payload_len(raster.pixel_count()?, analysis.valid_pixel_count as usize)?;
+    let range_len = depth_range_len(analysis)?;
+    FIXED_HEADER_LEN
         .checked_add(MASK_COUNT_LEN)
-        .and_then(|len| len.checked_add(mask_bytes.len()))
+        .and_then(|len| len.checked_add(mask_len))
         .and_then(|len| len.checked_add(range_len))
         .and_then(|len| len.checked_add(body.len()))
-        .ok_or_else(|| Error::InvalidArgument("encoded blob size overflows usize".into()))?;
-    if exact_len > i32::MAX as usize {
+        .ok_or_else(|| Error::InvalidArgument("encoded blob size overflows usize".into()))
+}
+
+fn encode_into_with_analysis<T: Sample>(
+    raster: RasterView<'_, T>,
+    mask: Option<&[u8]>,
+    options: EncodeOptions,
+    analysis: &RasterAnalysis,
+    out: &mut [u8],
+) -> Result<usize> {
+    let mut sink = SliceSink::new(out);
+    write_header_prefix(&mut sink, analysis)?;
+    write_u32(
+        &mut sink,
+        mask_payload_len(raster.pixel_count()?, analysis.valid_pixel_count as usize)? as u32,
+    )?;
+    write_mask_rle(
+        &mut sink,
+        mask,
+        raster.pixel_count()?,
+        analysis.valid_pixel_count as usize,
+    )?;
+    write_depth_ranges(&mut sink, analysis)?;
+    write_tile_body(&mut sink, raster, mask, options, analysis)?;
+
+    let written = sink.len();
+    if written > i32::MAX as usize {
         return Err(Error::InvalidArgument(
             "encoded blob size exceeds the Lerc2 header limit".into(),
         ));
     }
 
-    let (min_values, max_values) = per_depth_ranges
-        .map(|(mins, maxs)| (Some(mins), Some(maxs)))
-        .unwrap_or((None, None));
-
-    Ok(EncodePlan {
-        data_type,
-        width,
-        height,
-        depth,
-        valid_pixel_count,
-        micro_block_size: options.micro_block_size,
-        max_z_error: options.max_z_error,
-        z_min,
-        z_max,
-        mask_bytes,
-        min_values,
-        max_values,
-        body,
-        exact_len,
-    })
+    out[34..38].copy_from_slice(&(written as i32).to_le_bytes());
+    let checksum = fletcher32(&out[14..written]);
+    out[10..14].copy_from_slice(&checksum.to_le_bytes());
+    Ok(written)
 }
 
 fn validate_options<T: Sample>(
@@ -212,16 +334,53 @@ fn validate_options<T: Sample>(
     Ok(())
 }
 
-fn encode_tile_body<T: Sample>(
+fn write_header_prefix(sink: &mut impl ByteSink, analysis: &RasterAnalysis) -> Result<()> {
+    sink.extend_from_slice(MAGIC_LERC2)?;
+    write_i32(sink, VERSION)?;
+    write_u32(sink, 0)?;
+    write_u32(sink, analysis.height)?;
+    write_u32(sink, analysis.width)?;
+    write_u32(sink, analysis.depth)?;
+    write_u32(sink, analysis.valid_pixel_count)?;
+    write_i32(sink, analysis.micro_block_size as i32)?;
+    write_i32(sink, 0)?;
+    write_i32(sink, analysis.data_type.code() as i32)?;
+    write_f64(sink, analysis.max_z_error)?;
+    write_f64(sink, analysis.z_min)?;
+    write_f64(sink, analysis.z_max)?;
+    Ok(())
+}
+
+fn write_depth_ranges(sink: &mut impl ByteSink, analysis: &RasterAnalysis) -> Result<()> {
+    if let (Some(min_values), Some(max_values)) = (&analysis.min_values, &analysis.max_values) {
+        for &value in min_values {
+            write_value_as(sink, value, analysis.data_type)?;
+        }
+        for &value in max_values {
+            write_value_as(sink, value, analysis.data_type)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_tile_body<T: Sample>(
+    sink: &mut impl ByteSink,
     raster: RasterView<'_, T>,
     mask: Option<&[u8]>,
     options: EncodeOptions,
-) -> Result<Vec<u8>> {
+    analysis: &RasterAnalysis,
+) -> Result<()> {
+    if analysis.valid_pixel_count == 0
+        || analysis.z_min == analysis.z_max
+        || has_per_depth_constant(analysis)
+    {
+        return Ok(());
+    }
+
     let width = raster.width() as usize;
     let height = raster.height() as usize;
     let depth = raster.depth() as usize;
     let micro = options.micro_block_size as usize;
-    let data_type = raster.data_type();
 
     let num_blocks_x = width.div_ceil(micro);
     let num_blocks_y = height.div_ceil(micro);
@@ -236,11 +395,9 @@ fn encode_tile_body<T: Sample>(
         height % micro
     };
 
-    let mut out = Vec::new();
-    out.push(0);
-    if matches!(data_type, DataType::I8 | DataType::U8) && (options.max_z_error - 0.5).abs() < 1e-5
-    {
-        out.push(0);
+    sink.push(0)?;
+    if needs_huffman_flag(analysis.data_type, options.max_z_error) {
+        sink.push(0)?;
     }
 
     for block_y in 0..num_blocks_y {
@@ -257,7 +414,6 @@ fn encode_tile_body<T: Sample>(
             };
 
             for dim in 0..depth {
-                let mut typed_values = Vec::with_capacity(block_width * block_height);
                 let mut values = Vec::with_capacity(block_width * block_height);
                 for row in 0..block_height {
                     let pixel_row = block_y * micro + row;
@@ -266,45 +422,51 @@ fn encode_tile_body<T: Sample>(
                         if !pixel_is_valid(mask, pixel) {
                             continue;
                         }
-                        let value = raster.sample(pixel, dim);
-                        typed_values.push(value);
-                        values.push(value.to_f64());
+                        values.push(raster.sample(pixel, dim));
                     }
                 }
 
                 let check_code = (((block_x * micro) >> 3) as u8) & 15;
                 if values.is_empty() {
-                    out.push(tile_header(check_code, 2));
+                    sink.push(tile_header(check_code, 2))?;
                     continue;
                 }
 
-                let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-                let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                let mut as_f64 = Vec::with_capacity(values.len());
+                for &value in &values {
+                    let value = value.to_f64();
+                    min = min.min(value);
+                    max = max.max(value);
+                    as_f64.push(value);
+                }
+
                 if min == max {
-                    out.push(tile_header(check_code, 3));
-                    append_value_as(&mut out, min, data_type);
+                    sink.push(tile_header(check_code, 3))?;
+                    write_value_as(sink, min, analysis.data_type)?;
                     continue;
                 }
 
-                let raw_len = 1 + typed_values.len() * data_type.byte_len();
-                if let Some(bitstuff) = try_bitstuff_tile(&values, min, max, options.max_z_error)? {
-                    if bitstuff.encoded_len(data_type) < raw_len {
-                        out.push(tile_header(check_code, 1));
-                        append_value_as(&mut out, bitstuff.offset, data_type);
-                        out.extend_from_slice(&bitstuff.payload);
+                let raw_len = 1 + values.len() * analysis.data_type.byte_len();
+                if let Some(bitstuff) = try_bitstuff_tile(&as_f64, min, max, options.max_z_error)? {
+                    if bitstuff.encoded_len(analysis.data_type) < raw_len {
+                        sink.push(tile_header(check_code, 1))?;
+                        write_value_as(sink, bitstuff.offset, analysis.data_type)?;
+                        sink.extend_from_slice(&bitstuff.payload)?;
                         continue;
                     }
                 }
 
-                out.push(tile_header(check_code, 0));
-                for value in typed_values {
-                    value.append_le_bytes(&mut out);
+                sink.push(tile_header(check_code, 0))?;
+                for value in as_f64 {
+                    write_value_as(sink, value, analysis.data_type)?;
                 }
             }
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -425,8 +587,18 @@ fn pack_lsb_bits(values: &[u32], bits_per_value: u8) -> Vec<u8> {
     out
 }
 
-fn encode_mask_rle(mask: &[u8]) -> Vec<u8> {
-    let bitset_len = mask.len().div_ceil(8);
+fn write_mask_rle(
+    sink: &mut impl ByteSink,
+    mask: Option<&[u8]>,
+    pixel_count: usize,
+    valid_pixel_count: usize,
+) -> Result<()> {
+    if valid_pixel_count == 0 || valid_pixel_count == pixel_count {
+        return Ok(());
+    }
+
+    let mask = mask.expect("partial-valid rasters require a mask");
+    let bitset_len = pixel_count.div_ceil(8);
     let mut bitset = vec![0u8; bitset_len];
     for (index, &value) in mask.iter().enumerate() {
         if value != 0 {
@@ -434,51 +606,91 @@ fn encode_mask_rle(mask: &[u8]) -> Vec<u8> {
         }
     }
 
-    let mut encoded = Vec::with_capacity(bitset_len + 4 + bitset_len / i16::MAX as usize);
     let mut offset = 0usize;
     while offset < bitset.len() {
         let chunk = (bitset.len() - offset).min(i16::MAX as usize);
-        encoded.extend_from_slice(&(chunk as i16).to_le_bytes());
-        encoded.extend_from_slice(&bitset[offset..offset + chunk]);
+        write_i16(sink, chunk as i16)?;
+        sink.extend_from_slice(&bitset[offset..offset + chunk])?;
         offset += chunk;
     }
-    encoded.extend_from_slice(&i16::MIN.to_le_bytes());
-    encoded
+    write_i16(sink, i16::MIN)
 }
 
-fn serialize_plan(plan: &EncodePlan) -> Result<Vec<u8>> {
-    let blob_size = i32::try_from(plan.exact_len)
-        .map_err(|_| Error::InvalidArgument("encoded blob size exceeds i32".into()))?;
-    let mut out = Vec::with_capacity(plan.exact_len);
-    out.extend_from_slice(MAGIC_LERC2);
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&plan.height.to_le_bytes());
-    out.extend_from_slice(&plan.width.to_le_bytes());
-    out.extend_from_slice(&plan.depth.to_le_bytes());
-    out.extend_from_slice(&plan.valid_pixel_count.to_le_bytes());
-    out.extend_from_slice(&(plan.micro_block_size as i32).to_le_bytes());
-    out.extend_from_slice(&blob_size.to_le_bytes());
-    out.extend_from_slice(&(plan.data_type.code() as i32).to_le_bytes());
-    out.extend_from_slice(&plan.max_z_error.to_le_bytes());
-    out.extend_from_slice(&plan.z_min.to_le_bytes());
-    out.extend_from_slice(&plan.z_max.to_le_bytes());
-    out.extend_from_slice(&(plan.mask_bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(&plan.mask_bytes);
-
-    if let (Some(mins), Some(maxs)) = (&plan.min_values, &plan.max_values) {
-        for &value in mins {
-            append_value_as(&mut out, value, plan.data_type);
-        }
-        for &value in maxs {
-            append_value_as(&mut out, value, plan.data_type);
-        }
+fn mask_payload_len(pixel_count: usize, valid_pixel_count: usize) -> Result<usize> {
+    if valid_pixel_count == 0 || valid_pixel_count == pixel_count {
+        return Ok(0);
     }
-    out.extend_from_slice(&plan.body);
+    let bitset_len = pixel_count.div_ceil(8);
+    let chunk_count = bitset_len.div_ceil(i16::MAX as usize);
+    bitset_len
+        .checked_add(chunk_count * 2)
+        .and_then(|len| len.checked_add(2))
+        .ok_or_else(|| Error::InvalidArgument("mask payload length overflows usize".into()))
+}
 
-    let checksum = fletcher32(&out[14..]);
-    out[10..14].copy_from_slice(&checksum.to_le_bytes());
-    Ok(out)
+fn depth_range_len(analysis: &RasterAnalysis) -> Result<usize> {
+    if analysis.min_values.is_none() {
+        return Ok(0);
+    }
+    (analysis.depth as usize)
+        .checked_mul(2)
+        .and_then(|len| len.checked_mul(analysis.data_type.byte_len()))
+        .ok_or_else(|| Error::InvalidArgument("range byte count overflows usize".into()))
+}
+
+fn tile_count(width: usize, height: usize, options: EncodeOptions) -> Result<usize> {
+    let micro = options.micro_block_size as usize;
+    let num_blocks_x = width.div_ceil(micro);
+    let num_blocks_y = height.div_ceil(micro);
+    num_blocks_x
+        .checked_mul(num_blocks_y)
+        .ok_or_else(|| Error::InvalidArgument("tile count overflows usize".into()))
+}
+
+fn body_prefix_len(data_type: DataType, max_z_error: f64) -> usize {
+    1 + usize::from(needs_huffman_flag(data_type, max_z_error))
+}
+
+fn needs_huffman_flag(data_type: DataType, max_z_error: f64) -> bool {
+    matches!(data_type, DataType::I8 | DataType::U8) && (max_z_error - 0.5).abs() < 1e-5
+}
+
+fn has_per_depth_constant(analysis: &RasterAnalysis) -> bool {
+    analysis
+        .min_values
+        .as_ref()
+        .zip(analysis.max_values.as_ref())
+        .map(|(mins, maxs)| mins == maxs)
+        .unwrap_or(false)
+}
+
+fn write_value_as(sink: &mut impl ByteSink, value: f64, data_type: DataType) -> Result<()> {
+    match data_type {
+        DataType::I8 => sink.push((value as i8) as u8),
+        DataType::U8 => sink.push(value as u8),
+        DataType::I16 => sink.extend_from_slice(&(value as i16).to_le_bytes()),
+        DataType::U16 => sink.extend_from_slice(&(value as u16).to_le_bytes()),
+        DataType::I32 => sink.extend_from_slice(&(value as i32).to_le_bytes()),
+        DataType::U32 => sink.extend_from_slice(&(value as u32).to_le_bytes()),
+        DataType::F32 => sink.extend_from_slice(&(value as f32).to_le_bytes()),
+        DataType::F64 => sink.extend_from_slice(&value.to_le_bytes()),
+    }
+}
+
+fn write_u32(sink: &mut impl ByteSink, value: u32) -> Result<()> {
+    sink.extend_from_slice(&value.to_le_bytes())
+}
+
+fn write_i32(sink: &mut impl ByteSink, value: i32) -> Result<()> {
+    sink.extend_from_slice(&value.to_le_bytes())
+}
+
+fn write_i16(sink: &mut impl ByteSink, value: i16) -> Result<()> {
+    sink.extend_from_slice(&value.to_le_bytes())
+}
+
+fn write_f64(sink: &mut impl ByteSink, value: f64) -> Result<()> {
+    sink.extend_from_slice(&value.to_le_bytes())
 }
 
 fn tile_header(check_code: u8, encoding: u8) -> u8 {

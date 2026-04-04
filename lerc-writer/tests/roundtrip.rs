@@ -21,6 +21,17 @@ fn roundtrips_constant_u16_raster() {
 }
 
 #[test]
+fn encoded_len_upper_bound_is_conservative() {
+    let pixels = vec![9u16; 6];
+    let raster = RasterView::new(3, 2, 1, &pixels).unwrap();
+    let upper = encoded_len_upper_bound(raster, None, EncodeOptions::default()).unwrap();
+    let blob = encode(raster, None, EncodeOptions::default()).unwrap();
+
+    assert!(upper >= blob.len());
+    assert!(upper > blob.len());
+}
+
+#[test]
 fn roundtrips_bitstuffed_u8_tiles_exactly() {
     let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
     let raster = RasterView::new(4, 2, 1, &pixels).unwrap();
