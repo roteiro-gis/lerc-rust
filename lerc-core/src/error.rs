@@ -9,10 +9,15 @@ pub enum Error {
         needed: usize,
         available: usize,
     },
+    OutputTooSmall {
+        needed: usize,
+        available: usize,
+    },
     InvalidMagic,
     UnsupportedVersion(u32),
     UnsupportedFeature(&'static str),
     InvalidHeader(&'static str),
+    InvalidArgument(String),
     InvalidBlob(String),
     ChecksumMismatch {
         expected: u32,
@@ -31,12 +36,17 @@ impl fmt::Display for Error {
                 f,
                 "truncated input at offset {offset}: need {needed} bytes, have {available}"
             ),
+            Self::OutputTooSmall { needed, available } => write!(
+                f,
+                "output buffer too small: need {needed} bytes, have {available}"
+            ),
             Self::InvalidMagic => write!(f, "invalid LERC magic"),
             Self::UnsupportedVersion(version) => {
                 write!(f, "unsupported LERC version {version}")
             }
             Self::UnsupportedFeature(feature) => write!(f, "unsupported LERC feature: {feature}"),
             Self::InvalidHeader(reason) => write!(f, "invalid LERC header: {reason}"),
+            Self::InvalidArgument(reason) => write!(f, "invalid argument: {reason}"),
             Self::InvalidBlob(reason) => write!(f, "invalid LERC blob: {reason}"),
             Self::ChecksumMismatch { expected, actual } => {
                 write!(

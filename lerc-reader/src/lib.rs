@@ -19,18 +19,20 @@ mod io;
 mod lerc1;
 mod lerc2;
 mod pixel;
+mod types;
 
 #[cfg(test)]
 mod tests;
 
 use lerc_band_materialize::{BandLayout as MaterializeLayout, BandMaterializer, BandSink};
-use lerc_core::{
-    BandElement, BandElementKind, BandLayout, BandSetInfo, BlobInfo, Decoded, DecodedBandSet,
-    DecodedF64, Error, NdArrayElement, Result,
-};
+use lerc_core::{BandLayout, BandSetInfo, BlobInfo, Error, Result};
 use ndarray::ArrayD;
 
 use crate::pixel::Sample;
+pub use crate::types::{
+    into_band_mask_ndarray, BandElement, BandElementKind, Decoded, DecodedBandSet, DecodedF64,
+    NdArrayElement,
+};
 
 macro_rules! dispatch_band_element {
     ($target:ty, |$concrete:ident| $body:block) => {
@@ -205,7 +207,7 @@ pub fn decode_band_set_ndarray_f64(blob: &[u8]) -> Result<ArrayD<f64>> {
 
 pub fn decode_band_mask_ndarray(blob: &[u8]) -> Result<Option<ArrayD<u8>>> {
     let (info, band_masks) = inspect_band_masks(blob)?;
-    info.into_band_mask_ndarray(band_masks)
+    into_band_mask_ndarray(info, band_masks)
 }
 
 pub fn decode_to_f64(blob: &[u8]) -> Result<DecodedF64> {

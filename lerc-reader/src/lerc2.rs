@@ -1,4 +1,4 @@
-use lerc_core::{BlobInfo, DataType, Decoded, DecodedF64, Error, PixelData, Result, Version};
+use lerc_core::{BlobInfo, DataType, Error, PixelData, Result, Version};
 
 use crate::bitstuff::{data_type_used, decode_bits, read_typed_scalar};
 use crate::huffman::{decode_huffman, decode_huffman_into};
@@ -7,6 +7,7 @@ use crate::pixel::{
     count_valid_in_block, fletcher32, output_value, read_typed_values, read_values_as,
     sample_index, Sample,
 };
+use crate::{Decoded, DecodedF64};
 use lerc_band_materialize::{BandWriteOrder, BandWriter};
 
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";

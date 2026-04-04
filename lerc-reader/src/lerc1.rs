@@ -1,8 +1,9 @@
-use lerc_core::{BlobInfo, DataType, Decoded, DecodedF64, Error, PixelData, Result, Version};
+use lerc_core::{BlobInfo, DataType, Error, PixelData, Result, Version};
 
 use crate::bitstuff::{unstuff_v2, UnstuffOptions};
 use crate::io::Cursor;
 use crate::pixel::{count_valid_in_block, words_from_padded, Sample};
+use crate::{Decoded, DecodedF64};
 use lerc_band_materialize::BandWriter;
 
 const MAGIC_LERC1_PREFIX: &[u8; 9] = b"CntZImage";
