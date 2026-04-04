@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-publish = false
+readme = "../README.md"
+documentation = "https://docs.rs/lerc-band-materialize"
+keywords = ["lerc", "raster", "compression", "gis", "geospatial"]
+categories = ["compression", "science"]
 
 [dependencies]
