@@ -3,7 +3,7 @@ use std::cmp;
 use crate::bitstuff::decode_bits;
 use crate::io::Cursor;
 use crate::pixel::{output_value, sample_index, words_from_padded, Sample};
-use lerc_band_materialize::BandWriter;
+use lerc_band_materialize::{BandWriteOrder, BandWriter};
 use lerc_core::{BlobInfo, Error, PixelData, Result, Version};
 
 const HUFFMAN_LUT_BITS_MAX: u8 = 12;
@@ -145,6 +145,9 @@ pub(crate) fn decode_huffman_into<T: Sample, W: BandWriter<T>>(
     };
 
     if depth < 2 || delta_encode {
+        if depth > 1 && delta_encode {
+            out.set_write_order(BandWriteOrder::DimMajor);
+        }
         for dim in 0..depth {
             let mut prev_value = 0.0;
             for row in 0..height {

@@ -7,6 +7,13 @@ pub enum BandLayout {
     Bsq,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandWriteOrder {
+    PixelMajor,
+    DimMajor,
+    Arbitrary,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializeError {
     message: String,
@@ -35,6 +42,7 @@ pub trait BandWriter<T: Copy + Default> {
     fn write(&mut self, pixel: usize, dim: usize, value: T);
     fn read(&self, pixel: usize, dim: usize) -> T;
     fn depth(&self) -> usize;
+    fn set_write_order(&mut self, _order: BandWriteOrder) {}
 }
 
 pub fn copy_band_values_into_slice<T: Clone>(
@@ -178,6 +186,7 @@ struct BandShape {
 #[derive(Debug, Clone)]
 struct ActiveBand {
     band_index: usize,
+    order: BandWriteOrder,
     progress: ActiveBandProgress,
 }
 
@@ -233,6 +242,7 @@ impl<T> BandMaterializer<T> {
         let band_len = band_len(self.shape.pixel_count, self.shape.depth)?;
         self.active_band = Some(ActiveBand {
             band_index,
+            order: BandWriteOrder::PixelMajor,
             progress: ActiveBandProgress::Prefix(0),
         });
         for value_index in 0..band_len {
@@ -252,6 +262,13 @@ impl<T> BandMaterializer<T> {
 
     pub fn finish(self) -> Result<Vec<T>> {
         let mut this = self;
+        if let Some(active_band) = this.active_band.as_ref() {
+            validate_active_band_complete(this.shape, active_band)?;
+            return Err(MaterializeError::new(format!(
+                "band {} was not finalized before finishing the output buffer",
+                active_band.band_index
+            )));
+        }
         if this.written_bands.iter().any(|written| !written) {
             return Err(MaterializeError::new(
                 "not all decoded bands were materialized into the output buffer",
@@ -281,6 +298,7 @@ impl<T> BandMaterializer<T> {
         }
         self.active_band = Some(ActiveBand {
             band_index,
+            order: BandWriteOrder::PixelMajor,
             progress: ActiveBandProgress::Prefix(0),
         });
         Ok(MaterializerBandWriter {
@@ -314,6 +332,7 @@ impl<T: Clone> BandMaterializer<T> {
 
         self.active_band = Some(ActiveBand {
             band_index,
+            order: BandWriteOrder::PixelMajor,
             progress: ActiveBandProgress::Prefix(0),
         });
         write_band_values_into_uninit_slice(
@@ -336,10 +355,15 @@ pub struct MaterializerBandWriter<'a, T> {
 }
 
 impl<T: Copy + Default> MaterializerBandWriter<'_, T> {
-    pub fn finish(mut self) {
+    pub fn finish(mut self) -> Result<()> {
+        let active_band = self.materializer.active_band.as_ref().ok_or_else(|| {
+            MaterializeError::new("cannot finalize a band that is no longer active")
+        })?;
+        validate_active_band_complete(self.materializer.shape, active_band)?;
         self.materializer.written_bands[self.band_index] = true;
         self.materializer.active_band = None;
         self.finished = true;
+        Ok(())
     }
 }
 
@@ -402,15 +426,23 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
                 pixel,
                 dim,
             );
-            match &mut self.materializer.active_band.as_mut().unwrap().progress {
+            let active_band = self.materializer.active_band.as_mut().unwrap();
+            match &mut active_band.progress {
                 ActiveBandProgress::Prefix(written_values) => {
-                    if logical_index < *written_values {
+                    let ordered_index = match active_band.order {
+                        BandWriteOrder::PixelMajor => logical_index,
+                        BandWriteOrder::DimMajor => {
+                            dim * self.materializer.shape.pixel_count + pixel
+                        }
+                        BandWriteOrder::Arbitrary => usize::MAX,
+                    };
+                    if ordered_index < *written_values {
                         unsafe {
                             *self.materializer.out[out_index].assume_init_mut() = value;
                         }
                         return;
                     }
-                    if logical_index == *written_values {
+                    if ordered_index == *written_values {
                         self.materializer.out[out_index].write(value);
                         *written_values += 1;
                         return;
@@ -425,9 +457,14 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
                             )
                             .expect("band length was validated when the materializer was created")
                         ];
-                    initialized[..*written_values].fill(true);
-                    self.materializer.active_band.as_mut().unwrap().progress =
-                        ActiveBandProgress::Sparse(initialized);
+                    for step_index in 0..*written_values {
+                        initialized[logical_index_for_step(
+                            self.materializer.shape,
+                            active_band.order,
+                            step_index,
+                        )] = true;
+                    }
+                    active_band.progress = ActiveBandProgress::Sparse(initialized);
                 }
                 ActiveBandProgress::Sparse(initialized) => {
                     if initialized[logical_index] {
@@ -453,10 +490,16 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
             dim,
         );
         let logical_index = pixel * self.materializer.shape.depth + dim;
-        match &self.materializer.active_band.as_ref().unwrap().progress {
+        let active_band = self.materializer.active_band.as_ref().unwrap();
+        match &active_band.progress {
             ActiveBandProgress::Prefix(written_values) => {
+                let ordered_index = match active_band.order {
+                    BandWriteOrder::PixelMajor => logical_index,
+                    BandWriteOrder::DimMajor => dim * self.materializer.shape.pixel_count + pixel,
+                    BandWriteOrder::Arbitrary => usize::MAX,
+                };
                 assert!(
-                    logical_index < *written_values,
+                    ordered_index < *written_values,
                     "attempted to read an uninitialized materialized sample"
                 );
             }
@@ -472,6 +515,14 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
 
     fn depth(&self) -> usize {
         self.materializer.shape.depth
+    }
+
+    fn set_write_order(&mut self, order: BandWriteOrder) {
+        let active_band = self.materializer.active_band.as_mut().unwrap();
+        match &active_band.progress {
+            ActiveBandProgress::Prefix(0) => active_band.order = order,
+            _ => debug_assert_eq!(active_band.order, order),
+        }
     }
 }
 
@@ -490,6 +541,7 @@ impl<T> Drop for BandMaterializer<T> {
                 self.shape,
                 band_index,
                 self.layout,
+                BandWriteOrder::PixelMajor,
                 band_len(self.shape.pixel_count, self.shape.depth).unwrap_or(0),
             );
         }
@@ -501,6 +553,7 @@ impl<T> Drop for BandMaterializer<T> {
                     self.shape,
                     active_band.band_index,
                     self.layout,
+                    active_band.order,
                     written_values,
                 ),
                 ActiveBandProgress::Sparse(initialized) => drop_sparse_band(
@@ -569,10 +622,11 @@ fn drop_band_prefix<T>(
     shape: BandShape,
     band_index: usize,
     layout: BandLayout,
+    order: BandWriteOrder,
     written_values: usize,
 ) {
-    for value_index in 0..written_values {
-        let out_index = band_value_index(shape, band_index, layout, value_index);
+    for step_index in 0..written_values {
+        let out_index = band_value_index_for_step(shape, band_index, layout, order, step_index);
         unsafe {
             out[out_index].assume_init_drop();
         }
@@ -617,6 +671,31 @@ fn band_value_index(
     }
 }
 
+fn logical_index_for_step(shape: BandShape, order: BandWriteOrder, step_index: usize) -> usize {
+    match order {
+        BandWriteOrder::PixelMajor => step_index,
+        BandWriteOrder::DimMajor => {
+            let pixel = step_index % shape.pixel_count;
+            let dim = step_index / shape.pixel_count;
+            pixel * shape.depth + dim
+        }
+        BandWriteOrder::Arbitrary => {
+            unreachable!("arbitrary-order writes cannot be represented as a prefix")
+        }
+    }
+}
+
+fn band_value_index_for_step(
+    shape: BandShape,
+    band_index: usize,
+    layout: BandLayout,
+    order: BandWriteOrder,
+    step_index: usize,
+) -> usize {
+    let logical_index = logical_index_for_step(shape, order, step_index);
+    band_value_index(shape, band_index, layout, logical_index)
+}
+
 fn band_value_index_for_pixel(
     shape: BandShape,
     band_index: usize,
@@ -642,6 +721,23 @@ fn total_len(pixel_count: usize, depth: usize, band_count: usize) -> Result<usiz
         .ok_or_else(|| MaterializeError::new("decoded band set length overflows usize"))
 }
 
+fn validate_active_band_complete(shape: BandShape, active_band: &ActiveBand) -> Result<()> {
+    let band_len = band_len(shape.pixel_count, shape.depth)?;
+    let is_complete = match &active_band.progress {
+        ActiveBandProgress::Prefix(written_values) => *written_values == band_len,
+        ActiveBandProgress::Sparse(initialized) => {
+            initialized.len() == band_len && initialized.iter().all(|initialized| *initialized)
+        }
+    };
+    if is_complete {
+        return Ok(());
+    }
+    Err(MaterializeError::new(format!(
+        "band {} was finalized before all decoded values were initialized",
+        active_band.band_index
+    )))
+}
+
 unsafe fn assume_init_vec<T>(values: Vec<MaybeUninit<T>>) -> Vec<T> {
     let len = values.len();
     let cap = values.capacity();
@@ -656,7 +752,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use super::{BandLayout, BandMaterializer};
+    use super::{BandLayout, BandMaterializer, BandWriteOrder, BandWriter};
 
     #[derive(Debug)]
     struct CloneBomb {
@@ -741,5 +837,20 @@ mod tests {
 
         drop(values);
         assert_eq!(state.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rejects_finalizing_incomplete_band_writer() {
+        let mut materializer =
+            BandMaterializer::<u16>::new(2, 2, 1, BandLayout::Interleaved).unwrap();
+        let mut writer = materializer.band_writer(0).unwrap();
+        writer.set_write_order(BandWriteOrder::DimMajor);
+        writer.write(0, 0, 1);
+        writer.write(1, 0, 2);
+        let err = writer.finish().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "band 0 was finalized before all decoded values were initialized"
+        );
     }
 }

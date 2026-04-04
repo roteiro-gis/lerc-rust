@@ -7,7 +7,7 @@ use crate::pixel::{
     count_valid_in_block, fletcher32, output_value, read_typed_values, read_values_as,
     sample_index, Sample,
 };
-use lerc_band_materialize::BandWriter;
+use lerc_band_materialize::{BandWriteOrder, BandWriter};
 
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
 
@@ -885,6 +885,7 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
     mask: Option<&[u8]>,
     out: &mut W,
 ) -> Result<()> {
+    out.set_write_order(BandWriteOrder::Arbitrary);
     let width = info.width as usize;
     let height = info.height as usize;
     let depth = info.depth as usize;
