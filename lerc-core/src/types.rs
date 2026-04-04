@@ -382,15 +382,11 @@ impl DecodedBandSet {
             )));
         }
 
-        let bands: Vec<Vec<T>> = self
-            .bands
-            .into_iter()
-            .map(T::from_pixel_data)
-            .collect::<Result<_>>()?;
-        for (band_index, band) in bands.iter().enumerate() {
+        for (band_index, band) in self.bands.into_iter().enumerate() {
+            let values = T::from_pixel_data(band)?;
             copy_band_values_into_slice(
                 out,
-                band,
+                &values,
                 pixel_count,
                 depth,
                 band_index,
@@ -441,8 +437,7 @@ impl DecodedBandSet {
     }
 }
 
-#[doc(hidden)]
-pub fn copy_band_values_into_slice<T: Clone>(
+fn copy_band_values_into_slice<T: Clone>(
     out: &mut [T],
     values: &[T],
     pixel_count: usize,
@@ -484,7 +479,7 @@ pub fn copy_band_values_into_slice<T: Clone>(
     Ok(())
 }
 
-pub struct BandMaterializer<T> {
+struct BandMaterializer<T> {
     info: BandSetInfo,
     layout: BandLayout,
     out: Vec<MaybeUninit<T>>,
@@ -539,13 +534,44 @@ impl<T: Clone> BandMaterializer<T> {
     }
 
     pub fn finish(self) -> Result<Vec<T>> {
-        if self.written_bands.iter().any(|written| !written) {
+        let mut this = self;
+        if this.written_bands.iter().any(|written| !written) {
             return Err(Error::InvalidBlob(
                 "not all decoded bands were materialized into the output buffer".into(),
             ));
         }
 
-        Ok(unsafe { assume_init_vec(self.out) })
+        let out = std::mem::take(&mut this.out);
+        this.written_bands.fill(false);
+        Ok(unsafe { assume_init_vec(out) })
+    }
+}
+
+impl<T> Drop for BandMaterializer<T> {
+    fn drop(&mut self) {
+        if self.out.is_empty() || self.written_bands.iter().all(|written| !written) {
+            return;
+        }
+
+        let Ok(pixel_count) = self.info.bands[0].pixel_count() else {
+            return;
+        };
+        let depth = (self.info.depth() as usize).max(1);
+        let band_count = self.info.band_count();
+
+        for (band_index, written) in self.written_bands.iter().copied().enumerate() {
+            if !written {
+                continue;
+            }
+            drop_written_band(
+                &mut self.out,
+                pixel_count,
+                depth,
+                band_index,
+                band_count,
+                self.layout,
+            );
+        }
     }
 }
 
@@ -600,6 +626,45 @@ unsafe fn assume_init_vec<T>(values: Vec<MaybeUninit<T>>) -> Vec<T> {
     let ptr = values.as_ptr() as *mut T;
     std::mem::forget(values);
     Vec::from_raw_parts(ptr, len, cap)
+}
+
+fn drop_written_band<T>(
+    out: &mut [MaybeUninit<T>],
+    pixel_count: usize,
+    depth: usize,
+    band_index: usize,
+    band_count: usize,
+    layout: BandLayout,
+) {
+    match layout {
+        BandLayout::Interleaved => {
+            if depth <= 1 {
+                for pixel in 0..pixel_count {
+                    unsafe {
+                        out[pixel * band_count + band_index].assume_init_drop();
+                    }
+                }
+            } else {
+                for pixel in 0..pixel_count {
+                    let dst_base = (pixel * band_count + band_index) * depth;
+                    for offset in 0..depth {
+                        unsafe {
+                            out[dst_base + offset].assume_init_drop();
+                        }
+                    }
+                }
+            }
+        }
+        BandLayout::Bsq => {
+            let band_len = pixel_count * depth;
+            let dst_base = band_index * band_len;
+            for index in 0..band_len {
+                unsafe {
+                    out[dst_base + index].assume_init_drop();
+                }
+            }
+        }
+    }
 }
 
 pub trait NdArrayElement: Sized + Clone {

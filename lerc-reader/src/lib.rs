@@ -13,6 +13,7 @@
 //! - decode only the first promoted `f64` blob with [`decode_first_to_f64`]
 //! - decode directly into `ndarray::ArrayD` with [`decode_ndarray`]
 
+mod band_materialize;
 mod bitstuff;
 mod huffman;
 mod io;
@@ -23,9 +24,10 @@ mod pixel;
 #[cfg(test)]
 mod tests;
 
+use band_materialize::{copy_band_values_into_slice, BandMaterializer};
 use lerc_core::{
-    copy_band_values_into_slice, BandLayout, BandMaterializer, BandSetInfo, BlobInfo, Decoded,
-    DecodedBandSet, DecodedF64, Error, NdArrayElement, Result,
+    BandLayout, BandSetInfo, BlobInfo, Decoded, DecodedBandSet, DecodedF64, Error, NdArrayElement,
+    Result,
 };
 use ndarray::ArrayD;
 
