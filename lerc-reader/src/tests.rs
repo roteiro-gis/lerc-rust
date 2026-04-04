@@ -335,3 +335,25 @@ fn decode_band_set_into_supports_bsq_layout() {
     assert_eq!(info.band_count(), 2);
     assert_eq!(out, vec![1, 2, 3, 4]);
 }
+
+#[test]
+fn decode_band_set_ndarray_f64_promotes_concatenated_bands_directly() {
+    let mut blob1 = build_header_v2(1, 2, 2, 1, 0.0, 1.0, 2.0, 1 + 2);
+    blob1.extend_from_slice(&0u32.to_le_bytes());
+    blob1.push(1);
+    blob1.extend_from_slice(&[1, 2]);
+    let mut blob2 = build_header_v2(1, 2, 2, 1, 0.0, 3.0, 4.0, 1 + 2);
+    blob2.extend_from_slice(&0u32.to_le_bytes());
+    blob2.push(1);
+    blob2.extend_from_slice(&[3, 4]);
+
+    let mut merged = blob1;
+    merged.extend_from_slice(&blob2);
+
+    let array = decode_band_set_ndarray_f64(&merged).unwrap();
+    assert_eq!(array.shape(), &[2, 1, 2]);
+    assert_eq!(array[IxDyn(&[0, 0, 0])], 1.0);
+    assert_eq!(array[IxDyn(&[0, 0, 1])], 3.0);
+    assert_eq!(array[IxDyn(&[1, 0, 0])], 2.0);
+    assert_eq!(array[IxDyn(&[1, 0, 1])], 4.0);
+}

@@ -13,6 +13,7 @@
 //! - decode only the first promoted `f64` blob with [`decode_first_to_f64`]
 //! - decode directly into `ndarray::ArrayD` with [`decode_ndarray`]
 
+mod band_sink;
 mod bitstuff;
 mod huffman;
 mod io;
@@ -31,6 +32,10 @@ use lerc_core::{
     Result,
 };
 use ndarray::ArrayD;
+use std::any::TypeId;
+
+use crate::band_sink::BandSink;
+use crate::pixel::Sample;
 
 pub fn inspect_first(blob: &[u8]) -> Result<BlobInfo> {
     if lerc1::is_lerc1(blob) {
@@ -127,11 +132,36 @@ pub fn decode_band_set_vec<T: NdArrayElement>(
     decode_band_set_owned(blob, layout)
 }
 
-pub fn decode_band_set_into<T: NdArrayElement>(
+pub fn decode_band_set_into<T: NdArrayElement + 'static>(
     blob: &[u8],
     layout: BandLayout,
     out: &mut [T],
 ) -> Result<BandSetInfo> {
+    if TypeId::of::<T>() == TypeId::of::<i8>() {
+        return decode_band_set_into_impl::<i8>(blob, layout, cast_slice_mut::<T, i8>(out));
+    }
+    if TypeId::of::<T>() == TypeId::of::<u8>() {
+        return decode_band_set_into_impl::<u8>(blob, layout, cast_slice_mut::<T, u8>(out));
+    }
+    if TypeId::of::<T>() == TypeId::of::<i16>() {
+        return decode_band_set_into_impl::<i16>(blob, layout, cast_slice_mut::<T, i16>(out));
+    }
+    if TypeId::of::<T>() == TypeId::of::<u16>() {
+        return decode_band_set_into_impl::<u16>(blob, layout, cast_slice_mut::<T, u16>(out));
+    }
+    if TypeId::of::<T>() == TypeId::of::<i32>() {
+        return decode_band_set_into_impl::<i32>(blob, layout, cast_slice_mut::<T, i32>(out));
+    }
+    if TypeId::of::<T>() == TypeId::of::<u32>() {
+        return decode_band_set_into_impl::<u32>(blob, layout, cast_slice_mut::<T, u32>(out));
+    }
+    if TypeId::of::<T>() == TypeId::of::<f32>() {
+        return decode_band_set_into_impl::<f32>(blob, layout, cast_slice_mut::<T, f32>(out));
+    }
+    if TypeId::of::<T>() == TypeId::of::<f64>() {
+        return decode_band_set_into_impl::<f64>(blob, layout, cast_slice_mut::<T, f64>(out));
+    }
+
     let band_info = scan_band_infos(blob)?;
     let band_count = band_info.band_count();
     let expected_len = band_info.value_count()?;
@@ -200,11 +230,20 @@ pub fn decode_band_set_ndarray_with_layout<T: NdArrayElement>(
 }
 
 pub fn decode_band_set_ndarray_f64(blob: &[u8]) -> Result<ArrayD<f64>> {
-    decode_band_set_ndarray_with_layout(blob, BandLayout::Interleaved)
+    let band_info = decode_band_set_to_f64_info(blob, BandLayout::Interleaved)?;
+    let shape = band_info
+        .0
+        .ndarray_shape_for_layout(BandLayout::Interleaved);
+    ArrayD::from_shape_vec(ndarray::IxDyn(&shape), band_info.1).map_err(|e| {
+        Error::InvalidBlob(format!(
+            "failed to build ndarray from decoded band set: {e}"
+        ))
+    })
 }
 
 pub fn decode_band_mask_ndarray(blob: &[u8]) -> Result<Option<ArrayD<u8>>> {
-    decode_band_set(blob)?.into_band_mask_ndarray()
+    let (info, band_masks) = inspect_band_masks(blob)?;
+    band_masks_to_ndarray(info, band_masks)
 }
 
 pub fn decode_to_f64(blob: &[u8]) -> Result<DecodedF64> {
@@ -231,7 +270,14 @@ pub fn decode_ndarray_f64(blob: &[u8]) -> Result<ArrayD<f64>> {
 }
 
 pub fn decode_mask_ndarray(blob: &[u8]) -> Result<Option<ArrayD<u8>>> {
-    decode(blob)?.into_mask_ndarray()
+    let (info, mask) = inspect_first_with_masks(blob, None, None)?;
+    ensure_single_blob_consumed(
+        blob.len(),
+        info.blob_size,
+        "decode_mask_ndarray",
+        "inspect_first",
+    )?;
+    mask_to_ndarray(&info, mask)
 }
 
 fn decode_first_with_masks(
@@ -244,6 +290,20 @@ fn decode_first_with_masks(
     }
     if lerc2::is_lerc2(blob) {
         return lerc2::decode(blob, lerc2_shared_mask);
+    }
+    Err(Error::InvalidMagic)
+}
+
+fn inspect_first_with_masks(
+    blob: &[u8],
+    lerc1_shared_mask: Option<&[u8]>,
+    lerc2_shared_mask: Option<&[u8]>,
+) -> Result<(BlobInfo, Option<Vec<u8>>)> {
+    if lerc1::is_lerc1(blob) {
+        return lerc1::inspect_with_mask(blob, lerc1_shared_mask);
+    }
+    if lerc2::is_lerc2(blob) {
+        return lerc2::inspect_with_mask(blob, lerc2_shared_mask);
     }
     Err(Error::InvalidMagic)
 }
@@ -321,6 +381,93 @@ fn decode_band_set_owned<T: NdArrayElement>(
     ))
 }
 
+fn decode_band_set_into_impl<T: Sample + NdArrayElement>(
+    blob: &[u8],
+    layout: BandLayout,
+    out: &mut [T],
+) -> Result<BandSetInfo> {
+    let band_info = scan_band_infos(blob)?;
+    let band_count = band_info.band_count();
+    let expected_len = band_info.value_count()?;
+    if out.len() != expected_len {
+        return Err(Error::InvalidBlob(format!(
+            "output slice length {} does not match decoded band set length {}",
+            out.len(),
+            expected_len
+        )));
+    }
+
+    let pixel_count = band_info.bands[0].pixel_count()?;
+    let depth = band_info.depth() as usize;
+    let mut offset = 0usize;
+    let mut band_index = 0usize;
+    let mut lerc1_mask: Option<Vec<u8>> = None;
+    let mut lerc2_mask: Option<Vec<u8>> = None;
+
+    while offset < blob.len() {
+        let slice = &blob[offset..];
+        let is_lerc1 = lerc1::is_lerc1(slice);
+        let mut sink = BandSink::new(out, pixel_count, depth, band_index, band_count, layout);
+        let (info, mask) = if is_lerc1 {
+            lerc1::decode_into(slice, lerc1_mask.as_deref(), &mut sink)?
+        } else if lerc2::is_lerc2(slice) {
+            lerc2::decode_into(slice, lerc2_mask.as_deref(), &mut sink)?
+        } else {
+            return Err(Error::InvalidMagic);
+        };
+
+        if is_lerc1 {
+            lerc1_mask = mask;
+            lerc2_mask = None;
+        } else {
+            lerc2_mask = mask;
+            lerc1_mask = None;
+        }
+
+        offset = checked_next_offset(offset, info.blob_size, blob.len())?;
+        band_index += 1;
+    }
+
+    Ok(band_info)
+}
+
+fn decode_band_set_to_f64_info(blob: &[u8], layout: BandLayout) -> Result<(BandSetInfo, Vec<f64>)> {
+    let band_info = scan_band_infos(blob)?;
+    let expected_len = band_info.value_count()?;
+    let mut out = vec![0.0; expected_len];
+    let info = decode_band_set_into(blob, layout, &mut out)?;
+    Ok((info, out))
+}
+
+fn inspect_band_masks(blob: &[u8]) -> Result<(BandSetInfo, Vec<Option<Vec<u8>>>)> {
+    let mut offset = 0usize;
+    let mut infos = Vec::new();
+    let mut band_masks = Vec::new();
+    let mut lerc1_mask: Option<Vec<u8>> = None;
+    let mut lerc2_mask: Option<Vec<u8>> = None;
+
+    while offset < blob.len() {
+        let slice = &blob[offset..];
+        let is_lerc1 = lerc1::is_lerc1(slice);
+        let (info, mask) =
+            inspect_first_with_masks(slice, lerc1_mask.as_deref(), lerc2_mask.as_deref())?;
+
+        if is_lerc1 {
+            lerc1_mask = mask.clone();
+            lerc2_mask = None;
+        } else {
+            lerc2_mask = mask.clone();
+            lerc1_mask = None;
+        }
+
+        offset = checked_next_offset(offset, info.blob_size, blob.len())?;
+        infos.push(info);
+        band_masks.push(mask);
+    }
+
+    Ok((BandSetInfo::new(infos)?, band_masks))
+}
+
 fn scan_band_infos(blob: &[u8]) -> Result<BandSetInfo> {
     let mut offset = 0usize;
     let mut infos = Vec::new();
@@ -384,4 +531,59 @@ fn materialize_layout(layout: BandLayout) -> MaterializeLayout {
 
 fn materialize_error(err: lerc_band_materialize::MaterializeError) -> Error {
     Error::InvalidBlob(err.to_string())
+}
+
+fn mask_to_ndarray(info: &BlobInfo, mask: Option<Vec<u8>>) -> Result<Option<ArrayD<u8>>> {
+    let shape = info.mask_ndarray_shape();
+    mask.map(|mask| {
+        ArrayD::from_shape_vec(ndarray::IxDyn(&shape), mask).map_err(|e| {
+            Error::InvalidBlob(format!("failed to build ndarray from decoded mask: {e}"))
+        })
+    })
+    .transpose()
+}
+
+fn band_masks_to_ndarray(
+    info: BandSetInfo,
+    band_masks: Vec<Option<Vec<u8>>>,
+) -> Result<Option<ArrayD<u8>>> {
+    if band_masks.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+
+    let pixel_count = info.bands[0].pixel_count()?;
+    let band_count = info.band_count();
+    let shape = info.band_mask_ndarray_shape();
+
+    if band_count == 1 {
+        let mask = band_masks
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap_or_else(|| vec![1; pixel_count]);
+        return ArrayD::from_shape_vec(ndarray::IxDyn(&shape), mask)
+            .map(Some)
+            .map_err(|e| {
+                Error::InvalidBlob(format!("failed to build ndarray from decoded mask: {e}"))
+            });
+    }
+
+    let mut merged = Vec::with_capacity(pixel_count * band_count);
+    for pixel in 0..pixel_count {
+        for band_mask in &band_masks {
+            merged.push(band_mask.as_ref().map(|mask| mask[pixel]).unwrap_or(1));
+        }
+    }
+
+    ArrayD::from_shape_vec(ndarray::IxDyn(&shape), merged)
+        .map(Some)
+        .map_err(|e| {
+            Error::InvalidBlob(format!(
+                "failed to build ndarray from decoded band mask: {e}"
+            ))
+        })
+}
+
+fn cast_slice_mut<T, U>(slice: &mut [T]) -> &mut [U] {
+    unsafe { &mut *(slice as *mut [T] as *mut [U]) }
 }

@@ -2,6 +2,7 @@ use std::cmp;
 
 use lerc_core::{BlobInfo, Error, PixelData, Result, Version};
 
+use crate::band_sink::BandSink;
 use crate::bitstuff::decode_bits;
 use crate::io::Cursor;
 use crate::pixel::{output_value, sample_index, words_from_padded, Sample};
@@ -114,6 +115,80 @@ pub(crate) fn decode_huffman<T: Sample>(
     }
 
     Ok(T::into_pixel_data(result))
+}
+
+pub(crate) fn decode_huffman_into<T: Sample>(
+    cursor: &mut Cursor<'_>,
+    info: &BlobInfo,
+    mask: Option<&[u8]>,
+    delta_encode: bool,
+    out: &mut BandSink<'_, T>,
+) -> Result<()> {
+    let width = info.width as usize;
+    let height = info.height as usize;
+    let depth = info.depth as usize;
+
+    let huffman = read_huffman_tree(cursor, info)?;
+    let mut stream = HuffmanStream {
+        words: &huffman.stuffed_data,
+        src_ptr: huffman.src_ptr,
+        bit_pos: huffman.bit_pos,
+    };
+    if stream.bit_pos > 0 {
+        stream.src_ptr += 1;
+        stream.bit_pos = 0;
+    }
+
+    let offset = if info.data_type == lerc_core::DataType::I8 {
+        128.0
+    } else {
+        0.0
+    };
+
+    if depth < 2 || delta_encode {
+        for dim in 0..depth {
+            let mut prev_value = 0.0;
+            for row in 0..height {
+                for col in 0..width {
+                    let pixel = row * width + col;
+                    if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
+                        let value = read_huffman_symbol(&mut stream, &huffman)? as f64 - offset;
+                        let decoded = if delta_encode {
+                            let mut delta = value;
+                            if col > 0 && mask.map(|m| m[pixel - 1] != 0).unwrap_or(true) {
+                                delta += prev_value;
+                            } else if row > 0 && mask.map(|m| m[pixel - width] != 0).unwrap_or(true)
+                            {
+                                delta += out.read(pixel - width, dim).to_f64();
+                            } else {
+                                delta += prev_value;
+                            }
+                            let wrapped = ((delta as i64) & 0xFF) as f64;
+                            prev_value = wrapped;
+                            wrapped
+                        } else {
+                            value
+                        };
+                        out.write(pixel, dim, output_value::<T>(decoded, info.data_type));
+                    }
+                }
+            }
+        }
+    } else {
+        for row in 0..height {
+            for col in 0..width {
+                let pixel = row * width + col;
+                if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
+                    for dim in 0..depth {
+                        let value = read_huffman_symbol(&mut stream, &huffman)? as f64 - offset;
+                        out.write(pixel, dim, output_value::<T>(value, info.data_type));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn read_huffman_tree(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<HuffmanInfo> {
