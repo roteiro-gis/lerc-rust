@@ -27,7 +27,13 @@ The current suite measures:
 - concatenated multi-band Lerc2 decode (`bluemarble_256_256_3_byte.lerc2`)
 
 Each benchmark validates decoded byte-hash parity against `libLerc` before
-timing and then compares full decode throughput for the same fixture.
+timing and then reports two Rust measurements for the same fixture:
+
+- `decode-only`: fixture bytes are preloaded in memory before timing
+- `load-plus-decode`: fixture loading remains inside the timed loop
+
+The current native `libLerc` comparison remains on the end-to-end
+`load-plus-decode` path via the helper.
 
 ## Methodology
 
@@ -49,10 +55,15 @@ Notes:
   path.
 - Concatenated band sets are compared in bands-last layout because that is the
   public shape exposed by `lerc-reader`.
+- The Rust harness now publishes a pure in-memory `decode-only` group and a
+  separate `load-plus-decode` group so codec speed is not conflated with file I/O.
 - Both implementations include the decode-to-checksum path during timing so the
   benchmark validates real decoded output rather than parser-only work.
 
 ## Current Results
+
+The figures below summarize the `load-plus-decode` comparison, because that is
+the only group with a directly comparable `libLerc` number today.
 
 | fixture | `lerc-rust` time | `libLerc` time | result |
 | --- | ---: | ---: | --- |
@@ -68,6 +79,9 @@ Representative throughput ranges from the same run:
 | `california_400_400_1_float.lerc2` | 570-866 MiB/s | 410-449 MiB/s |
 | `bluemarble_256_256_3_byte.lerc2` | 93.1-102.6 MiB/s | 85.1-99.8 MiB/s |
 
+The Criterion report also includes separate `decode-only` groups for the Rust
+implementation. Those are the numbers to use when making codec-speed claims.
+
 ## Interpretation
 
 - `lerc-reader` stays clearly ahead on the two masked single-band fixtures.
@@ -75,6 +89,8 @@ Representative throughput ranges from the same run:
   on this host, with a small median edge for `lerc-reader`.
 - The benchmark is now a codec-to-codec comparison with no Python or NumPy
   boundary overhead in the reference timing.
+- Decode-only and end-to-end timings are now intentionally separated, so read
+  the correct group for the claim you want to make.
 
 ## Commands
 

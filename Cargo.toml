@@ -1,5 +1,6 @@
 [workspace]
-members = ["lerc-core", "lerc-reader"]
+members = ["lerc-band-materialize", "lerc-core", "lerc-reader"]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

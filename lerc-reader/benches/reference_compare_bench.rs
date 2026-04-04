@@ -117,6 +117,7 @@ fn reference_benchmark_duration(
 
 fn bench_fixture(c: &mut Criterion, fixture_name: &str, kind: FixtureKind, group_name: &str) {
     let path = fixture(fixture_name);
+    let blob = load_blob(&path);
     let helper = reference::helper_path()
         .expect("LERC_READER_REFERENCE_HELPER should be configured before calling bench_fixture");
     let fixture_path = path.to_str().unwrap().to_string();
@@ -129,8 +130,26 @@ fn bench_fixture(c: &mut Criterion, fixture_name: &str, kind: FixtureKind, group
     );
     let (expected_checksum, expected_valid_sum) = rust_checksum(&path, kind);
 
-    let mut group = c.benchmark_group(group_name);
-    group.throughput(Throughput::Bytes(expected_hash.0 as u64));
+    let mut decode_only_group = c.benchmark_group(format!("{group_name}/decode-only"));
+    decode_only_group.throughput(Throughput::Bytes(blob.len() as u64));
+
+    decode_only_group.bench_function(BenchmarkId::new(RUST_IMPL_NAME, fixture_name), |b| {
+        b.iter(|| match kind {
+            FixtureKind::F32 => {
+                let raster: ArrayD<f32> = lerc_reader::decode_ndarray(black_box(&blob)).unwrap();
+                black_box(raster);
+            }
+            FixtureKind::BandSetU8 => {
+                let raster: ArrayD<u8> =
+                    lerc_reader::decode_band_set_ndarray(black_box(&blob)).unwrap();
+                black_box(raster);
+            }
+        });
+    });
+    decode_only_group.finish();
+
+    let mut group = c.benchmark_group(format!("{group_name}/load-plus-decode"));
+    group.throughput(Throughput::Bytes(blob.len() as u64));
 
     group.bench_function(BenchmarkId::new(RUST_IMPL_NAME, fixture_name), |b| {
         b.iter_custom(|iters| {
