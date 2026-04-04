@@ -232,10 +232,6 @@ version = "0.1.0"
 [[package]]
 name = "lerc-core"
 version = "0.1.0"
-dependencies = [
- "lerc-band-materialize",
- "ndarray",
-]
 
 [[package]]
 name = "lerc-reader"
@@ -244,6 +240,17 @@ dependencies = [
  "criterion",
  "lerc-band-materialize",
  "lerc-core",
+ "ndarray",
+ "serde_json",
+]
+
+[[package]]
+name = "lerc-writer"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "lerc-core",
+ "lerc-reader",
  "ndarray",
  "serde_json",
 ]

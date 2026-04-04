@@ -3,7 +3,8 @@
 Date: 2026-04-02
 
 This report summarizes the current Criterion comparison suite for
-`lerc-reader` against Esri's official native `libLerc` decoder.
+`lerc-reader` against Esri's official native `libLerc` decoder and records the
+repo-level benchmark entry points that now include `lerc-writer`.
 
 ## System Under Test
 
@@ -43,7 +44,10 @@ Commands used for this report:
 LERC_READER_REFERENCE_HELPER="$(./scripts/build-reference-helper.sh)" \
   cargo test -p lerc-reader --test reference_parity
 LERC_READER_REFERENCE_HELPER="$(./scripts/build-reference-helper.sh)" \
+  cargo test -p lerc-writer --test reference_parity
+LERC_READER_REFERENCE_HELPER="$(./scripts/build-reference-helper.sh)" \
   cargo bench -p lerc-reader --bench reference_compare_bench -- --noplot
+cargo bench -p lerc-writer --bench encode_bench -- --noplot
 ```
 
 Notes:
@@ -59,6 +63,8 @@ Notes:
   separate `load-plus-decode` group so codec speed is not conflated with file I/O.
 - Both implementations include the decode-to-checksum path during timing so the
   benchmark validates real decoded output rather than parser-only work.
+- The writer bench is operationalized through the same repo harness, but this
+  report does not yet publish encode baseline numbers from a fixed host run.
 
 ## Current Results
 

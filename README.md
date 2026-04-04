@@ -8,8 +8,9 @@ as `geotiff-rust`.
 
 | Crate | Description |
 |---|---|
-| `lerc-core` | Shared types and errors for LERC blobs, decoded pixels, masks, and ndarray conversion |
+| `lerc-core` | Codec-neutral shared types, errors, typed raster views, and sample helpers |
 | `lerc-reader` | Pure-Rust LERC inspection and decode paths for Lerc1 and Lerc2 blobs |
+| `lerc-writer` | Pure-Rust Lerc2 single-blob writer with mask, depth, checksum, and tiled emit paths |
 
 ## Usage
 
@@ -26,6 +27,21 @@ println!(
 let raster: ndarray::ArrayD<f32> = decode_ndarray(&blob)?;
 let mask = decode_mask_ndarray(&blob)?;
 println!("shape={:?} has_mask={}", raster.shape(), mask.is_some());
+```
+
+```rust
+use lerc_core::RasterView;
+use lerc_writer::{encode, EncodeOptions};
+
+let pixels = vec![1u8, 2, 3, 4];
+let blob = encode(
+    RasterView::new(2, 2, 1, &pixels)?,
+    None,
+    EncodeOptions {
+        max_z_error: 0.5,
+        micro_block_size: 8,
+    },
+)?;
 ```
 
 Single-blob entry points are strict. If you intentionally want first-blob
@@ -50,10 +66,12 @@ assert_eq!(bsq.len(), (info.width() * info.height() * info.band_count() as u32) 
   shared-mask band sets
 - Lerc2 header parsing, Fletcher32 verification, mask decoding, constant/raw,
   tiled, bit-stuffed, and Huffman decode paths
+- Lerc2 single-blob writes with optional masks, depth metadata, checksum, and
+  constant/raw/bit-stuffed tiles
 - Native typed decode and type-promoting `f64` decode
 - Strict single-blob APIs plus permissive first-blob adapters for concatenated payloads
 - Direct `ndarray::ArrayD` conversion for rasters, band sets, and masks, with selectable band layout
-- Shape helpers and shared metadata types in `lerc-core`
+- Codec-neutral typed raster views and shared metadata types in `lerc-core`
 
 ## Testing
 
@@ -72,15 +90,17 @@ The default test suite covers:
   Lerc2
 - an Esri JavaScript sanity fixture for `depth > 1`
 - malformed-input regression coverage for strict parsing, mask RLE, Huffman tables,
-  bit-stuffed payloads, and concatenated parsing
+  bit-stuffed payloads, concatenated parsing, and writer roundtrips/output sizing
 
-Reference-library parity tests compare `lerc-reader` against Esri's official
-`libLerc` decoder when a compiled helper path is configured; otherwise they
-self-skip:
+Reference-library parity tests compare both decode and writer output against
+Esri's official `libLerc` decoder when a compiled helper path is configured;
+otherwise they self-skip:
 
 ```sh
 LERC_READER_REFERENCE_HELPER="$(./scripts/build-reference-helper.sh)" \
   cargo test -p lerc-reader --test reference_parity
+LERC_READER_REFERENCE_HELPER="$(./scripts/build-reference-helper.sh)" \
+  cargo test -p lerc-writer --test reference_parity
 ```
 
 For a reproducible reference environment, run the Docker harness:
@@ -89,8 +109,8 @@ For a reproducible reference environment, run the Docker harness:
 ./scripts/run-reference-parity.sh
 ```
 
-Criterion comparison benches against `libLerc` live in
-`lerc-reader/benches/reference_compare_bench.rs`:
+Criterion benchmark entry points live in `lerc-reader` for decode-vs-`libLerc`
+comparison and in `lerc-writer` for encode / encode+decode throughput:
 
 ```sh
 ./scripts/run-reference-benchmarks.sh
@@ -107,6 +127,7 @@ cargo fuzz run mask_rle
 cargo fuzz run huffman_tables
 cargo fuzz run bitstuff_blocks
 cargo fuzz run concatenated
+cargo fuzz run encode_roundtrip
 ```
 
 ## License

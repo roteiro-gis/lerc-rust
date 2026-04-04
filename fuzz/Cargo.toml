@@ -9,7 +9,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+lerc-core = { path = "../lerc-core" }
 lerc-reader = { path = "../lerc-reader" }
+lerc-writer = { path = "../lerc-writer" }
 
 [[bin]]
 name = "headers"
@@ -42,6 +44,13 @@ bench = false
 [[bin]]
 name = "concatenated"
 path = "fuzz_targets/concatenated.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
 test = false
 doc = false
 bench = false

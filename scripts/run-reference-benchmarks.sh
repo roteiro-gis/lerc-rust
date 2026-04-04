@@ -15,4 +15,5 @@ docker run --rm \
   "${image_name}" bash -lc '
   helper="$(./scripts/build-reference-helper.sh)"
   LERC_READER_REFERENCE_HELPER="${helper}" cargo bench -p lerc-reader --bench reference_compare_bench -- --noplot
+  cargo bench -p lerc-writer --bench encode_bench -- --noplot
 '
