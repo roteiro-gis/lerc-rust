@@ -226,9 +226,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lerc-band-materialize"
+version = "0.1.0"
+
+[[package]]
 name = "lerc-core"
 version = "0.1.0"
 dependencies = [
+ "lerc-band-materialize",
  "ndarray",
 ]
 
@@ -237,6 +242,7 @@ name = "lerc-reader"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "lerc-band-materialize",
  "lerc-core",
  "ndarray",
  "serde_json",

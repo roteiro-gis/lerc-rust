@@ -13,7 +13,6 @@
 //! - decode only the first promoted `f64` blob with [`decode_first_to_f64`]
 //! - decode directly into `ndarray::ArrayD` with [`decode_ndarray`]
 
-mod band_materialize;
 mod bitstuff;
 mod huffman;
 mod io;
@@ -24,7 +23,9 @@ mod pixel;
 #[cfg(test)]
 mod tests;
 
-use band_materialize::{copy_band_values_into_slice, BandMaterializer};
+use lerc_band_materialize::{
+    copy_band_values_into_slice, BandLayout as MaterializeLayout, BandMaterializer,
+};
 use lerc_core::{
     BandLayout, BandSetInfo, BlobInfo, Decoded, DecodedBandSet, DecodedF64, Error, NdArrayElement,
     Result,
@@ -162,8 +163,9 @@ pub fn decode_band_set_into<T: NdArrayElement>(
             depth,
             band_index,
             band_count,
-            layout,
-        )?;
+            materialize_layout(layout),
+        )
+        .map_err(materialize_error)?;
 
         if is_lerc1 {
             lerc1_mask = decoded.mask;
@@ -272,7 +274,15 @@ fn decode_band_set_owned<T: NdArrayElement>(
     let mut lerc1_mask: Option<Vec<u8>> = None;
     let mut lerc2_mask: Option<Vec<u8>> = None;
     let mut materializer = if band_count > 1 {
-        Some(BandMaterializer::new(&band_info, layout)?)
+        Some(
+            BandMaterializer::new(
+                band_info.bands[0].pixel_count()?,
+                band_info.depth() as usize,
+                band_count,
+                materialize_layout(layout),
+            )
+            .map_err(materialize_error)?,
+        )
     } else {
         None
     };
@@ -290,7 +300,8 @@ fn decode_band_set_owned<T: NdArrayElement>(
         materializer
             .as_mut()
             .unwrap()
-            .copy_band(band_index, &values)?;
+            .copy_band(band_index, &values)
+            .map_err(materialize_error)?;
 
         if is_lerc1 {
             lerc1_mask = decoded.mask;
@@ -304,7 +315,10 @@ fn decode_band_set_owned<T: NdArrayElement>(
         band_index += 1;
     }
 
-    Ok((band_info, materializer.unwrap().finish()?))
+    Ok((
+        band_info,
+        materializer.unwrap().finish().map_err(materialize_error)?,
+    ))
 }
 
 fn scan_band_infos(blob: &[u8]) -> Result<BandSetInfo> {
@@ -359,4 +373,15 @@ fn checked_next_offset(offset: usize, next_len: usize, total_len: usize) -> Resu
         ));
     }
     Ok(next)
+}
+
+fn materialize_layout(layout: BandLayout) -> MaterializeLayout {
+    match layout {
+        BandLayout::Interleaved => MaterializeLayout::Interleaved,
+        BandLayout::Bsq => MaterializeLayout::Bsq,
+    }
+}
+
+fn materialize_error(err: lerc_band_materialize::MaterializeError) -> Error {
+    Error::InvalidBlob(err.to_string())
 }
