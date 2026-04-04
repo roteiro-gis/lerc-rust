@@ -1,7 +1,7 @@
+use std::any::TypeId;
+
 use crate::error::{Error, Result};
-use lerc_band_materialize::{
-    copy_band_values_into_slice, BandLayout as MaterializeLayout, BandMaterializer,
-};
+use lerc_band_materialize::{BandLayout as MaterializeLayout, BandMaterializer, BandSink};
 use ndarray::{ArrayD, IxDyn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -326,6 +326,47 @@ impl BandSetInfo {
             .and_then(|n| n.checked_mul((self.depth() as usize).max(1)))
             .ok_or_else(|| Error::InvalidBlob("LERC ndarray size overflows usize".into()))
     }
+
+    pub fn into_band_mask_ndarray(
+        self,
+        band_masks: Vec<Option<Vec<u8>>>,
+    ) -> Result<Option<ArrayD<u8>>> {
+        if band_masks.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+
+        let pixel_count = self.bands[0].pixel_count()?;
+        let band_count = self.band_count();
+        let shape = self.band_mask_ndarray_shape();
+
+        if band_count == 1 {
+            let mask = band_masks
+                .into_iter()
+                .next()
+                .flatten()
+                .unwrap_or_else(|| vec![1; pixel_count]);
+            return ArrayD::from_shape_vec(IxDyn(&shape), mask)
+                .map(Some)
+                .map_err(|e| {
+                    Error::InvalidBlob(format!("failed to build ndarray from decoded mask: {e}"))
+                });
+        }
+
+        let mut merged = Vec::with_capacity(pixel_count * band_count);
+        for pixel in 0..pixel_count {
+            for band_mask in &band_masks {
+                merged.push(band_mask.as_ref().map(|mask| mask[pixel]).unwrap_or(1));
+            }
+        }
+
+        ArrayD::from_shape_vec(IxDyn(&shape), merged)
+            .map(Some)
+            .map_err(|e| {
+                Error::InvalidBlob(format!(
+                    "failed to build ndarray from decoded band mask: {e}"
+                ))
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -336,11 +377,11 @@ pub struct DecodedBandSet {
 }
 
 impl DecodedBandSet {
-    pub fn into_ndarray<T: NdArrayElement>(self) -> Result<ArrayD<T>> {
+    pub fn into_ndarray<T: NdArrayElement + 'static>(self) -> Result<ArrayD<T>> {
         self.into_ndarray_with_layout(BandLayout::Interleaved)
     }
 
-    pub fn into_ndarray_with_layout<T: NdArrayElement>(
+    pub fn into_ndarray_with_layout<T: NdArrayElement + 'static>(
         self,
         layout: BandLayout,
     ) -> Result<ArrayD<T>> {
@@ -353,7 +394,10 @@ impl DecodedBandSet {
         })
     }
 
-    pub fn into_vec_with_layout<T: NdArrayElement>(self, layout: BandLayout) -> Result<Vec<T>> {
+    pub fn into_vec_with_layout<T: NdArrayElement + 'static>(
+        self,
+        layout: BandLayout,
+    ) -> Result<Vec<T>> {
         if self.bands.len() == 1 {
             return T::from_pixel_data(self.bands.into_iter().next().unwrap());
         }
@@ -366,15 +410,12 @@ impl DecodedBandSet {
         )
         .map_err(materialize_error)?;
         for (band_index, band) in self.bands.into_iter().enumerate() {
-            let values = T::from_pixel_data(band)?;
-            materializer
-                .copy_band(band_index, &values)
-                .map_err(materialize_error)?;
+            copy_pixel_data_into_materializer(&mut materializer, band_index, band)?;
         }
         materializer.finish().map_err(materialize_error)
     }
 
-    pub fn copy_into_slice<T: NdArrayElement>(
+    pub fn copy_into_slice<T: NdArrayElement + 'static + Copy + Default>(
         self,
         layout: BandLayout,
         out: &mut [T],
@@ -392,58 +433,21 @@ impl DecodedBandSet {
         }
 
         for (band_index, band) in self.bands.into_iter().enumerate() {
-            let values = T::from_pixel_data(band)?;
-            copy_band_values_into_slice(
+            let mut sink = BandSink::new(
                 out,
-                &values,
                 pixel_count,
                 depth,
                 band_index,
                 band_count,
                 materialize_layout(layout),
-            )
-            .map_err(materialize_error)?;
+            );
+            copy_pixel_data_into_sink(&mut sink, band)?;
         }
         Ok(())
     }
 
     pub fn into_band_mask_ndarray(self) -> Result<Option<ArrayD<u8>>> {
-        if self.band_masks.iter().all(Option::is_none) {
-            return Ok(None);
-        }
-
-        let pixel_count = self.info.bands[0].pixel_count()?;
-        let band_count = self.info.band_count();
-        let shape = self.info.band_mask_ndarray_shape();
-
-        if band_count == 1 {
-            let mask = self
-                .band_masks
-                .into_iter()
-                .next()
-                .flatten()
-                .unwrap_or_else(|| vec![1; pixel_count]);
-            return ArrayD::from_shape_vec(IxDyn(&shape), mask)
-                .map(Some)
-                .map_err(|e| {
-                    Error::InvalidBlob(format!("failed to build ndarray from decoded mask: {e}"))
-                });
-        }
-
-        let mut merged = Vec::with_capacity(pixel_count * band_count);
-        for pixel in 0..pixel_count {
-            for band_mask in &self.band_masks {
-                merged.push(band_mask.as_ref().map(|mask| mask[pixel]).unwrap_or(1));
-            }
-        }
-
-        ArrayD::from_shape_vec(IxDyn(&shape), merged)
-            .map(Some)
-            .map_err(|e| {
-                Error::InvalidBlob(format!(
-                    "failed to build ndarray from decoded band mask: {e}"
-                ))
-            })
+        self.info.into_band_mask_ndarray(self.band_masks)
     }
 }
 
@@ -456,6 +460,192 @@ fn materialize_layout(layout: BandLayout) -> MaterializeLayout {
 
 fn materialize_error(err: lerc_band_materialize::MaterializeError) -> Error {
     Error::InvalidBlob(err.to_string())
+}
+
+fn copy_pixel_data_into_materializer<T: NdArrayElement + 'static>(
+    materializer: &mut BandMaterializer<T>,
+    band_index: usize,
+    band: PixelData,
+) -> Result<()> {
+    match band {
+        PixelData::I8(values) => {
+            copy_typed_values_into_materializer(materializer, band_index, &values)
+        }
+        PixelData::U8(values) => {
+            copy_typed_values_into_materializer(materializer, band_index, &values)
+        }
+        PixelData::I16(values) => {
+            copy_typed_values_into_materializer(materializer, band_index, &values)
+        }
+        PixelData::U16(values) => {
+            copy_typed_values_into_materializer(materializer, band_index, &values)
+        }
+        PixelData::I32(values) => {
+            copy_typed_values_into_materializer(materializer, band_index, &values)
+        }
+        PixelData::U32(values) => {
+            copy_typed_values_into_materializer(materializer, band_index, &values)
+        }
+        PixelData::F32(values) => {
+            copy_typed_values_into_materializer(materializer, band_index, &values)
+        }
+        PixelData::F64(values) => {
+            copy_typed_values_into_materializer(materializer, band_index, &values)
+        }
+    }
+}
+
+fn copy_typed_values_into_materializer<T: NdArrayElement + 'static, U: Copy + 'static + IntoF64>(
+    materializer: &mut BandMaterializer<T>,
+    band_index: usize,
+    values: &[U],
+) -> Result<()> {
+    if TypeId::of::<T>() == TypeId::of::<U>() {
+        let typed = unsafe { cast_slice::<U, T>(values) };
+        return materializer
+            .copy_band(band_index, typed)
+            .map_err(materialize_error);
+    }
+    if TypeId::of::<T>() == TypeId::of::<f64>() {
+        return materializer
+            .copy_band_with(band_index, |index| {
+                unsafe_cast::<T, f64>(values[index].into_f64())
+            })
+            .map_err(materialize_error);
+    }
+    Err(Error::InvalidBlob(format!(
+        "cannot decode {} pixels into ndarray<{}>",
+        data_type_name::<U>(),
+        std::any::type_name::<T>()
+            .rsplit("::")
+            .next()
+            .unwrap_or("unknown"),
+    )))
+}
+
+fn copy_pixel_data_into_sink<T: NdArrayElement + 'static + Copy + Default>(
+    sink: &mut BandSink<'_, T>,
+    band: PixelData,
+) -> Result<()> {
+    match band {
+        PixelData::I8(values) => copy_typed_values_into_sink(sink, &values),
+        PixelData::U8(values) => copy_typed_values_into_sink(sink, &values),
+        PixelData::I16(values) => copy_typed_values_into_sink(sink, &values),
+        PixelData::U16(values) => copy_typed_values_into_sink(sink, &values),
+        PixelData::I32(values) => copy_typed_values_into_sink(sink, &values),
+        PixelData::U32(values) => copy_typed_values_into_sink(sink, &values),
+        PixelData::F32(values) => copy_typed_values_into_sink(sink, &values),
+        PixelData::F64(values) => copy_typed_values_into_sink(sink, &values),
+    }
+}
+
+fn copy_typed_values_into_sink<
+    T: NdArrayElement + 'static + Copy + Default,
+    U: Copy + 'static + IntoF64,
+>(
+    sink: &mut BandSink<'_, T>,
+    values: &[U],
+) -> Result<()> {
+    let depth = sink.depth();
+    if TypeId::of::<T>() == TypeId::of::<U>() {
+        for (index, value) in values.iter().copied().enumerate() {
+            sink.write(index / depth, index % depth, unsafe_cast::<T, U>(value));
+        }
+        return Ok(());
+    }
+    if TypeId::of::<T>() == TypeId::of::<f64>() {
+        for (index, value) in values.iter().copied().enumerate() {
+            sink.write(
+                index / depth,
+                index % depth,
+                unsafe_cast::<T, f64>(value.into_f64()),
+            );
+        }
+        return Ok(());
+    }
+    Err(Error::InvalidBlob(format!(
+        "cannot decode {} pixels into ndarray<{}>",
+        data_type_name::<U>(),
+        std::any::type_name::<T>()
+            .rsplit("::")
+            .next()
+            .unwrap_or("unknown"),
+    )))
+}
+
+unsafe fn cast_slice<U, T>(values: &[U]) -> &[T] {
+    &*(values as *const [U] as *const [T])
+}
+
+fn unsafe_cast<T, U: Copy>(value: U) -> T {
+    unsafe { std::mem::transmute_copy(&value) }
+}
+
+trait IntoF64 {
+    fn into_f64(self) -> f64;
+}
+
+impl IntoF64 for i8 {
+    fn into_f64(self) -> f64 {
+        self as f64
+    }
+}
+impl IntoF64 for u8 {
+    fn into_f64(self) -> f64 {
+        self as f64
+    }
+}
+impl IntoF64 for i16 {
+    fn into_f64(self) -> f64 {
+        self as f64
+    }
+}
+impl IntoF64 for u16 {
+    fn into_f64(self) -> f64 {
+        self as f64
+    }
+}
+impl IntoF64 for i32 {
+    fn into_f64(self) -> f64 {
+        self as f64
+    }
+}
+impl IntoF64 for u32 {
+    fn into_f64(self) -> f64 {
+        self as f64
+    }
+}
+impl IntoF64 for f32 {
+    fn into_f64(self) -> f64 {
+        self as f64
+    }
+}
+impl IntoF64 for f64 {
+    fn into_f64(self) -> f64 {
+        self
+    }
+}
+
+fn data_type_name<T: 'static>() -> &'static str {
+    if TypeId::of::<T>() == TypeId::of::<i8>() {
+        "i8"
+    } else if TypeId::of::<T>() == TypeId::of::<u8>() {
+        "u8"
+    } else if TypeId::of::<T>() == TypeId::of::<i16>() {
+        "i16"
+    } else if TypeId::of::<T>() == TypeId::of::<u16>() {
+        "u16"
+    } else if TypeId::of::<T>() == TypeId::of::<i32>() {
+        "i32"
+    } else if TypeId::of::<T>() == TypeId::of::<u32>() {
+        "u32"
+    } else if TypeId::of::<T>() == TypeId::of::<f32>() {
+        "f32"
+    } else if TypeId::of::<T>() == TypeId::of::<f64>() {
+        "f64"
+    } else {
+        "unknown"
+    }
 }
 
 pub trait NdArrayElement: Sized + Clone {

@@ -30,6 +30,13 @@ impl std::error::Error for MaterializeError {}
 
 pub type Result<T> = std::result::Result<T, MaterializeError>;
 
+pub trait BandWriter<T: Copy + Default> {
+    fn fill_default(&mut self);
+    fn write(&mut self, pixel: usize, dim: usize, value: T);
+    fn read(&self, pixel: usize, dim: usize) -> T;
+    fn depth(&self) -> usize;
+}
+
 pub fn copy_band_values_into_slice<T: Clone>(
     out: &mut [T],
     values: &[T],
@@ -75,6 +82,84 @@ pub fn copy_band_values_into_slice<T: Clone>(
     Ok(())
 }
 
+#[derive(Debug)]
+pub struct BandSink<'a, T> {
+    out: &'a mut [T],
+    shape: BandShape,
+    band_index: usize,
+    layout: BandLayout,
+}
+
+impl<'a, T: Copy + Default> BandSink<'a, T> {
+    pub fn new(
+        out: &'a mut [T],
+        pixel_count: usize,
+        depth: usize,
+        band_index: usize,
+        band_count: usize,
+        layout: BandLayout,
+    ) -> Self {
+        Self {
+            out,
+            shape: BandShape {
+                pixel_count,
+                depth: depth.max(1),
+                band_count,
+            },
+            band_index,
+            layout,
+        }
+    }
+
+    pub fn fill_default(&mut self) {
+        match self.layout {
+            BandLayout::Interleaved => {
+                for pixel in 0..self.shape.pixel_count {
+                    let base = (pixel * self.shape.band_count + self.band_index) * self.shape.depth;
+                    self.out[base..base + self.shape.depth].fill(T::default());
+                }
+            }
+            BandLayout::Bsq => {
+                let band_len = self.shape.pixel_count * self.shape.depth;
+                let base = self.band_index * band_len;
+                self.out[base..base + band_len].fill(T::default());
+            }
+        }
+    }
+
+    pub fn write(&mut self, pixel: usize, dim: usize, value: T) {
+        let index =
+            band_value_index_for_pixel(self.shape, self.band_index, self.layout, pixel, dim);
+        self.out[index] = value;
+    }
+
+    pub fn read(&self, pixel: usize, dim: usize) -> T {
+        self.out[band_value_index_for_pixel(self.shape, self.band_index, self.layout, pixel, dim)]
+    }
+
+    pub fn depth(&self) -> usize {
+        self.shape.depth
+    }
+}
+
+impl<T: Copy + Default> BandWriter<T> for BandSink<'_, T> {
+    fn fill_default(&mut self) {
+        Self::fill_default(self);
+    }
+
+    fn write(&mut self, pixel: usize, dim: usize, value: T) {
+        Self::write(self, pixel, dim, value);
+    }
+
+    fn read(&self, pixel: usize, dim: usize) -> T {
+        Self::read(self, pixel, dim)
+    }
+
+    fn depth(&self) -> usize {
+        Self::depth(self)
+    }
+}
+
 pub struct BandMaterializer<T> {
     shape: BandShape,
     layout: BandLayout,
@@ -96,7 +181,7 @@ struct ActiveBand {
     written_values: usize,
 }
 
-impl<T: Clone> BandMaterializer<T> {
+impl<T> BandMaterializer<T> {
     pub fn new(
         pixel_count: usize,
         depth: usize,
@@ -123,6 +208,80 @@ impl<T: Clone> BandMaterializer<T> {
         })
     }
 
+    pub fn copy_band_with<F>(&mut self, band_index: usize, mut value_at: F) -> Result<()>
+    where
+        F: FnMut(usize) -> T,
+    {
+        if band_index >= self.shape.band_count {
+            return Err(MaterializeError::new(format!(
+                "band index {band_index} exceeds band count {}",
+                self.shape.band_count
+            )));
+        }
+        if self.written_bands[band_index] {
+            return Err(MaterializeError::new(format!(
+                "band index {band_index} was materialized more than once"
+            )));
+        }
+
+        let band_len = band_len(self.shape.pixel_count, self.shape.depth)?;
+        self.active_band = Some(ActiveBand {
+            band_index,
+            written_values: 0,
+        });
+        for value_index in 0..band_len {
+            let out_index = band_value_index(self.shape, band_index, self.layout, value_index);
+            self.out[out_index].write(value_at(value_index));
+            self.active_band.as_mut().unwrap().written_values += 1;
+        }
+        self.active_band = None;
+        self.written_bands[band_index] = true;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<Vec<T>> {
+        let mut this = self;
+        if this.written_bands.iter().any(|written| !written) {
+            return Err(MaterializeError::new(
+                "not all decoded bands were materialized into the output buffer",
+            ));
+        }
+
+        let out = std::mem::take(&mut this.out);
+        this.active_band = None;
+        this.written_bands.fill(false);
+        Ok(unsafe { assume_init_vec(out) })
+    }
+
+    pub fn band_writer(&mut self, band_index: usize) -> Result<MaterializerBandWriter<'_, T>>
+    where
+        T: Copy + Default,
+    {
+        if band_index >= self.shape.band_count {
+            return Err(MaterializeError::new(format!(
+                "band index {band_index} exceeds band count {}",
+                self.shape.band_count
+            )));
+        }
+        if self.written_bands[band_index] {
+            return Err(MaterializeError::new(format!(
+                "band index {band_index} was materialized more than once"
+            )));
+        }
+        self.active_band = Some(ActiveBand {
+            band_index,
+            written_values: 0,
+        });
+        Ok(MaterializerBandWriter {
+            materializer: self,
+            band_index,
+            initialized_all: false,
+            finished: false,
+        })
+    }
+}
+
+impl<T: Clone> BandMaterializer<T> {
     pub fn copy_band(&mut self, band_index: usize, values: &[T]) -> Result<()> {
         if band_index >= self.shape.band_count {
             return Err(MaterializeError::new(format!(
@@ -158,19 +317,85 @@ impl<T: Clone> BandMaterializer<T> {
         self.written_bands[band_index] = true;
         Ok(())
     }
+}
 
-    pub fn finish(self) -> Result<Vec<T>> {
-        let mut this = self;
-        if this.written_bands.iter().any(|written| !written) {
-            return Err(MaterializeError::new(
-                "not all decoded bands were materialized into the output buffer",
-            ));
+pub struct MaterializerBandWriter<'a, T> {
+    materializer: &'a mut BandMaterializer<T>,
+    band_index: usize,
+    initialized_all: bool,
+    finished: bool,
+}
+
+impl<T: Copy + Default> MaterializerBandWriter<'_, T> {
+    pub fn finish(mut self) {
+        self.materializer.written_bands[self.band_index] = true;
+        self.materializer.active_band = None;
+        self.finished = true;
+    }
+}
+
+impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
+    fn fill_default(&mut self) {
+        if self.initialized_all {
+            return;
         }
+        let band_len = band_len(
+            self.materializer.shape.pixel_count,
+            self.materializer.shape.depth,
+        )
+        .expect("band length was validated when the materializer was created");
+        for value_index in 0..band_len {
+            let out_index = band_value_index(
+                self.materializer.shape,
+                self.band_index,
+                self.materializer.layout,
+                value_index,
+            );
+            self.materializer.out[out_index].write(T::default());
+        }
+        self.materializer
+            .active_band
+            .as_mut()
+            .unwrap()
+            .written_values = band_len;
+        self.initialized_all = true;
+    }
 
-        let out = std::mem::take(&mut this.out);
-        this.active_band = None;
-        this.written_bands.fill(false);
-        Ok(unsafe { assume_init_vec(out) })
+    fn write(&mut self, pixel: usize, dim: usize, value: T) {
+        let out_index = band_value_index_for_pixel(
+            self.materializer.shape,
+            self.band_index,
+            self.materializer.layout,
+            pixel,
+            dim,
+        );
+        if self.initialized_all {
+            unsafe {
+                *self.materializer.out[out_index].assume_init_mut() = value;
+            }
+        } else {
+            self.materializer.out[out_index].write(value);
+            self.materializer
+                .active_band
+                .as_mut()
+                .unwrap()
+                .written_values += 1;
+        }
+    }
+
+    fn read(&self, pixel: usize, dim: usize) -> T {
+        let out_index = band_value_index_for_pixel(
+            self.materializer.shape,
+            self.band_index,
+            self.materializer.layout,
+            pixel,
+            dim,
+        );
+        unsafe { *self.materializer.out[out_index].assume_init_ref() }
+    }
+
+    fn depth(&self) -> usize {
+        self.materializer.shape.depth
     }
 }
 
@@ -275,6 +500,19 @@ fn band_value_index(
             }
         }
         BandLayout::Bsq => band_index * shape.pixel_count * shape.depth.max(1) + value_index,
+    }
+}
+
+fn band_value_index_for_pixel(
+    shape: BandShape,
+    band_index: usize,
+    layout: BandLayout,
+    pixel: usize,
+    dim: usize,
+) -> usize {
+    match layout {
+        BandLayout::Interleaved => ((pixel * shape.band_count + band_index) * shape.depth) + dim,
+        BandLayout::Bsq => (band_index * shape.pixel_count + pixel) * shape.depth + dim,
     }
 }
 

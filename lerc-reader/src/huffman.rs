@@ -1,11 +1,10 @@
 use std::cmp;
 
-use lerc_core::{BlobInfo, Error, PixelData, Result, Version};
-
-use crate::band_sink::BandSink;
 use crate::bitstuff::decode_bits;
 use crate::io::Cursor;
 use crate::pixel::{output_value, sample_index, words_from_padded, Sample};
+use lerc_band_materialize::BandWriter;
+use lerc_core::{BlobInfo, Error, PixelData, Result, Version};
 
 const HUFFMAN_LUT_BITS_MAX: u8 = 12;
 
@@ -117,12 +116,12 @@ pub(crate) fn decode_huffman<T: Sample>(
     Ok(T::into_pixel_data(result))
 }
 
-pub(crate) fn decode_huffman_into<T: Sample>(
+pub(crate) fn decode_huffman_into<T: Sample, W: BandWriter<T>>(
     cursor: &mut Cursor<'_>,
     info: &BlobInfo,
     mask: Option<&[u8]>,
     delta_encode: bool,
-    out: &mut BandSink<'_, T>,
+    out: &mut W,
 ) -> Result<()> {
     let width = info.width as usize;
     let height = info.height as usize;

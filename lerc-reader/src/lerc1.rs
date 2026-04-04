@@ -1,9 +1,9 @@
 use lerc_core::{BlobInfo, DataType, Decoded, DecodedF64, Error, PixelData, Result, Version};
 
-use crate::band_sink::BandSink;
 use crate::bitstuff::{unstuff_v2, UnstuffOptions};
 use crate::io::Cursor;
 use crate::pixel::{count_valid_in_block, words_from_padded, Sample};
+use lerc_band_materialize::BandWriter;
 
 const MAGIC_LERC1_PREFIX: &[u8; 9] = b"CntZImage";
 
@@ -69,6 +69,14 @@ pub(crate) fn inspect_with_mask(
     Ok((parsed.info, parsed.mask))
 }
 
+pub(crate) fn inspect_mask(
+    blob: &[u8],
+    shared_mask: Option<&[u8]>,
+) -> Result<(BlobInfo, Option<Vec<u8>>)> {
+    let parsed = parse(blob, shared_mask)?;
+    Ok((parsed.info, parsed.mask))
+}
+
 pub(crate) fn decode(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Decoded> {
     let mut parsed = parse(blob, shared_mask)?;
     let (pixels, z_range) = decode_pixels::<f32>(&parsed)?;
@@ -103,13 +111,15 @@ pub(crate) fn decode_f64(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Deco
     })
 }
 
-pub(crate) fn decode_into<T: Sample>(
+pub(crate) fn decode_into<T: Sample, W: BandWriter<T>>(
     blob: &[u8],
     shared_mask: Option<&[u8]>,
-    out: &mut BandSink<'_, T>,
+    out: &mut W,
 ) -> Result<(BlobInfo, Option<Vec<u8>>)> {
     let mut parsed = parse(blob, shared_mask)?;
-    out.fill_default();
+    if parsed.info.valid_pixel_count != parsed.info.pixel_count()? as u32 {
+        out.fill_default();
+    }
     let z_range = decode_pixels_into(&parsed, out)?;
     if parsed.info.valid_pixel_count != 0 {
         let (z_min, z_max) = z_range.ok_or_else(|| {
@@ -469,9 +479,9 @@ fn decode_pixels<T: Sample>(parsed: &Lerc1Blob) -> Result<TypedPixels<T>> {
     Ok((result, z_range))
 }
 
-fn decode_pixels_into<T: Sample>(
+fn decode_pixels_into<T: Sample, W: BandWriter<T>>(
     parsed: &Lerc1Blob,
-    out: &mut BandSink<'_, T>,
+    out: &mut W,
 ) -> Result<ValueRange> {
     let width = parsed.info.width as usize;
     let height = parsed.info.height as usize;

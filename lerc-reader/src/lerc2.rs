@@ -1,6 +1,5 @@
 use lerc_core::{BlobInfo, DataType, Decoded, DecodedF64, Error, PixelData, Result, Version};
 
-use crate::band_sink::BandSink;
 use crate::bitstuff::{data_type_used, decode_bits, read_typed_scalar};
 use crate::huffman::{decode_huffman, decode_huffman_into};
 use crate::io::Cursor;
@@ -8,6 +7,7 @@ use crate::pixel::{
     count_valid_in_block, fletcher32, output_value, read_typed_values, read_values_as,
     sample_index, Sample,
 };
+use lerc_band_materialize::BandWriter;
 
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
 
@@ -82,10 +82,10 @@ pub(crate) fn decode_f64(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<D
     Ok(DecodedF64 { info, pixels, mask })
 }
 
-pub(crate) fn decode_into<T: Sample>(
+pub(crate) fn decode_into<T: Sample, W: BandWriter<T>>(
     blob: &[u8],
     inherited_mask: Option<&[u8]>,
-    out: &mut BandSink<'_, T>,
+    out: &mut W,
 ) -> Result<(BlobInfo, Option<Vec<u8>>)> {
     let (mut info, mut cursor) = parse(blob)?;
     let mask = read_mask(&mut cursor, &info, inherited_mask)?;
@@ -99,7 +99,9 @@ pub(crate) fn decode_into<T: Sample>(
         None
     };
 
-    out.fill_default();
+    if info.valid_pixel_count != info.pixel_count()? as u32 {
+        out.fill_default();
+    }
     decode_pixels_into_typed(
         &mut cursor,
         &info,
@@ -398,12 +400,12 @@ fn decode_pixels_typed<T: Sample>(
     decode_tiles::<T>(cursor, info, depth_ranges, mask)
 }
 
-fn decode_pixels_into_typed<T: Sample>(
+fn decode_pixels_into_typed<T: Sample, W: BandWriter<T>>(
     cursor: &mut Cursor<'_>,
     info: &BlobInfo,
     depth_ranges: Option<&DepthRanges>,
     mask: Option<&[u8]>,
-    out: &mut BandSink<'_, T>,
+    out: &mut W,
 ) -> Result<()> {
     if info.valid_pixel_count == 0 {
         return Ok(());
@@ -510,8 +512,8 @@ fn constant_pixels<T: Sample>(
     out
 }
 
-fn write_constant_pixels<T: Sample>(
-    out: &mut BandSink<'_, T>,
+fn write_constant_pixels<T: Sample, W: BandWriter<T>>(
+    out: &mut W,
     data_type: DataType,
     num_pixels: usize,
     depth: usize,
@@ -604,11 +606,11 @@ fn decode_one_sweep<T: Sample>(
     Ok(T::into_pixel_data(out))
 }
 
-fn decode_one_sweep_into<T: Sample>(
+fn decode_one_sweep_into<T: Sample, W: BandWriter<T>>(
     cursor: &mut Cursor<'_>,
     info: &BlobInfo,
     mask: Option<&[u8]>,
-    out: &mut BandSink<'_, T>,
+    out: &mut W,
 ) -> Result<()> {
     let num_pixels = info.pixel_count()?;
     let num_valid = info.valid_pixel_count as usize;
@@ -876,12 +878,12 @@ fn decode_tiles<T: Sample>(
     Ok(T::into_pixel_data(result))
 }
 
-fn decode_tiles_into<T: Sample>(
+fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
     cursor: &mut Cursor<'_>,
     info: &BlobInfo,
     depth_ranges: Option<&DepthRanges>,
     mask: Option<&[u8]>,
-    out: &mut BandSink<'_, T>,
+    out: &mut W,
 ) -> Result<()> {
     let width = info.width as usize;
     let height = info.height as usize;
