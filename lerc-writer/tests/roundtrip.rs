@@ -40,9 +40,9 @@ fn roundtrips_bitstuffed_u8_tiles_exactly() {
         micro_block_size: 2,
     };
 
-    let exact_len = encoded_len_upper_bound(raster, None, options).unwrap();
+    let upper_bound = encoded_len_upper_bound(raster, None, options).unwrap();
     let blob = encode(raster, None, options).unwrap();
-    assert_eq!(blob.len(), exact_len);
+    assert!(blob.len() <= upper_bound);
 
     let decoded = lerc_reader::decode(&blob).unwrap();
     assert_eq!(decoded.pixels, lerc_core::PixelData::U8(pixels));
@@ -104,8 +104,8 @@ fn emits_per_depth_constant_blob_without_tile_payload() {
 fn encode_into_reports_small_output_buffers() {
     let pixels = vec![1u8, 2, 3, 4];
     let raster = RasterView::new(2, 2, 1, &pixels).unwrap();
-    let exact_len = encoded_len_upper_bound(raster, None, EncodeOptions::default()).unwrap();
-    let mut out = vec![0u8; exact_len - 1];
+    let blob = encode(raster, None, EncodeOptions::default()).unwrap();
+    let mut out = vec![0u8; blob.len() - 1];
 
     assert!(matches!(
         encode_into(raster, None, EncodeOptions::default(), &mut out),

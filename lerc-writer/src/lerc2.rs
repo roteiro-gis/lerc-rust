@@ -41,30 +41,6 @@ trait ByteSink {
     fn len(&self) -> usize;
 }
 
-#[derive(Debug, Default)]
-struct CountSink {
-    len: usize,
-}
-
-impl ByteSink for CountSink {
-    fn push(&mut self, _byte: u8) -> Result<()> {
-        self.len += 1;
-        Ok(())
-    }
-
-    fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
-        self.len = self
-            .len
-            .checked_add(bytes.len())
-            .ok_or_else(|| Error::InvalidArgument("encoded blob size overflows usize".into()))?;
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
 struct SliceSink<'a> {
     out: &'a mut [u8],
     len: usize,
@@ -107,6 +83,23 @@ impl ByteSink for SliceSink<'_> {
 
     fn len(&self) -> usize {
         self.len
+    }
+}
+
+#[derive(Debug, Default)]
+struct TileScratch {
+    raw_bytes: Vec<u8>,
+    values_f64: Vec<f64>,
+    quantized: Vec<u32>,
+    bitstuff_payload: Vec<u8>,
+}
+
+impl TileScratch {
+    fn clear(&mut self) {
+        self.raw_bytes.clear();
+        self.values_f64.clear();
+        self.quantized.clear();
+        self.bitstuff_payload.clear();
     }
 }
 
@@ -156,8 +149,8 @@ pub fn encode<T: Sample>(
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
     let analysis = analyze_raster(raster, mask, options)?;
-    let exact_len = exact_encoded_len(raster, mask.map(MaskView::data), options, &analysis)?;
-    let mut out = vec![0u8; exact_len];
+    let upper_bound = encoded_len_upper_bound_from_analysis(raster, mask, options, &analysis)?;
+    let mut out = vec![0u8; upper_bound];
     let written = encode_into_with_analysis(
         raster,
         mask.map(MaskView::data),
@@ -165,7 +158,7 @@ pub fn encode<T: Sample>(
         &analysis,
         &mut out,
     )?;
-    debug_assert_eq!(written, exact_len);
+    out.truncate(written);
     Ok(out)
 }
 
@@ -176,13 +169,6 @@ pub fn encode_into<T: Sample>(
     out: &mut [u8],
 ) -> Result<usize> {
     let analysis = analyze_raster(raster, mask, options)?;
-    let exact_len = exact_encoded_len(raster, mask.map(MaskView::data), options, &analysis)?;
-    if out.len() < exact_len {
-        return Err(Error::OutputTooSmall {
-            needed: exact_len,
-            available: out.len(),
-        });
-    }
     encode_into_with_analysis(raster, mask.map(MaskView::data), options, &analysis, out)
 }
 
@@ -251,22 +237,45 @@ fn analyze_raster<T: Sample>(
     })
 }
 
-fn exact_encoded_len<T: Sample>(
+fn encoded_len_upper_bound_from_analysis<T: Sample>(
     raster: RasterView<'_, T>,
-    mask: Option<&[u8]>,
+    mask: Option<MaskView<'_>>,
     options: EncodeOptions,
     analysis: &RasterAnalysis,
 ) -> Result<usize> {
-    let mut body = CountSink::default();
-    write_tile_body(&mut body, raster, mask, options, analysis)?;
-    let mask_len = mask_payload_len(raster.pixel_count()?, analysis.valid_pixel_count as usize)?;
+    validate_options(raster, mask, options)?;
+
+    let pixel_count = raster.pixel_count()?;
+    let valid_pixel_count = analysis.valid_pixel_count as usize;
+    let depth = raster.depth() as usize;
+    let num_tiles = tile_count(raster.width() as usize, raster.height() as usize, options)?;
+    let byte_len = raster.data_type().byte_len();
+    let mask_len = mask_payload_len(pixel_count, valid_pixel_count)?;
     let range_len = depth_range_len(analysis)?;
+    let prefix_len = if analysis.valid_pixel_count == 0
+        || analysis.z_min == analysis.z_max
+        || has_per_depth_constant(analysis)
+    {
+        0
+    } else {
+        body_prefix_len(raster.data_type(), options.max_z_error)
+    };
+    let tile_header_len = num_tiles
+        .checked_mul(depth)
+        .ok_or_else(|| Error::InvalidArgument("tile header length overflows usize".into()))?;
+    let raw_data_len = valid_pixel_count
+        .checked_mul(depth)
+        .and_then(|len| len.checked_mul(byte_len))
+        .ok_or_else(|| Error::InvalidArgument("raw tile payload length overflows usize".into()))?;
+
     FIXED_HEADER_LEN
         .checked_add(MASK_COUNT_LEN)
         .and_then(|len| len.checked_add(mask_len))
         .and_then(|len| len.checked_add(range_len))
-        .and_then(|len| len.checked_add(body.len()))
-        .ok_or_else(|| Error::InvalidArgument("encoded blob size overflows usize".into()))
+        .and_then(|len| len.checked_add(prefix_len))
+        .and_then(|len| len.checked_add(tile_header_len))
+        .and_then(|len| len.checked_add(raw_data_len))
+        .ok_or_else(|| Error::InvalidArgument("encoded upper bound overflows usize".into()))
 }
 
 fn encode_into_with_analysis<T: Sample>(
@@ -277,6 +286,7 @@ fn encode_into_with_analysis<T: Sample>(
     out: &mut [u8],
 ) -> Result<usize> {
     let mut sink = SliceSink::new(out);
+    let mut scratch = TileScratch::default();
     write_header_prefix(&mut sink, analysis)?;
     write_u32(
         &mut sink,
@@ -289,7 +299,7 @@ fn encode_into_with_analysis<T: Sample>(
         analysis.valid_pixel_count as usize,
     )?;
     write_depth_ranges(&mut sink, analysis)?;
-    write_tile_body(&mut sink, raster, mask, options, analysis)?;
+    write_tile_body(&mut sink, &mut scratch, raster, mask, options, analysis)?;
 
     let written = sink.len();
     if written > i32::MAX as usize {
@@ -365,6 +375,7 @@ fn write_depth_ranges(sink: &mut impl ByteSink, analysis: &RasterAnalysis) -> Re
 
 fn write_tile_body<T: Sample>(
     sink: &mut impl ByteSink,
+    scratch: &mut TileScratch,
     raster: RasterView<'_, T>,
     mask: Option<&[u8]>,
     options: EncodeOptions,
@@ -414,7 +425,7 @@ fn write_tile_body<T: Sample>(
             };
 
             for dim in 0..depth {
-                let mut values = Vec::with_capacity(block_width * block_height);
+                scratch.clear();
                 for row in 0..block_height {
                     let pixel_row = block_y * micro + row;
                     for col in 0..block_width {
@@ -422,24 +433,23 @@ fn write_tile_body<T: Sample>(
                         if !pixel_is_valid(mask, pixel) {
                             continue;
                         }
-                        values.push(raster.sample(pixel, dim));
+                        let value = raster.sample(pixel, dim);
+                        value.append_le_bytes(&mut scratch.raw_bytes);
+                        scratch.values_f64.push(value.to_f64());
                     }
                 }
 
                 let check_code = (((block_x * micro) >> 3) as u8) & 15;
-                if values.is_empty() {
+                if scratch.values_f64.is_empty() {
                     sink.push(tile_header(check_code, 2))?;
                     continue;
                 }
 
                 let mut min = f64::INFINITY;
                 let mut max = f64::NEG_INFINITY;
-                let mut as_f64 = Vec::with_capacity(values.len());
-                for &value in &values {
-                    let value = value.to_f64();
+                for &value in &scratch.values_f64 {
                     min = min.min(value);
                     max = max.max(value);
-                    as_f64.push(value);
                 }
 
                 if min == max {
@@ -448,20 +458,25 @@ fn write_tile_body<T: Sample>(
                     continue;
                 }
 
-                let raw_len = 1 + values.len() * analysis.data_type.byte_len();
-                if let Some(bitstuff) = try_bitstuff_tile(&as_f64, min, max, options.max_z_error)? {
+                let raw_len = 1 + scratch.raw_bytes.len();
+                if let Some(bitstuff) = try_bitstuff_tile(
+                    &scratch.values_f64,
+                    min,
+                    max,
+                    options.max_z_error,
+                    &mut scratch.quantized,
+                    &mut scratch.bitstuff_payload,
+                )? {
                     if bitstuff.encoded_len(analysis.data_type) < raw_len {
                         sink.push(tile_header(check_code, 1))?;
                         write_value_as(sink, bitstuff.offset, analysis.data_type)?;
-                        sink.extend_from_slice(&bitstuff.payload)?;
+                        sink.extend_from_slice(&scratch.bitstuff_payload[..bitstuff.payload_len])?;
                         continue;
                     }
                 }
 
                 sink.push(tile_header(check_code, 0))?;
-                for value in as_f64 {
-                    write_value_as(sink, value, analysis.data_type)?;
-                }
+                sink.extend_from_slice(&scratch.raw_bytes)?;
             }
         }
     }
@@ -472,12 +487,12 @@ fn write_tile_body<T: Sample>(
 #[derive(Debug, Clone)]
 struct BitstuffTile {
     offset: f64,
-    payload: Vec<u8>,
+    payload_len: usize,
 }
 
 impl BitstuffTile {
     fn encoded_len(&self, data_type: DataType) -> usize {
-        1 + data_type.byte_len() + self.payload.len()
+        1 + data_type.byte_len() + self.payload_len
     }
 }
 
@@ -486,6 +501,8 @@ fn try_bitstuff_tile(
     offset: f64,
     max_value: f64,
     max_z_error: f64,
+    quantized: &mut Vec<u32>,
+    payload: &mut Vec<u8>,
 ) -> Result<Option<BitstuffTile>> {
     if max_z_error <= 0.0 {
         return Ok(None);
@@ -501,7 +518,8 @@ fn try_bitstuff_tile(
     }
 
     let epsilon = max_z_error.abs() * 1e-12 + 1e-12;
-    let mut quantized = Vec::with_capacity(values.len());
+    quantized.clear();
+    quantized.reserve(values.len());
     let mut max_quantized = 0u32;
     for &value in values {
         let quantized_value = ((value - offset) / scale).round().clamp(0.0, nmax as f64) as u32;
@@ -523,12 +541,15 @@ fn try_bitstuff_tile(
     }
 
     let (count_code, count_bytes) = count_field(values.len())?;
-    let mut payload =
-        Vec::with_capacity(1 + count_bytes + (values.len() * bits as usize).div_ceil(8));
+    payload.clear();
+    payload.reserve(1 + count_bytes + (values.len() * bits as usize).div_ceil(8));
     payload.push((count_code << 6) | bits);
-    append_count(&mut payload, values.len(), count_bytes)?;
-    payload.extend_from_slice(&pack_lsb_bits(&quantized, bits));
-    Ok(Some(BitstuffTile { offset, payload }))
+    append_count(payload, values.len(), count_bytes)?;
+    pack_lsb_bits_into(quantized, bits, payload);
+    Ok(Some(BitstuffTile {
+        offset,
+        payload_len: payload.len(),
+    }))
 }
 
 fn count_field(count: usize) -> Result<(u8, usize)> {
@@ -570,21 +591,22 @@ fn append_count(out: &mut Vec<u8>, count: usize, count_bytes: usize) -> Result<(
     Ok(())
 }
 
-fn pack_lsb_bits(values: &[u32], bits_per_value: u8) -> Vec<u8> {
+fn pack_lsb_bits_into(values: &[u32], bits_per_value: u8, out: &mut Vec<u8>) {
     let total_bits = values.len() * bits_per_value as usize;
-    let mut out = vec![0u8; total_bits.div_ceil(8)];
+    let byte_len = total_bits.div_ceil(8);
+    let base = out.len();
+    out.resize(base + byte_len, 0);
     let mut bit_offset = 0usize;
     for &value in values {
         for bit in 0..bits_per_value {
             if ((value >> bit) & 1) != 0 {
                 let byte_index = bit_offset / 8;
                 let bit_index = bit_offset % 8;
-                out[byte_index] |= 1 << bit_index;
+                out[base + byte_index] |= 1 << bit_index;
             }
             bit_offset += 1;
         }
     }
-    out
 }
 
 fn write_mask_rle(
