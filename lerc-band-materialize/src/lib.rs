@@ -175,10 +175,16 @@ struct BandShape {
     band_count: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ActiveBand {
     band_index: usize,
-    written_values: usize,
+    progress: ActiveBandProgress,
+}
+
+#[derive(Debug, Clone)]
+enum ActiveBandProgress {
+    Prefix(usize),
+    Sparse(Vec<bool>),
 }
 
 impl<T> BandMaterializer<T> {
@@ -227,12 +233,17 @@ impl<T> BandMaterializer<T> {
         let band_len = band_len(self.shape.pixel_count, self.shape.depth)?;
         self.active_band = Some(ActiveBand {
             band_index,
-            written_values: 0,
+            progress: ActiveBandProgress::Prefix(0),
         });
         for value_index in 0..band_len {
             let out_index = band_value_index(self.shape, band_index, self.layout, value_index);
             self.out[out_index].write(value_at(value_index));
-            self.active_band.as_mut().unwrap().written_values += 1;
+            let ActiveBandProgress::Prefix(written_values) =
+                &mut self.active_band.as_mut().unwrap().progress
+            else {
+                unreachable!();
+            };
+            *written_values += 1;
         }
         self.active_band = None;
         self.written_bands[band_index] = true;
@@ -270,12 +281,11 @@ impl<T> BandMaterializer<T> {
         }
         self.active_band = Some(ActiveBand {
             band_index,
-            written_values: 0,
+            progress: ActiveBandProgress::Prefix(0),
         });
         Ok(MaterializerBandWriter {
             materializer: self,
             band_index,
-            initialized_all: false,
             finished: false,
         })
     }
@@ -304,7 +314,7 @@ impl<T: Clone> BandMaterializer<T> {
 
         self.active_band = Some(ActiveBand {
             band_index,
-            written_values: 0,
+            progress: ActiveBandProgress::Prefix(0),
         });
         write_band_values_into_uninit_slice(
             &mut self.out,
@@ -322,7 +332,6 @@ impl<T: Clone> BandMaterializer<T> {
 pub struct MaterializerBandWriter<'a, T> {
     materializer: &'a mut BandMaterializer<T>,
     band_index: usize,
-    initialized_all: bool,
     finished: bool,
 }
 
@@ -336,50 +345,102 @@ impl<T: Copy + Default> MaterializerBandWriter<'_, T> {
 
 impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
     fn fill_default(&mut self) {
-        if self.initialized_all {
-            return;
-        }
         let band_len = band_len(
             self.materializer.shape.pixel_count,
             self.materializer.shape.depth,
         )
         .expect("band length was validated when the materializer was created");
-        for value_index in 0..band_len {
-            let out_index = band_value_index(
-                self.materializer.shape,
-                self.band_index,
-                self.materializer.layout,
-                value_index,
-            );
-            self.materializer.out[out_index].write(T::default());
+        match &mut self.materializer.active_band.as_mut().unwrap().progress {
+            ActiveBandProgress::Prefix(written_values) => {
+                for value_index in 0..band_len {
+                    let out_index = band_value_index(
+                        self.materializer.shape,
+                        self.band_index,
+                        self.materializer.layout,
+                        value_index,
+                    );
+                    if value_index < *written_values {
+                        unsafe {
+                            *self.materializer.out[out_index].assume_init_mut() = T::default();
+                        }
+                    } else {
+                        self.materializer.out[out_index].write(T::default());
+                    }
+                }
+                *written_values = band_len;
+            }
+            ActiveBandProgress::Sparse(initialized) => {
+                for (value_index, is_initialized) in
+                    initialized.iter_mut().enumerate().take(band_len)
+                {
+                    let out_index = band_value_index(
+                        self.materializer.shape,
+                        self.band_index,
+                        self.materializer.layout,
+                        value_index,
+                    );
+                    if *is_initialized {
+                        unsafe {
+                            *self.materializer.out[out_index].assume_init_mut() = T::default();
+                        }
+                    } else {
+                        self.materializer.out[out_index].write(T::default());
+                        *is_initialized = true;
+                    }
+                }
+            }
         }
-        self.materializer
-            .active_band
-            .as_mut()
-            .unwrap()
-            .written_values = band_len;
-        self.initialized_all = true;
     }
 
     fn write(&mut self, pixel: usize, dim: usize, value: T) {
-        let out_index = band_value_index_for_pixel(
-            self.materializer.shape,
-            self.band_index,
-            self.materializer.layout,
-            pixel,
-            dim,
-        );
-        if self.initialized_all {
-            unsafe {
-                *self.materializer.out[out_index].assume_init_mut() = value;
+        let logical_index = pixel * self.materializer.shape.depth + dim;
+        loop {
+            let out_index = band_value_index_for_pixel(
+                self.materializer.shape,
+                self.band_index,
+                self.materializer.layout,
+                pixel,
+                dim,
+            );
+            match &mut self.materializer.active_band.as_mut().unwrap().progress {
+                ActiveBandProgress::Prefix(written_values) => {
+                    if logical_index < *written_values {
+                        unsafe {
+                            *self.materializer.out[out_index].assume_init_mut() = value;
+                        }
+                        return;
+                    }
+                    if logical_index == *written_values {
+                        self.materializer.out[out_index].write(value);
+                        *written_values += 1;
+                        return;
+                    }
+
+                    let mut initialized =
+                        vec![
+                            false;
+                            band_len(
+                                self.materializer.shape.pixel_count,
+                                self.materializer.shape.depth,
+                            )
+                            .expect("band length was validated when the materializer was created")
+                        ];
+                    initialized[..*written_values].fill(true);
+                    self.materializer.active_band.as_mut().unwrap().progress =
+                        ActiveBandProgress::Sparse(initialized);
+                }
+                ActiveBandProgress::Sparse(initialized) => {
+                    if initialized[logical_index] {
+                        unsafe {
+                            *self.materializer.out[out_index].assume_init_mut() = value;
+                        }
+                    } else {
+                        self.materializer.out[out_index].write(value);
+                        initialized[logical_index] = true;
+                    }
+                    return;
+                }
             }
-        } else {
-            self.materializer.out[out_index].write(value);
-            self.materializer
-                .active_band
-                .as_mut()
-                .unwrap()
-                .written_values += 1;
         }
     }
 
@@ -391,6 +452,21 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
             pixel,
             dim,
         );
+        let logical_index = pixel * self.materializer.shape.depth + dim;
+        match &self.materializer.active_band.as_ref().unwrap().progress {
+            ActiveBandProgress::Prefix(written_values) => {
+                assert!(
+                    logical_index < *written_values,
+                    "attempted to read an uninitialized materialized sample"
+                );
+            }
+            ActiveBandProgress::Sparse(initialized) => {
+                assert!(
+                    initialized[logical_index],
+                    "attempted to read an uninitialized materialized sample"
+                );
+            }
+        }
         unsafe { *self.materializer.out[out_index].assume_init_ref() }
     }
 
@@ -419,13 +495,22 @@ impl<T> Drop for BandMaterializer<T> {
         }
 
         if let Some(active_band) = self.active_band.take() {
-            drop_band_prefix(
-                &mut self.out,
-                self.shape,
-                active_band.band_index,
-                self.layout,
-                active_band.written_values,
-            );
+            match active_band.progress {
+                ActiveBandProgress::Prefix(written_values) => drop_band_prefix(
+                    &mut self.out,
+                    self.shape,
+                    active_band.band_index,
+                    self.layout,
+                    written_values,
+                ),
+                ActiveBandProgress::Sparse(initialized) => drop_sparse_band(
+                    &mut self.out,
+                    self.shape,
+                    active_band.band_index,
+                    self.layout,
+                    &initialized,
+                ),
+            }
         }
     }
 }
@@ -443,7 +528,11 @@ fn write_band_values_into_uninit_slice<T: Clone>(
                 for pixel in 0..shape.pixel_count {
                     out[pixel * shape.band_count + active_band.band_index]
                         .write(values[pixel].clone());
-                    active_band.written_values += 1;
+                    let ActiveBandProgress::Prefix(written_values) = &mut active_band.progress
+                    else {
+                        unreachable!();
+                    };
+                    *written_values += 1;
                 }
             } else {
                 for pixel in 0..shape.pixel_count {
@@ -452,7 +541,11 @@ fn write_band_values_into_uninit_slice<T: Clone>(
                         (pixel * shape.band_count + active_band.band_index) * shape.depth;
                     for offset in 0..shape.depth {
                         out[dst_base + offset].write(values[src_base + offset].clone());
-                        active_band.written_values += 1;
+                        let ActiveBandProgress::Prefix(written_values) = &mut active_band.progress
+                        else {
+                            unreachable!();
+                        };
+                        *written_values += 1;
                     }
                 }
             }
@@ -462,7 +555,10 @@ fn write_band_values_into_uninit_slice<T: Clone>(
             let dst_base = active_band.band_index * band_len;
             for (index, value) in values.iter().enumerate() {
                 out[dst_base + index].write(value.clone());
-                active_band.written_values += 1;
+                let ActiveBandProgress::Prefix(written_values) = &mut active_band.progress else {
+                    unreachable!();
+                };
+                *written_values += 1;
             }
         }
     }
@@ -476,6 +572,24 @@ fn drop_band_prefix<T>(
     written_values: usize,
 ) {
     for value_index in 0..written_values {
+        let out_index = band_value_index(shape, band_index, layout, value_index);
+        unsafe {
+            out[out_index].assume_init_drop();
+        }
+    }
+}
+
+fn drop_sparse_band<T>(
+    out: &mut [MaybeUninit<T>],
+    shape: BandShape,
+    band_index: usize,
+    layout: BandLayout,
+    initialized: &[bool],
+) {
+    for (value_index, is_initialized) in initialized.iter().copied().enumerate() {
+        if !is_initialized {
+            continue;
+        }
         let out_index = band_value_index(shape, band_index, layout, value_index);
         unsafe {
             out[out_index].assume_init_drop();

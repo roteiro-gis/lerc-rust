@@ -23,9 +23,7 @@ mod pixel;
 #[cfg(test)]
 mod tests;
 
-use lerc_band_materialize::{
-    copy_band_values_into_slice, BandLayout as MaterializeLayout, BandMaterializer, BandSink,
-};
+use lerc_band_materialize::{BandLayout as MaterializeLayout, BandMaterializer, BandSink};
 use lerc_core::{
     BandLayout, BandSetInfo, BlobInfo, Decoded, DecodedBandSet, DecodedF64, Error, NdArrayElement,
     Result,
@@ -135,79 +133,14 @@ pub fn decode_band_set_into<T: NdArrayElement + 'static>(
     layout: BandLayout,
     out: &mut [T],
 ) -> Result<BandSetInfo> {
-    if TypeId::of::<T>() == TypeId::of::<i8>() {
-        return decode_band_set_into_impl::<i8>(blob, layout, cast_slice_mut::<T, i8>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u8>() {
-        return decode_band_set_into_impl::<u8>(blob, layout, cast_slice_mut::<T, u8>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<i16>() {
-        return decode_band_set_into_impl::<i16>(blob, layout, cast_slice_mut::<T, i16>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u16>() {
-        return decode_band_set_into_impl::<u16>(blob, layout, cast_slice_mut::<T, u16>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<i32>() {
-        return decode_band_set_into_impl::<i32>(blob, layout, cast_slice_mut::<T, i32>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u32>() {
-        return decode_band_set_into_impl::<u32>(blob, layout, cast_slice_mut::<T, u32>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<f32>() {
-        return decode_band_set_into_impl::<f32>(blob, layout, cast_slice_mut::<T, f32>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<f64>() {
-        return decode_band_set_into_impl::<f64>(blob, layout, cast_slice_mut::<T, f64>(out));
+    if let Some(info) = try_decode_band_set_into_direct(blob, layout, out) {
+        return info;
     }
 
-    let band_info = scan_band_infos(blob)?;
-    let band_count = band_info.band_count();
-    let expected_len = band_info.value_count()?;
-    if out.len() != expected_len {
-        return Err(Error::InvalidBlob(format!(
-            "output slice length {} does not match decoded band set length {}",
-            out.len(),
-            expected_len
-        )));
-    }
-
-    let mut offset = 0usize;
-    let mut band_index = 0usize;
-    let mut lerc1_mask: Option<Vec<u8>> = None;
-    let mut lerc2_mask: Option<Vec<u8>> = None;
-
-    while offset < blob.len() {
-        let slice = &blob[offset..];
-        let is_lerc1 = lerc1::is_lerc1(slice);
-        let decoded = decode_first_with_masks(slice, lerc1_mask.as_deref(), lerc2_mask.as_deref())?;
-        let pixel_count = decoded.info.pixel_count()?;
-        let depth = decoded.info.depth as usize;
-
-        let values = T::from_pixel_data(decoded.pixels)?;
-        copy_band_values_into_slice(
-            out,
-            &values,
-            pixel_count,
-            depth,
-            band_index,
-            band_count,
-            materialize_layout(layout),
-        )
-        .map_err(materialize_error)?;
-
-        if is_lerc1 {
-            lerc1_mask = decoded.mask;
-            lerc2_mask = None;
-        } else {
-            lerc2_mask = decoded.mask;
-            lerc1_mask = None;
-        }
-
-        offset = checked_next_offset(offset, decoded.info.blob_size, blob.len())?;
-        band_index += 1;
-    }
-
-    Ok(band_info)
+    let decoded = decode_band_set(blob)?;
+    let info = decoded.info.clone();
+    decoded.copy_into_slice(layout, out)?;
+    Ok(info)
 }
 
 pub fn decode_band_set_ndarray<T: NdArrayElement + 'static>(blob: &[u8]) -> Result<ArrayD<T>> {
@@ -321,103 +254,134 @@ fn decode_band_set_owned<T: NdArrayElement + 'static>(
     layout: BandLayout,
 ) -> Result<(BandSetInfo, Vec<T>)> {
     let band_info = scan_band_infos(blob)?;
-    if TypeId::of::<T>() == TypeId::of::<i8>() {
-        return decode_band_set_owned_direct_impl::<i8>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, i8>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u8>() {
-        return decode_band_set_owned_direct_impl::<u8>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, u8>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<i16>() {
-        return decode_band_set_owned_direct_impl::<i16>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, i16>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u16>() {
-        return decode_band_set_owned_direct_impl::<u16>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, u16>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<i32>() {
-        return decode_band_set_owned_direct_impl::<i32>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, i32>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u32>() {
-        return decode_band_set_owned_direct_impl::<u32>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, u32>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<f32>() {
-        return decode_band_set_owned_direct_impl::<f32>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, f32>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<f64>() {
-        return decode_band_set_owned_direct_impl::<f64>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, f64>(values)));
+    if let Some(decoded) = try_decode_band_set_owned_direct(blob, layout, band_info.clone()) {
+        return decoded;
     }
 
-    decode_band_set_owned_fallback(blob, layout, band_info)
+    let decoded = decode_band_set(blob)?;
+    let info = decoded.info.clone();
+    let values = decoded.into_vec_with_layout(layout)?;
+    Ok((info, values))
 }
 
-fn decode_band_set_owned_fallback<T: NdArrayElement>(
+fn try_decode_band_set_into_direct<T: NdArrayElement + 'static>(
+    blob: &[u8],
+    layout: BandLayout,
+    out: &mut [T],
+) -> Option<Result<BandSetInfo>> {
+    if TypeId::of::<T>() == TypeId::of::<i8>() {
+        return Some(decode_band_set_into_impl::<i8>(
+            blob,
+            layout,
+            cast_slice_mut::<T, i8>(out),
+        ));
+    }
+    if TypeId::of::<T>() == TypeId::of::<u8>() {
+        return Some(decode_band_set_into_impl::<u8>(
+            blob,
+            layout,
+            cast_slice_mut::<T, u8>(out),
+        ));
+    }
+    if TypeId::of::<T>() == TypeId::of::<i16>() {
+        return Some(decode_band_set_into_impl::<i16>(
+            blob,
+            layout,
+            cast_slice_mut::<T, i16>(out),
+        ));
+    }
+    if TypeId::of::<T>() == TypeId::of::<u16>() {
+        return Some(decode_band_set_into_impl::<u16>(
+            blob,
+            layout,
+            cast_slice_mut::<T, u16>(out),
+        ));
+    }
+    if TypeId::of::<T>() == TypeId::of::<i32>() {
+        return Some(decode_band_set_into_impl::<i32>(
+            blob,
+            layout,
+            cast_slice_mut::<T, i32>(out),
+        ));
+    }
+    if TypeId::of::<T>() == TypeId::of::<u32>() {
+        return Some(decode_band_set_into_impl::<u32>(
+            blob,
+            layout,
+            cast_slice_mut::<T, u32>(out),
+        ));
+    }
+    if TypeId::of::<T>() == TypeId::of::<f32>() {
+        return Some(decode_band_set_into_impl::<f32>(
+            blob,
+            layout,
+            cast_slice_mut::<T, f32>(out),
+        ));
+    }
+    if TypeId::of::<T>() == TypeId::of::<f64>() {
+        return Some(decode_band_set_into_impl::<f64>(
+            blob,
+            layout,
+            cast_slice_mut::<T, f64>(out),
+        ));
+    }
+    None
+}
+
+fn try_decode_band_set_owned_direct<T: NdArrayElement + 'static>(
     blob: &[u8],
     layout: BandLayout,
     band_info: BandSetInfo,
-) -> Result<(BandSetInfo, Vec<T>)> {
-    let band_count = band_info.band_count();
-    let expected_len = band_info.value_count()?;
-    if expected_len == 0 {
-        return Ok((band_info, Vec::new()));
+) -> Option<Result<(BandSetInfo, Vec<T>)>> {
+    if TypeId::of::<T>() == TypeId::of::<i8>() {
+        return Some(
+            decode_band_set_owned_direct_impl::<i8>(blob, layout, band_info)
+                .map(|(info, values)| (info, cast_vec::<T, i8>(values))),
+        );
     }
-
-    let mut offset = 0usize;
-    let mut band_index = 0usize;
-    let mut lerc1_mask: Option<Vec<u8>> = None;
-    let mut lerc2_mask: Option<Vec<u8>> = None;
-    let mut materializer = if band_count > 1 {
-        Some(
-            BandMaterializer::new(
-                band_info.bands[0].pixel_count()?,
-                band_info.depth() as usize,
-                band_count,
-                materialize_layout(layout),
-            )
-            .map_err(materialize_error)?,
-        )
-    } else {
-        None
-    };
-
-    while offset < blob.len() {
-        let slice = &blob[offset..];
-        let is_lerc1 = lerc1::is_lerc1(slice);
-        let decoded = decode_first_with_masks(slice, lerc1_mask.as_deref(), lerc2_mask.as_deref())?;
-        let values = T::from_pixel_data(decoded.pixels)?;
-
-        if band_count == 1 {
-            return Ok((band_info, values));
-        }
-
-        materializer
-            .as_mut()
-            .unwrap()
-            .copy_band(band_index, &values)
-            .map_err(materialize_error)?;
-
-        if is_lerc1 {
-            lerc1_mask = decoded.mask;
-            lerc2_mask = None;
-        } else {
-            lerc2_mask = decoded.mask;
-            lerc1_mask = None;
-        }
-
-        offset = checked_next_offset(offset, decoded.info.blob_size, blob.len())?;
-        band_index += 1;
+    if TypeId::of::<T>() == TypeId::of::<u8>() {
+        return Some(
+            decode_band_set_owned_direct_impl::<u8>(blob, layout, band_info)
+                .map(|(info, values)| (info, cast_vec::<T, u8>(values))),
+        );
     }
-
-    Ok((
-        band_info,
-        materializer.unwrap().finish().map_err(materialize_error)?,
-    ))
+    if TypeId::of::<T>() == TypeId::of::<i16>() {
+        return Some(
+            decode_band_set_owned_direct_impl::<i16>(blob, layout, band_info)
+                .map(|(info, values)| (info, cast_vec::<T, i16>(values))),
+        );
+    }
+    if TypeId::of::<T>() == TypeId::of::<u16>() {
+        return Some(
+            decode_band_set_owned_direct_impl::<u16>(blob, layout, band_info)
+                .map(|(info, values)| (info, cast_vec::<T, u16>(values))),
+        );
+    }
+    if TypeId::of::<T>() == TypeId::of::<i32>() {
+        return Some(
+            decode_band_set_owned_direct_impl::<i32>(blob, layout, band_info)
+                .map(|(info, values)| (info, cast_vec::<T, i32>(values))),
+        );
+    }
+    if TypeId::of::<T>() == TypeId::of::<u32>() {
+        return Some(
+            decode_band_set_owned_direct_impl::<u32>(blob, layout, band_info)
+                .map(|(info, values)| (info, cast_vec::<T, u32>(values))),
+        );
+    }
+    if TypeId::of::<T>() == TypeId::of::<f32>() {
+        return Some(
+            decode_band_set_owned_direct_impl::<f32>(blob, layout, band_info)
+                .map(|(info, values)| (info, cast_vec::<T, f32>(values))),
+        );
+    }
+    if TypeId::of::<T>() == TypeId::of::<f64>() {
+        return Some(
+            decode_band_set_owned_direct_impl::<f64>(blob, layout, band_info)
+                .map(|(info, values)| (info, cast_vec::<T, f64>(values))),
+        );
+    }
+    None
 }
 
 fn decode_band_set_into_impl<T: Sample + NdArrayElement>(
@@ -604,11 +568,6 @@ fn decode_band_set_owned_direct_impl<T: Sample + NdArrayElement + Copy + Default
     let expected_len = band_info.value_count()?;
     if expected_len == 0 {
         return Ok((band_info, Vec::new()));
-    }
-    if band_info.band_count() == 1 {
-        let mut out = vec![T::default(); expected_len];
-        decode_band_set_into_impl_with_info(blob, layout, &band_info, &mut out)?;
-        return Ok((band_info, out));
     }
 
     let pixel_count = band_info.bands[0].pixel_count()?;

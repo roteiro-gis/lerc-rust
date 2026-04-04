@@ -1,7 +1,9 @@
 use std::any::TypeId;
 
 use crate::error::{Error, Result};
-use lerc_band_materialize::{BandLayout as MaterializeLayout, BandMaterializer, BandSink};
+use lerc_band_materialize::{
+    copy_band_values_into_slice, BandLayout as MaterializeLayout, BandMaterializer,
+};
 use ndarray::{ArrayD, IxDyn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -415,7 +417,7 @@ impl DecodedBandSet {
         materializer.finish().map_err(materialize_error)
     }
 
-    pub fn copy_into_slice<T: NdArrayElement + 'static + Copy + Default>(
+    pub fn copy_into_slice<T: NdArrayElement + 'static>(
         self,
         layout: BandLayout,
         out: &mut [T],
@@ -433,15 +435,15 @@ impl DecodedBandSet {
         }
 
         for (band_index, band) in self.bands.into_iter().enumerate() {
-            let mut sink = BandSink::new(
+            copy_pixel_data_into_layout_slice(
                 out,
+                band_index,
                 pixel_count,
                 depth,
-                band_index,
                 band_count,
-                materialize_layout(layout),
-            );
-            copy_pixel_data_into_sink(&mut sink, band)?;
+                layout,
+                band,
+            )?;
         }
         Ok(())
     }
@@ -523,43 +525,136 @@ fn copy_typed_values_into_materializer<T: NdArrayElement + 'static, U: Copy + 's
     )))
 }
 
-fn copy_pixel_data_into_sink<T: NdArrayElement + 'static + Copy + Default>(
-    sink: &mut BandSink<'_, T>,
+fn copy_pixel_data_into_layout_slice<T: NdArrayElement + 'static>(
+    out: &mut [T],
+    band_index: usize,
+    pixel_count: usize,
+    depth: usize,
+    band_count: usize,
+    layout: BandLayout,
     band: PixelData,
 ) -> Result<()> {
     match band {
-        PixelData::I8(values) => copy_typed_values_into_sink(sink, &values),
-        PixelData::U8(values) => copy_typed_values_into_sink(sink, &values),
-        PixelData::I16(values) => copy_typed_values_into_sink(sink, &values),
-        PixelData::U16(values) => copy_typed_values_into_sink(sink, &values),
-        PixelData::I32(values) => copy_typed_values_into_sink(sink, &values),
-        PixelData::U32(values) => copy_typed_values_into_sink(sink, &values),
-        PixelData::F32(values) => copy_typed_values_into_sink(sink, &values),
-        PixelData::F64(values) => copy_typed_values_into_sink(sink, &values),
+        PixelData::I8(values) => copy_typed_values_into_layout_slice(
+            out,
+            band_index,
+            pixel_count,
+            depth,
+            band_count,
+            layout,
+            &values,
+        ),
+        PixelData::U8(values) => copy_typed_values_into_layout_slice(
+            out,
+            band_index,
+            pixel_count,
+            depth,
+            band_count,
+            layout,
+            &values,
+        ),
+        PixelData::I16(values) => copy_typed_values_into_layout_slice(
+            out,
+            band_index,
+            pixel_count,
+            depth,
+            band_count,
+            layout,
+            &values,
+        ),
+        PixelData::U16(values) => copy_typed_values_into_layout_slice(
+            out,
+            band_index,
+            pixel_count,
+            depth,
+            band_count,
+            layout,
+            &values,
+        ),
+        PixelData::I32(values) => copy_typed_values_into_layout_slice(
+            out,
+            band_index,
+            pixel_count,
+            depth,
+            band_count,
+            layout,
+            &values,
+        ),
+        PixelData::U32(values) => copy_typed_values_into_layout_slice(
+            out,
+            band_index,
+            pixel_count,
+            depth,
+            band_count,
+            layout,
+            &values,
+        ),
+        PixelData::F32(values) => copy_typed_values_into_layout_slice(
+            out,
+            band_index,
+            pixel_count,
+            depth,
+            band_count,
+            layout,
+            &values,
+        ),
+        PixelData::F64(values) => copy_typed_values_into_layout_slice(
+            out,
+            band_index,
+            pixel_count,
+            depth,
+            band_count,
+            layout,
+            &values,
+        ),
     }
 }
 
-fn copy_typed_values_into_sink<
-    T: NdArrayElement + 'static + Copy + Default,
-    U: Copy + 'static + IntoF64,
->(
-    sink: &mut BandSink<'_, T>,
+fn copy_typed_values_into_layout_slice<T: NdArrayElement + 'static, U: Copy + 'static + IntoF64>(
+    out: &mut [T],
+    band_index: usize,
+    pixel_count: usize,
+    depth: usize,
+    band_count: usize,
+    layout: BandLayout,
     values: &[U],
 ) -> Result<()> {
-    let depth = sink.depth();
     if TypeId::of::<T>() == TypeId::of::<U>() {
-        for (index, value) in values.iter().copied().enumerate() {
-            sink.write(index / depth, index % depth, unsafe_cast::<T, U>(value));
-        }
-        return Ok(());
+        let typed = unsafe { cast_slice::<U, T>(values) };
+        return copy_band_values_into_slice(
+            out,
+            typed,
+            pixel_count,
+            depth,
+            band_index,
+            band_count,
+            materialize_layout(layout),
+        )
+        .map_err(materialize_error);
     }
     if TypeId::of::<T>() == TypeId::of::<f64>() {
-        for (index, value) in values.iter().copied().enumerate() {
-            sink.write(
-                index / depth,
-                index % depth,
-                unsafe_cast::<T, f64>(value.into_f64()),
-            );
+        let band_len = pixel_count
+            .checked_mul(depth.max(1))
+            .ok_or_else(|| Error::InvalidBlob("decoded band length overflows usize".into()))?;
+        if values.len() != band_len {
+            return Err(Error::InvalidBlob(
+                "decoded band length does not match its metadata".into(),
+            ));
+        }
+        for (value_index, value) in values.iter().copied().enumerate() {
+            let out_index = match layout {
+                BandLayout::Interleaved => {
+                    if depth <= 1 {
+                        value_index * band_count + band_index
+                    } else {
+                        let pixel = value_index / depth;
+                        let sample = value_index % depth;
+                        (pixel * band_count + band_index) * depth + sample
+                    }
+                }
+                BandLayout::Bsq => band_index * band_len + value_index,
+            };
+            out[out_index] = unsafe_cast::<T, f64>(value.into_f64());
         }
         return Ok(());
     }
