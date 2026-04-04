@@ -5,6 +5,6 @@ mod types;
 
 pub use error::{Error, Result};
 pub use types::{
-    BandLayout, BandSetInfo, BlobInfo, DataType, Decoded, DecodedBandSet, DecodedF64,
-    NdArrayElement, PixelData, Version,
+    copy_band_values_into_slice, BandLayout, BandMaterializer, BandSetInfo, BlobInfo, DataType,
+    Decoded, DecodedBandSet, DecodedF64, NdArrayElement, PixelData, Version,
 };

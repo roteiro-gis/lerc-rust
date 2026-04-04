@@ -24,8 +24,8 @@ mod pixel;
 mod tests;
 
 use lerc_core::{
-    BandLayout, BandSetInfo, BlobInfo, Decoded, DecodedBandSet, DecodedF64, Error, NdArrayElement,
-    Result,
+    copy_band_values_into_slice, BandLayout, BandMaterializer, BandSetInfo, BlobInfo, Decoded,
+    DecodedBandSet, DecodedF64, Error, NdArrayElement, Result,
 };
 use ndarray::ArrayD;
 
@@ -131,7 +131,7 @@ pub fn decode_band_set_into<T: NdArrayElement>(
 ) -> Result<BandSetInfo> {
     let band_info = scan_band_infos(blob)?;
     let band_count = band_info.band_count();
-    let expected_len = band_set_value_len(&band_info.bands[0], band_count)?;
+    let expected_len = band_info.value_count()?;
     if out.len() != expected_len {
         return Err(Error::InvalidBlob(format!(
             "output slice length {} does not match decoded band set length {}",
@@ -153,7 +153,7 @@ pub fn decode_band_set_into<T: NdArrayElement>(
         let depth = decoded.info.depth as usize;
 
         let values = T::from_pixel_data(decoded.pixels)?;
-        write_band_into_slice(
+        copy_band_values_into_slice(
             out,
             &values,
             pixel_count,
@@ -260,7 +260,7 @@ fn decode_band_set_owned<T: NdArrayElement>(
 ) -> Result<(BandSetInfo, Vec<T>)> {
     let band_info = scan_band_infos(blob)?;
     let band_count = band_info.band_count();
-    let expected_len = band_set_value_len(&band_info.bands[0], band_count)?;
+    let expected_len = band_info.value_count()?;
     if expected_len == 0 {
         return Ok((band_info, Vec::new()));
     }
@@ -269,35 +269,26 @@ fn decode_band_set_owned<T: NdArrayElement>(
     let mut band_index = 0usize;
     let mut lerc1_mask: Option<Vec<u8>> = None;
     let mut lerc2_mask: Option<Vec<u8>> = None;
-    let mut out: Option<Vec<T>> = None;
+    let mut materializer = if band_count > 1 {
+        Some(BandMaterializer::new(&band_info, layout)?)
+    } else {
+        None
+    };
 
     while offset < blob.len() {
         let slice = &blob[offset..];
         let is_lerc1 = lerc1::is_lerc1(slice);
         let decoded = decode_first_with_masks(slice, lerc1_mask.as_deref(), lerc2_mask.as_deref())?;
-        let pixel_count = decoded.info.pixel_count()?;
-        let depth = decoded.info.depth as usize;
         let values = T::from_pixel_data(decoded.pixels)?;
 
-        if out.is_none() {
-            if band_count == 1 {
-                return Ok((band_info, values));
-            }
-            let seed = values.first().cloned().ok_or_else(|| {
-                Error::InvalidBlob("decoded non-empty band set produced an empty band".into())
-            })?;
-            out = Some(vec![seed; expected_len]);
+        if band_count == 1 {
+            return Ok((band_info, values));
         }
 
-        write_band_into_slice(
-            out.as_mut().unwrap(),
-            &values,
-            pixel_count,
-            depth,
-            band_index,
-            band_count,
-            layout,
-        )?;
+        materializer
+            .as_mut()
+            .unwrap()
+            .copy_band(band_index, &values)?;
 
         if is_lerc1 {
             lerc1_mask = decoded.mask;
@@ -311,7 +302,7 @@ fn decode_band_set_owned<T: NdArrayElement>(
         band_index += 1;
     }
 
-    Ok((band_info, out.unwrap_or_default()))
+    Ok((band_info, materializer.unwrap().finish()?))
 }
 
 fn scan_band_infos(blob: &[u8]) -> Result<BandSetInfo> {
@@ -366,53 +357,4 @@ fn checked_next_offset(offset: usize, next_len: usize, total_len: usize) -> Resu
         ));
     }
     Ok(next)
-}
-
-fn band_set_value_len(info: &BlobInfo, band_count: usize) -> Result<usize> {
-    info.pixel_count()?
-        .checked_mul(info.depth as usize)
-        .and_then(|value_count| value_count.checked_mul(band_count))
-        .ok_or_else(|| Error::InvalidBlob("decoded band set length overflows usize".into()))
-}
-
-fn write_band_into_slice<T: NdArrayElement>(
-    out: &mut [T],
-    values: &[T],
-    pixel_count: usize,
-    depth: usize,
-    band_index: usize,
-    band_count: usize,
-    layout: BandLayout,
-) -> Result<()> {
-    let band_len = pixel_count
-        .checked_mul(depth)
-        .ok_or_else(|| Error::InvalidBlob("decoded band length overflows usize".into()))?;
-    if values.len() != band_len {
-        return Err(Error::InvalidBlob(
-            "decoded band length does not match its metadata".into(),
-        ));
-    }
-
-    match layout {
-        BandLayout::Interleaved => {
-            if depth <= 1 {
-                for pixel in 0..pixel_count {
-                    out[pixel * band_count + band_index] = values[pixel].clone();
-                }
-            } else {
-                for pixel in 0..pixel_count {
-                    let src_base = pixel * depth;
-                    let dst_base = (pixel * band_count + band_index) * depth;
-                    out[dst_base..dst_base + depth]
-                        .clone_from_slice(&values[src_base..src_base + depth]);
-                }
-            }
-        }
-        BandLayout::Bsq => {
-            let dst_base = band_index * band_len;
-            out[dst_base..dst_base + band_len].clone_from_slice(values);
-        }
-    }
-
-    Ok(())
 }

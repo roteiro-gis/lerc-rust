@@ -1,3 +1,5 @@
+use std::mem::MaybeUninit;
+
 use crate::error::{Error, Result};
 use ndarray::{ArrayD, IxDyn};
 
@@ -315,6 +317,14 @@ impl BandSetInfo {
             band_count => vec![height, width, band_count],
         }
     }
+
+    pub fn value_count(&self) -> Result<usize> {
+        self.bands[0]
+            .pixel_count()?
+            .checked_mul(self.band_count())
+            .and_then(|n| n.checked_mul((self.depth() as usize).max(1)))
+            .ok_or_else(|| Error::InvalidBlob("LERC ndarray size overflows usize".into()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -347,50 +357,12 @@ impl DecodedBandSet {
             return T::from_pixel_data(self.bands.into_iter().next().unwrap());
         }
 
-        let pixel_count = self.info.bands[0].pixel_count()?;
-        let depth = self.info.depth() as usize;
-        let band_count = self.info.band_count();
-        let sample_count = pixel_count
-            .checked_mul(band_count)
-            .and_then(|n| n.checked_mul(depth.max(1)))
-            .ok_or_else(|| Error::InvalidBlob("LERC ndarray size overflows usize".into()))?;
-        if sample_count == 0 {
-            return Ok(Vec::new());
-        }
-        let mut bands = self.bands.into_iter();
-        let first_band = T::from_pixel_data(
-            bands
-                .next()
-                .ok_or_else(|| Error::InvalidBlob("LERC band set is empty".into()))?,
-        )?;
-        let seed = first_band.first().cloned().ok_or_else(|| {
-            Error::InvalidBlob("decoded non-empty band set produced an empty band".into())
-        })?;
-        let mut out = vec![seed; sample_count];
-        copy_band_values_into_slice(
-            &mut out,
-            &first_band,
-            pixel_count,
-            depth,
-            0,
-            band_count,
-            layout,
-        )?;
-
-        for (band_index, band) in bands.enumerate() {
+        let mut materializer = BandMaterializer::new(&self.info, layout)?;
+        for (band_index, band) in self.bands.into_iter().enumerate() {
             let values = T::from_pixel_data(band)?;
-            copy_band_values_into_slice(
-                &mut out,
-                &values,
-                pixel_count,
-                depth,
-                band_index + 1,
-                band_count,
-                layout,
-            )?;
+            materializer.copy_band(band_index, &values)?;
         }
-
-        Ok(out)
+        materializer.finish()
     }
 
     pub fn copy_into_slice<T: NdArrayElement>(
@@ -401,10 +373,7 @@ impl DecodedBandSet {
         let pixel_count = self.info.bands[0].pixel_count()?;
         let depth = self.info.depth() as usize;
         let band_count = self.info.band_count();
-        let expected_len = pixel_count
-            .checked_mul(band_count)
-            .and_then(|n| n.checked_mul(depth.max(1)))
-            .ok_or_else(|| Error::InvalidBlob("LERC ndarray size overflows usize".into()))?;
+        let expected_len = self.info.value_count()?;
         if out.len() != expected_len {
             return Err(Error::InvalidBlob(format!(
                 "output slice length {} does not match decoded band set length {}",
@@ -472,7 +441,8 @@ impl DecodedBandSet {
     }
 }
 
-fn copy_band_values_into_slice<T: Clone>(
+#[doc(hidden)]
+pub fn copy_band_values_into_slice<T: Clone>(
     out: &mut [T],
     values: &[T],
     pixel_count: usize,
@@ -512,6 +482,124 @@ fn copy_band_values_into_slice<T: Clone>(
     }
 
     Ok(())
+}
+
+pub struct BandMaterializer<T> {
+    info: BandSetInfo,
+    layout: BandLayout,
+    out: Vec<MaybeUninit<T>>,
+    written_bands: Vec<bool>,
+}
+
+impl<T: Clone> BandMaterializer<T> {
+    pub fn new(info: &BandSetInfo, layout: BandLayout) -> Result<Self> {
+        let sample_count = info.value_count()?;
+        let mut out = Vec::with_capacity(sample_count);
+        if sample_count != 0 {
+            unsafe {
+                out.set_len(sample_count);
+            }
+        }
+        Ok(Self {
+            info: info.clone(),
+            layout,
+            out,
+            written_bands: vec![false; info.band_count()],
+        })
+    }
+
+    pub fn copy_band(&mut self, band_index: usize, values: &[T]) -> Result<()> {
+        if band_index >= self.info.band_count() {
+            return Err(Error::InvalidBlob(format!(
+                "band index {} exceeds band count {}",
+                band_index,
+                self.info.band_count()
+            )));
+        }
+        if self.written_bands[band_index] {
+            return Err(Error::InvalidBlob(format!(
+                "band index {} was materialized more than once",
+                band_index
+            )));
+        }
+
+        let pixel_count = self.info.bands[0].pixel_count()?;
+        let depth = self.info.depth() as usize;
+        write_band_values_into_uninit_slice(
+            &mut self.out,
+            values,
+            pixel_count,
+            depth,
+            band_index,
+            self.info.band_count(),
+            self.layout,
+        )?;
+        self.written_bands[band_index] = true;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<Vec<T>> {
+        if self.written_bands.iter().any(|written| !written) {
+            return Err(Error::InvalidBlob(
+                "not all decoded bands were materialized into the output buffer".into(),
+            ));
+        }
+
+        Ok(unsafe { assume_init_vec(self.out) })
+    }
+}
+
+fn write_band_values_into_uninit_slice<T: Clone>(
+    out: &mut [MaybeUninit<T>],
+    values: &[T],
+    pixel_count: usize,
+    depth: usize,
+    band_index: usize,
+    band_count: usize,
+    layout: BandLayout,
+) -> Result<()> {
+    let band_len = pixel_count
+        .checked_mul(depth.max(1))
+        .ok_or_else(|| Error::InvalidBlob("LERC ndarray size overflows usize".into()))?;
+    if values.len() != band_len {
+        return Err(Error::InvalidBlob(
+            "LERC band set pixel buffers have inconsistent lengths".into(),
+        ));
+    }
+
+    match layout {
+        BandLayout::Interleaved => {
+            if depth <= 1 {
+                for pixel in 0..pixel_count {
+                    out[pixel * band_count + band_index].write(values[pixel].clone());
+                }
+            } else {
+                for pixel in 0..pixel_count {
+                    let src_base = pixel * depth;
+                    let dst_base = (pixel * band_count + band_index) * depth;
+                    for offset in 0..depth {
+                        out[dst_base + offset].write(values[src_base + offset].clone());
+                    }
+                }
+            }
+        }
+        BandLayout::Bsq => {
+            let dst_base = band_index * band_len;
+            for (index, value) in values.iter().enumerate() {
+                out[dst_base + index].write(value.clone());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+unsafe fn assume_init_vec<T>(values: Vec<MaybeUninit<T>>) -> Vec<T> {
+    let len = values.len();
+    let cap = values.capacity();
+    let ptr = values.as_ptr() as *mut T;
+    std::mem::forget(values);
+    Vec::from_raw_parts(ptr, len, cap)
 }
 
 pub trait NdArrayElement: Sized + Clone {
