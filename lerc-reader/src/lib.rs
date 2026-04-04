@@ -318,25 +318,23 @@ fn scan_band_infos(blob: &[u8]) -> Result<BandSetInfo> {
     let mut offset = 0usize;
     let mut infos = Vec::new();
     let mut lerc1_mask: Option<Vec<u8>> = None;
-    let mut lerc2_mask: Option<Vec<u8>> = None;
 
     while offset < blob.len() {
         let slice = &blob[offset..];
-        let (info, next_lerc1_mask, next_lerc2_mask) = if lerc1::is_lerc1(slice) {
+        let (info, next_lerc1_mask) = if lerc1::is_lerc1(slice) {
             let parsed = lerc1::parse(slice, lerc1_mask.as_deref())?;
             let info = parsed.info;
             let next_mask = parsed.mask;
-            (info, next_mask, None)
+            (info, next_mask)
         } else if lerc2::is_lerc2(slice) {
-            let (info, mask) = lerc2::inspect_with_mask(slice, lerc2_mask.as_deref())?;
-            (info, None, mask)
+            let (info, _) = lerc2::parse(slice)?;
+            (info, None)
         } else {
             return Err(Error::InvalidMagic);
         };
 
         offset = checked_next_offset(offset, info.blob_size, blob.len())?;
         lerc1_mask = next_lerc1_mask;
-        lerc2_mask = next_lerc2_mask;
         infos.push(info);
     }
 
