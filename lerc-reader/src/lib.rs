@@ -25,37 +25,51 @@ mod tests;
 
 use lerc_band_materialize::{BandLayout as MaterializeLayout, BandMaterializer, BandSink};
 use lerc_core::{
-    BandLayout, BandSetInfo, BlobInfo, Decoded, DecodedBandSet, DecodedF64, Error, NdArrayElement,
-    Result,
+    BandElement, BandElementKind, BandLayout, BandSetInfo, BlobInfo, Decoded, DecodedBandSet,
+    DecodedF64, Error, NdArrayElement, Result,
 };
 use ndarray::ArrayD;
-use std::any::TypeId;
 
 use crate::pixel::Sample;
 
-mod private {
-    pub trait Sealed {}
-
-    impl Sealed for i8 {}
-    impl Sealed for u8 {}
-    impl Sealed for i16 {}
-    impl Sealed for u16 {}
-    impl Sealed for i32 {}
-    impl Sealed for u32 {}
-    impl Sealed for f32 {}
-    impl Sealed for f64 {}
+macro_rules! dispatch_band_element {
+    ($target:ty, |$concrete:ident| $body:block) => {
+        match <$target as BandElement>::KIND {
+            BandElementKind::I8 => {
+                type $concrete = i8;
+                $body
+            }
+            BandElementKind::U8 => {
+                type $concrete = u8;
+                $body
+            }
+            BandElementKind::I16 => {
+                type $concrete = i16;
+                $body
+            }
+            BandElementKind::U16 => {
+                type $concrete = u16;
+                $body
+            }
+            BandElementKind::I32 => {
+                type $concrete = i32;
+                $body
+            }
+            BandElementKind::U32 => {
+                type $concrete = u32;
+                $body
+            }
+            BandElementKind::F32 => {
+                type $concrete = f32;
+                $body
+            }
+            BandElementKind::F64 => {
+                type $concrete = f64;
+                $body
+            }
+        }
+    };
 }
-
-pub trait BandElement: NdArrayElement + private::Sealed + Copy + Default + 'static {}
-
-impl BandElement for i8 {}
-impl BandElement for u8 {}
-impl BandElement for i16 {}
-impl BandElement for u16 {}
-impl BandElement for i32 {}
-impl BandElement for u32 {}
-impl BandElement for f32 {}
-impl BandElement for f64 {}
 
 pub fn inspect_first(blob: &[u8]) -> Result<BlobInfo> {
     if lerc1::is_lerc1(blob) {
@@ -279,28 +293,9 @@ fn decode_band_set_into_direct<T: BandElement>(
     layout: BandLayout,
     out: &mut [T],
 ) -> Result<BandSetInfo> {
-    if TypeId::of::<T>() == TypeId::of::<i8>() {
-        return decode_band_set_into_impl::<i8>(blob, layout, cast_slice_mut::<T, i8>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u8>() {
-        return decode_band_set_into_impl::<u8>(blob, layout, cast_slice_mut::<T, u8>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<i16>() {
-        return decode_band_set_into_impl::<i16>(blob, layout, cast_slice_mut::<T, i16>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u16>() {
-        return decode_band_set_into_impl::<u16>(blob, layout, cast_slice_mut::<T, u16>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<i32>() {
-        return decode_band_set_into_impl::<i32>(blob, layout, cast_slice_mut::<T, i32>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u32>() {
-        return decode_band_set_into_impl::<u32>(blob, layout, cast_slice_mut::<T, u32>(out));
-    }
-    if TypeId::of::<T>() == TypeId::of::<f32>() {
-        return decode_band_set_into_impl::<f32>(blob, layout, cast_slice_mut::<T, f32>(out));
-    }
-    decode_band_set_into_impl::<f64>(blob, layout, cast_slice_mut::<T, f64>(out))
+    dispatch_band_element!(T, |Concrete| {
+        decode_band_set_into_impl::<Concrete>(blob, layout, cast_slice_mut::<T, Concrete>(out))
+    })
 }
 
 fn decode_band_set_owned_direct<T: BandElement>(
@@ -308,36 +303,10 @@ fn decode_band_set_owned_direct<T: BandElement>(
     layout: BandLayout,
     band_info: BandSetInfo,
 ) -> Result<(BandSetInfo, Vec<T>)> {
-    if TypeId::of::<T>() == TypeId::of::<i8>() {
-        return decode_band_set_owned_direct_impl::<i8>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, i8>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u8>() {
-        return decode_band_set_owned_direct_impl::<u8>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, u8>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<i16>() {
-        return decode_band_set_owned_direct_impl::<i16>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, i16>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u16>() {
-        return decode_band_set_owned_direct_impl::<u16>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, u16>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<i32>() {
-        return decode_band_set_owned_direct_impl::<i32>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, i32>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<u32>() {
-        return decode_band_set_owned_direct_impl::<u32>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, u32>(values)));
-    }
-    if TypeId::of::<T>() == TypeId::of::<f32>() {
-        return decode_band_set_owned_direct_impl::<f32>(blob, layout, band_info)
-            .map(|(info, values)| (info, cast_vec::<T, f32>(values)));
-    }
-    decode_band_set_owned_direct_impl::<f64>(blob, layout, band_info)
-        .map(|(info, values)| (info, cast_vec::<T, f64>(values)))
+    dispatch_band_element!(T, |Concrete| {
+        decode_band_set_owned_direct_impl::<Concrete>(blob, layout, band_info)
+            .map(|(info, values)| (info, cast_vec::<T, Concrete>(values)))
+    })
 }
 
 fn decode_band_set_into_impl<T: Sample + NdArrayElement>(

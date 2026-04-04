@@ -227,6 +227,7 @@ impl<T> BandMaterializer<T> {
     where
         F: FnMut(usize) -> T,
     {
+        self.ensure_no_active_band()?;
         if band_index >= self.shape.band_count {
             return Err(MaterializeError::new(format!(
                 "band index {band_index} exceeds band count {}",
@@ -285,6 +286,7 @@ impl<T> BandMaterializer<T> {
     where
         T: Copy + Default,
     {
+        self.ensure_no_active_band()?;
         if band_index >= self.shape.band_count {
             return Err(MaterializeError::new(format!(
                 "band index {band_index} exceeds band count {}",
@@ -307,10 +309,21 @@ impl<T> BandMaterializer<T> {
             finished: false,
         })
     }
+
+    fn ensure_no_active_band(&self) -> Result<()> {
+        if let Some(active_band) = self.active_band.as_ref() {
+            return Err(MaterializeError::new(format!(
+                "band {} is still active; finalize it before starting another band",
+                active_band.band_index
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl<T: Clone> BandMaterializer<T> {
     pub fn copy_band(&mut self, band_index: usize, values: &[T]) -> Result<()> {
+        self.ensure_no_active_band()?;
         if band_index >= self.shape.band_count {
             return Err(MaterializeError::new(format!(
                 "band index {band_index} exceeds band count {}",
@@ -752,7 +765,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use super::{BandLayout, BandMaterializer, BandWriteOrder, BandWriter};
+    use super::{
+        ActiveBand, ActiveBandProgress, BandLayout, BandMaterializer, BandWriteOrder, BandWriter,
+    };
 
     #[derive(Debug)]
     struct CloneBomb {
@@ -851,6 +866,25 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "band 0 was finalized before all decoded values were initialized"
+        );
+    }
+
+    #[test]
+    fn rejects_starting_new_band_while_previous_band_is_active() {
+        let mut materializer =
+            BandMaterializer::<u16>::new(2, 1, 2, BandLayout::Interleaved).unwrap();
+        materializer.active_band = Some(ActiveBand {
+            band_index: 0,
+            order: BandWriteOrder::PixelMajor,
+            progress: ActiveBandProgress::Prefix(1),
+        });
+        let err = match materializer.band_writer(1) {
+            Ok(_) => panic!("starting a second band while one is active should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "band 0 is still active; finalize it before starting another band"
         );
     }
 }
