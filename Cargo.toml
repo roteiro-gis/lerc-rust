@@ -1,5 +1,5 @@
 [workspace]
-members = ["lerc-band-materialize", "lerc-core", "lerc-reader"]
+members = ["lerc-band-materialize", "lerc-core", "lerc-reader", "lerc-writer"]
 exclude = ["fuzz"]
 resolver = "2"
 

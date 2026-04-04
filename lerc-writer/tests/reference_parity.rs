@@ -1,0 +1,86 @@
+use ndarray::ArrayD;
+
+#[path = "../../test-support/reference.rs"]
+mod reference;
+
+fn write_temp_blob(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("lerc-writer-{name}-{nanos}.lerc2"));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn generated_blobs_match_liblerc_decode_hashes() {
+    let Some(helper) = reference::helper_path() else {
+        eprintln!("skipping libLerc parity test because LERC_READER_REFERENCE_HELPER is unset");
+        return;
+    };
+
+    let u8_pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    let u8_blob = lerc_writer::encode(
+        lerc_core::RasterView::new(4, 2, 1, &u8_pixels).unwrap(),
+        None,
+        lerc_writer::EncodeOptions {
+            max_z_error: 0.5,
+            micro_block_size: 2,
+        },
+    )
+    .unwrap();
+
+    let f32_pixels = vec![
+        10.0f32, 20.0, 11.0, 21.0, 12.0, 22.0, 13.0, 23.0, 14.0, 24.0, 15.0, 25.0,
+    ];
+    let f32_mask = vec![1u8, 0, 1, 1, 0, 1];
+    let f32_blob = lerc_writer::encode(
+        lerc_core::RasterView::new(3, 2, 2, &f32_pixels).unwrap(),
+        Some(lerc_core::MaskView::new(3, 2, &f32_mask).unwrap()),
+        lerc_writer::EncodeOptions {
+            max_z_error: 0.25,
+            micro_block_size: 2,
+        },
+    )
+    .unwrap();
+
+    for (name, blob, kind) in [
+        ("u8-bitstuff", u8_blob, 0u8),
+        ("f32-depth-mask", f32_blob, 1u8),
+    ] {
+        let path = write_temp_blob(name, &blob);
+        let reference_json =
+            reference::run_reference_json(&helper, &["hash", path.to_str().unwrap()]);
+        match kind {
+            0 => {
+                let raster: ArrayD<u8> = lerc_reader::decode_ndarray(&blob).unwrap();
+                let (byte_len, hash) = reference::array_hash(&raster);
+                assert_eq!(
+                    byte_len,
+                    reference_json["pixel_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(hash, reference_json["pixel_hash"].as_str().unwrap());
+            }
+            1 => {
+                let raster = lerc_reader::decode_ndarray_f64(&blob).unwrap();
+                let mask = lerc_reader::decode_mask_ndarray(&blob).unwrap().unwrap();
+                let (pixel_len, pixel_hash) = reference::array_hash(&raster);
+                let (mask_len, mask_hash) = reference::array_hash(&mask);
+                assert_eq!(
+                    pixel_len,
+                    reference_json["pixel_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(pixel_hash, reference_json["pixel_hash"].as_str().unwrap());
+                assert_eq!(
+                    mask_len,
+                    reference_json["mask_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(mask_hash, reference_json["mask_hash"].as_str().unwrap());
+            }
+            _ => unreachable!(),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+}
