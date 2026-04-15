@@ -82,6 +82,16 @@ fn metadata_matches_liblerc_for_interoperability_fixtures() {
                     first.data_type.code() as u64,
                     reference_json["data_type"].as_u64().unwrap()
                 );
+                assert_eq!(
+                    decoded.info.mask_count() as u64,
+                    reference_json["mask_count"].as_u64().unwrap(),
+                    "{relative_path}"
+                );
+                assert_eq!(
+                    decoded.info.uses_no_data_value(),
+                    reference_json["uses_no_data_value"].as_bool().unwrap(),
+                    "{relative_path}"
+                );
             }
             FixtureKind::U8 | FixtureKind::F32 => {
                 let info = lerc_reader::get_blob_info(&blob).unwrap();
@@ -116,6 +126,16 @@ fn metadata_matches_liblerc_for_interoperability_fixtures() {
                 assert_eq!(
                     info.max_z_error,
                     reference_json["max_z_error"].as_f64().unwrap(),
+                    "{relative_path}"
+                );
+                assert_eq!(
+                    info.mask_count() as u64,
+                    reference_json["mask_count"].as_u64().unwrap(),
+                    "{relative_path}"
+                );
+                assert_eq!(
+                    info.uses_no_data_value(),
+                    reference_json["uses_no_data_value"].as_bool().unwrap(),
                     "{relative_path}"
                 );
             }

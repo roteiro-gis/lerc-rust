@@ -10,4 +10,4 @@ pub use raster::{
     output_value, pixel_count_from_dims, read_scalar, read_typed_values, read_values_as,
     sample_count_from_dims, sample_index, words_from_padded, MaskView, RasterView, Sample,
 };
-pub use types::{BandLayout, BandSetInfo, BlobInfo, DataType, PixelData, Version};
+pub use types::{BandLayout, BandSetInfo, BlobInfo, DataType, MaskEncoding, PixelData, Version};

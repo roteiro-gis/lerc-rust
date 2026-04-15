@@ -1,7 +1,7 @@
 use ndarray::IxDyn;
 
 use crate::*;
-use lerc_core::{BandLayout, DataType, Error, PixelData, Version};
+use lerc_core::{BandLayout, DataType, Error, MaskEncoding, PixelData, Version};
 
 #[allow(clippy::too_many_arguments)]
 fn build_header_v2(
@@ -27,6 +27,45 @@ fn build_header_v2(
     bytes.extend_from_slice(&max_z_error.to_le_bytes());
     bytes.extend_from_slice(&z_min.to_le_bytes());
     bytes.extend_from_slice(&z_max.to_le_bytes());
+    bytes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_header_v6(
+    width: u32,
+    height: u32,
+    depth: u32,
+    valid_pixel_count: u32,
+    image_type: i32,
+    max_z_error: f64,
+    z_min: f64,
+    z_max: f64,
+    internal_no_data_value: f64,
+    original_no_data_value: f64,
+    payload_len: usize,
+) -> Vec<u8> {
+    let blob_size = 90 + 4 + payload_len;
+    let mut bytes = Vec::with_capacity(blob_size);
+    bytes.extend_from_slice(b"Lerc2 ");
+    bytes.extend_from_slice(&6i32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(&width.to_le_bytes());
+    bytes.extend_from_slice(&depth.to_le_bytes());
+    bytes.extend_from_slice(&valid_pixel_count.to_le_bytes());
+    bytes.extend_from_slice(&8i32.to_le_bytes());
+    bytes.extend_from_slice(&(blob_size as i32).to_le_bytes());
+    bytes.extend_from_slice(&image_type.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.push(1);
+    bytes.push(0);
+    bytes.push(0);
+    bytes.push(0);
+    bytes.extend_from_slice(&max_z_error.to_le_bytes());
+    bytes.extend_from_slice(&z_min.to_le_bytes());
+    bytes.extend_from_slice(&z_max.to_le_bytes());
+    bytes.extend_from_slice(&internal_no_data_value.to_le_bytes());
+    bytes.extend_from_slice(&original_no_data_value.to_le_bytes());
     bytes
 }
 
@@ -189,17 +228,25 @@ fn decodes_external_mask_lerc2_via_single_blob_with_mask_apis() {
 
     assert!(matches!(decode(&blob), Err(Error::UnsupportedFeature(_))));
 
-    let info = inspect_first_with_mask(&blob, &external_mask).unwrap();
+    let info = get_blob_info(&blob).unwrap();
     assert_eq!(info.version, Version::Lerc2(4));
     assert_eq!(info.width, 2);
     assert_eq!(info.height, 2);
     assert_eq!(info.depth, 1);
     assert_eq!(info.valid_pixel_count, 3);
+    assert_eq!(info.mask_encoding, MaskEncoding::External);
+    assert_eq!(info.mask_count(), 0);
+    assert!(info.has_mask());
+    assert!(info.uses_external_mask());
+    assert!(!info.uses_no_data_value());
     assert_eq!(info.min_values.as_deref(), Some(&[1.0][..]));
     assert_eq!(info.max_values.as_deref(), Some(&[3.0][..]));
 
     let strict_info = get_blob_info_with_mask(&blob, &external_mask).unwrap();
     assert_eq!(strict_info, info);
+
+    let inspected = inspect_first_with_mask(&blob, &external_mask).unwrap();
+    assert_eq!(inspected, info);
 
     let decoded_first = decode_first_with_mask(&blob, &external_mask).unwrap();
     let decoded = decode_with_mask(&blob, &external_mask).unwrap();
@@ -235,6 +282,68 @@ fn decodes_external_mask_lerc2_via_single_blob_with_mask_apis() {
     assert_eq!(mask[IxDyn(&[0, 1])], 0);
     assert_eq!(mask[IxDyn(&[1, 0])], 1);
     assert_eq!(mask[IxDyn(&[1, 1])], 1);
+}
+
+#[test]
+fn decodes_lerc2_v6_no_data_values_without_public_ranges() {
+    let internal_no_data = -7777.0f64;
+    let original_no_data = -9999.0f64;
+    let mut bytes = build_header_v6(
+        1,
+        1,
+        2,
+        1,
+        6,
+        0.0,
+        internal_no_data,
+        5.0,
+        internal_no_data,
+        original_no_data,
+        16,
+    );
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&5.0f32.to_le_bytes());
+    bytes.extend_from_slice(&(internal_no_data as f32).to_le_bytes());
+    bytes.extend_from_slice(&5.0f32.to_le_bytes());
+    bytes.extend_from_slice(&(internal_no_data as f32).to_le_bytes());
+
+    let blob = finalize_v4_with_checksum(bytes);
+
+    let info = get_blob_info(&blob).unwrap();
+    assert_eq!(info.version, Version::Lerc2(6));
+    assert_eq!(info.width, 1);
+    assert_eq!(info.height, 1);
+    assert_eq!(info.depth, 2);
+    assert_eq!(info.valid_pixel_count, 1);
+    assert_eq!(info.mask_encoding, MaskEncoding::None);
+    assert_eq!(info.mask_count(), 0);
+    assert_eq!(info.no_data_value, Some(original_no_data));
+    assert!(info.uses_no_data_value());
+    assert_eq!(info.z_min, -1.0);
+    assert_eq!(info.z_max, -1.0);
+    assert_eq!(info.min_values, None);
+    assert_eq!(info.max_values, None);
+
+    let decoded = decode(&blob).unwrap();
+    assert_eq!(decoded.info, info);
+    assert_eq!(decoded.mask, None);
+    assert_eq!(
+        decoded.pixels,
+        PixelData::F32(vec![5.0, original_no_data as f32])
+    );
+
+    let promoted = decode_to_f64(&blob).unwrap();
+    assert_eq!(promoted.info, info);
+    assert_eq!(promoted.mask, None);
+    assert_eq!(promoted.pixels, vec![5.0, original_no_data]);
+
+    let mask = decode_mask_ndarray(&blob).unwrap();
+    assert_eq!(mask, None);
+
+    let array = decode_ndarray_f64(&blob).unwrap();
+    assert_eq!(array.shape(), &[1, 1, 2]);
+    assert_eq!(array[IxDyn(&[0, 0, 0])], 5.0);
+    assert_eq!(array[IxDyn(&[0, 0, 1])], original_no_data);
 }
 
 #[test]

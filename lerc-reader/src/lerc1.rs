@@ -1,4 +1,4 @@
-use lerc_core::{BlobInfo, DataType, Error, PixelData, Result, Version};
+use lerc_core::{BlobInfo, DataType, Error, MaskEncoding, PixelData, Result, Version};
 
 use crate::bitstuff::{unstuff_v2, UnstuffOptions};
 use crate::io::Cursor;
@@ -148,8 +148,8 @@ pub(crate) fn parse(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Lerc1Blob
     let width = cursor.read_u32()?;
     let max_z_error = cursor.read_f64()?;
 
-    let mask = if let Some(shared_mask) = shared_mask {
-        Some(shared_mask.to_vec())
+    let (mask_encoding, mask) = if let Some(shared_mask) = shared_mask {
+        (MaskEncoding::External, Some(shared_mask.to_vec()))
     } else {
         read_mask(&mut cursor, width, height)?
     };
@@ -297,6 +297,8 @@ pub(crate) fn parse(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Lerc1Blob
         max_z_error,
         z_min: 0.0,
         z_max: pixels_max_value as f64,
+        mask_encoding,
+        no_data_value: None,
     };
 
     Ok(Lerc1Blob {
@@ -337,7 +339,11 @@ fn read_offset(cursor: &mut Cursor<'_>, offset_type: u8) -> Result<f32> {
     }
 }
 
-fn read_mask(cursor: &mut Cursor<'_>, width: u32, height: u32) -> Result<Option<Vec<u8>>> {
+fn read_mask(
+    cursor: &mut Cursor<'_>,
+    width: u32,
+    height: u32,
+) -> Result<(MaskEncoding, Option<Vec<u8>>)> {
     let num_blocks_y = cursor.read_u32()?;
     let num_blocks_x = cursor.read_u32()?;
     let num_bytes = cursor.read_u32()? as usize;
@@ -350,14 +356,17 @@ fn read_mask(cursor: &mut Cursor<'_>, width: u32, height: u32) -> Result<Option<
 
     if num_bytes > 0 {
         let bitset = crate::lerc2::decode_mask_rle(cursor.read_bytes(num_bytes)?, bitset_len)?;
-        return Ok(Some(crate::lerc2::unpack_mask_bitset(&bitset, num_pixels)));
+        return Ok((
+            MaskEncoding::Explicit,
+            Some(crate::lerc2::unpack_mask_bitset(&bitset, num_pixels)),
+        ));
     }
 
     if num_blocks_y == 0 && num_blocks_x == 0 && max_value == 0.0 {
-        return Ok(Some(vec![0; num_pixels]));
+        return Ok((MaskEncoding::ImplicitAllInvalid, Some(vec![0; num_pixels])));
     }
 
-    Ok(None)
+    Ok((MaskEncoding::None, None))
 }
 
 fn decode_pixels<T: Sample>(parsed: &Lerc1Blob) -> Result<TypedPixels<T>> {

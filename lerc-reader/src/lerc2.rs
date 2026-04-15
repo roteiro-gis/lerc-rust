@@ -1,4 +1,4 @@
-use lerc_core::{BlobInfo, DataType, Error, PixelData, Result, Version};
+use lerc_core::{BlobInfo, DataType, Error, MaskEncoding, PixelData, Result, Version};
 
 use crate::bitstuff::{data_type_used, decode_bits, read_typed_scalar};
 use crate::huffman::{decode_huffman, decode_huffman_into};
@@ -18,12 +18,31 @@ pub(crate) struct DepthRanges {
     pub(crate) max_values: Vec<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedLerc2 {
+    pub(crate) info: BlobInfo,
+    pub(crate) mask_num_bytes: usize,
+    raw_z_min: f64,
+    raw_z_max: f64,
+    encoded_no_data_value: Option<f64>,
+}
+
 pub(crate) fn is_lerc2(blob: &[u8]) -> bool {
     blob.starts_with(MAGIC_LERC2)
 }
 
 pub(crate) fn inspect(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<BlobInfo> {
-    let (info, _) = inspect_with_mask(blob, inherited_mask)?;
+    let (parsed, mut cursor) = parse(blob)?;
+    let mut info = parsed.info.clone();
+    if parsed.info.uses_external_mask() {
+        if let Some(mask) = inherited_mask {
+            validate_external_mask(&parsed.info, mask)?;
+        }
+    } else {
+        skip_mask(&mut cursor, &parsed)?;
+    }
+
+    read_public_depth_ranges(&mut cursor, &parsed, &mut info)?;
     Ok(info)
 }
 
@@ -31,55 +50,60 @@ pub(crate) fn inspect_with_mask(
     blob: &[u8],
     inherited_mask: Option<&[u8]>,
 ) -> Result<(BlobInfo, Option<Vec<u8>>)> {
-    let (mut info, mut cursor) = parse(blob)?;
-    let mask = read_mask(&mut cursor, &info, inherited_mask)?;
-    if should_read_depth_ranges(&info) {
-        let ranges = read_depth_ranges(&mut cursor, &info)?;
-        info.min_values = Some(ranges.min_values);
-        info.max_values = Some(ranges.max_values);
-    }
+    let (parsed, mut cursor) = parse(blob)?;
+    let mut info = parsed.info.clone();
+    let mask = read_mask(&mut cursor, &parsed, inherited_mask)?;
+    read_public_depth_ranges(&mut cursor, &parsed, &mut info)?;
     Ok((info, mask))
 }
 
 pub(crate) fn decode(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<Decoded> {
-    let (mut info, mut cursor) = parse(blob)?;
-    let mask = read_mask(&mut cursor, &info, inherited_mask)?;
-
-    let depth_ranges = if should_read_depth_ranges(&info) {
-        let ranges = read_depth_ranges(&mut cursor, &info)?;
-        info.min_values = Some(ranges.min_values.clone());
-        info.max_values = Some(ranges.max_values.clone());
-        Some(ranges)
-    } else {
-        None
-    };
-
-    let pixels = decode_pixels(&mut cursor, &info, depth_ranges.as_ref(), mask.as_deref())?;
+    let (parsed, mut cursor) = parse(blob)?;
+    let mut info = parsed.info.clone();
+    let mask = read_mask(&mut cursor, &parsed, inherited_mask)?;
+    let depth_ranges = read_public_depth_ranges(&mut cursor, &parsed, &mut info)?;
+    let mut decode_info = info.clone();
+    decode_info.z_min = parsed.raw_z_min;
+    decode_info.z_max = parsed.raw_z_max;
+    let mut pixels = decode_pixels(
+        &mut cursor,
+        &decode_info,
+        depth_ranges.as_ref(),
+        mask.as_deref(),
+    )?;
+    remap_pixel_data_no_data(
+        &mut pixels,
+        &info,
+        mask.as_deref(),
+        parsed.encoded_no_data_value,
+    );
     Ok(Decoded { info, pixels, mask })
 }
 
 pub(crate) fn decode_f64(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<DecodedF64> {
-    let (mut info, mut cursor) = parse(blob)?;
-    let mask = read_mask(&mut cursor, &info, inherited_mask)?;
+    let (parsed, mut cursor) = parse(blob)?;
+    let mut info = parsed.info.clone();
+    let mask = read_mask(&mut cursor, &parsed, inherited_mask)?;
+    let depth_ranges = read_public_depth_ranges(&mut cursor, &parsed, &mut info)?;
+    let mut decode_info = info.clone();
+    decode_info.z_min = parsed.raw_z_min;
+    decode_info.z_max = parsed.raw_z_max;
 
-    let depth_ranges = if should_read_depth_ranges(&info) {
-        let ranges = read_depth_ranges(&mut cursor, &info)?;
-        info.min_values = Some(ranges.min_values.clone());
-        info.max_values = Some(ranges.max_values.clone());
-        Some(ranges)
-    } else {
-        None
-    };
-
-    let pixels = match decode_pixels_typed::<f64>(
+    let mut pixels = match decode_pixels_typed::<f64>(
         &mut cursor,
-        &info,
+        &decode_info,
         depth_ranges.as_ref(),
         mask.as_deref(),
     )? {
         PixelData::F64(values) => values,
         _ => unreachable!("f64 decode must produce an f64 buffer"),
     };
+    remap_no_data_values(
+        &mut pixels,
+        &info,
+        mask.as_deref(),
+        parsed.encoded_no_data_value,
+    );
     Ok(DecodedF64 { info, pixels, mask })
 }
 
@@ -88,32 +112,29 @@ pub(crate) fn decode_into<T: Sample, W: BandWriter<T>>(
     inherited_mask: Option<&[u8]>,
     out: &mut W,
 ) -> Result<(BlobInfo, Option<Vec<u8>>)> {
-    let (mut info, mut cursor) = parse(blob)?;
-    let mask = read_mask(&mut cursor, &info, inherited_mask)?;
-
-    let depth_ranges = if should_read_depth_ranges(&info) {
-        let ranges = read_depth_ranges(&mut cursor, &info)?;
-        info.min_values = Some(ranges.min_values.clone());
-        info.max_values = Some(ranges.max_values.clone());
-        Some(ranges)
-    } else {
-        None
-    };
+    let (parsed, mut cursor) = parse(blob)?;
+    let mut info = parsed.info.clone();
+    let mask = read_mask(&mut cursor, &parsed, inherited_mask)?;
+    let depth_ranges = read_public_depth_ranges(&mut cursor, &parsed, &mut info)?;
+    let mut decode_info = info.clone();
+    decode_info.z_min = parsed.raw_z_min;
+    decode_info.z_max = parsed.raw_z_max;
 
     if info.valid_pixel_count != info.pixel_count()? as u32 {
         out.fill_default();
     }
     decode_pixels_into_typed(
         &mut cursor,
-        &info,
+        &decode_info,
         depth_ranges.as_ref(),
         mask.as_deref(),
         out,
     )?;
+    remap_written_no_data(out, &info, mask.as_deref(), parsed.encoded_no_data_value);
     Ok((info, mask))
 }
 
-pub(crate) fn parse(blob: &[u8]) -> Result<(BlobInfo, Cursor<'_>)> {
+pub(crate) fn parse(blob: &[u8]) -> Result<(ParsedLerc2, Cursor<'_>)> {
     let mut cursor = Cursor::new(blob);
     let magic = cursor.read_bytes(6)?;
     if magic != MAGIC_LERC2 {
@@ -143,15 +164,41 @@ pub(crate) fn parse(blob: &[u8]) -> Result<(BlobInfo, Cursor<'_>)> {
     let micro_block_size = cursor.read_i32()?;
     let blob_size = cursor.read_i32()?;
     let image_type = cursor.read_i32()?;
+    let n_blobs_more = if version >= 6 { cursor.read_i32()? } else { 0 };
+    let pass_no_data_values = if version >= 6 { cursor.read_u8()? } else { 0 };
+    let _is_all_int = if version >= 6 { cursor.read_u8()? } else { 0 };
+    let _reserved3 = if version >= 6 { cursor.read_u8()? } else { 0 };
+    let _reserved4 = if version >= 6 { cursor.read_u8()? } else { 0 };
     let max_z_error = cursor.read_f64()?;
-    let z_min = cursor.read_f64()?;
-    let z_max = cursor.read_f64()?;
+    let raw_z_min = cursor.read_f64()?;
+    let raw_z_max = cursor.read_f64()?;
+    let encoded_no_data_value = if version >= 6 {
+        Some(cursor.read_f64()?)
+    } else {
+        None
+    };
+    let original_no_data_value = if version >= 6 {
+        Some(cursor.read_f64()?)
+    } else {
+        None
+    };
 
     if micro_block_size < 0 {
         return Err(Error::InvalidHeader("negative micro block size"));
     }
     if depth == 0 {
         return Err(Error::InvalidHeader("depth must be greater than zero"));
+    }
+    if n_blobs_more < 0 {
+        return Err(Error::InvalidHeader("negative appended blob count"));
+    }
+    if version >= 6 && pass_no_data_values > 1 {
+        return Err(Error::InvalidHeader("invalid no-data flag"));
+    }
+    if pass_no_data_values != 0 && depth <= 1 {
+        return Err(Error::InvalidHeader(
+            "no-data values require depth greater than one",
+        ));
     }
     if blob_size <= 0 {
         return Err(Error::InvalidHeader("non-positive blob size"));
@@ -172,6 +219,41 @@ pub(crate) fn parse(blob: &[u8]) -> Result<(BlobInfo, Cursor<'_>)> {
         }
     }
 
+    let pixel_count = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or_else(|| Error::InvalidBlob("pixel count overflows usize".into()))?;
+    let num_valid = valid_pixel_count as usize;
+    if num_valid > pixel_count {
+        return Err(Error::InvalidBlob(format!(
+            "valid pixel count {} exceeds pixel count {}",
+            num_valid, pixel_count
+        )));
+    }
+
+    let mask_num_bytes = cursor.read_u32()? as usize;
+    let mask_encoding = infer_mask_encoding(valid_pixel_count, pixel_count, mask_num_bytes)?;
+
+    let no_data_value = if pass_no_data_values != 0 {
+        original_no_data_value
+    } else {
+        None
+    };
+    let encoded_no_data_value = if pass_no_data_values != 0 {
+        encoded_no_data_value
+    } else {
+        None
+    };
+    let (z_min, z_max) = if no_data_value.is_some() {
+        (-1.0, -1.0)
+    } else {
+        (raw_z_min, raw_z_max)
+    };
+
     let info = BlobInfo {
         version: Version::Lerc2(version),
         data_type: DataType::from_code(image_type)?,
@@ -186,66 +268,129 @@ pub(crate) fn parse(blob: &[u8]) -> Result<(BlobInfo, Cursor<'_>)> {
         max_z_error,
         z_min,
         z_max,
+        mask_encoding,
+        no_data_value,
     };
 
-    Ok((info, cursor))
+    let current_offset = cursor.offset();
+    let mut limited_cursor = Cursor::new(&blob[..blob_size]);
+    limited_cursor.skip(current_offset)?;
+
+    Ok((
+        ParsedLerc2 {
+            info,
+            mask_num_bytes,
+            raw_z_min,
+            raw_z_max,
+            encoded_no_data_value,
+        },
+        limited_cursor,
+    ))
 }
 
-fn should_read_depth_ranges(info: &BlobInfo) -> bool {
-    matches!(info.version, Version::Lerc2(version) if version >= 4)
-        && info.valid_pixel_count != 0
-        && info.z_min != info.z_max
-}
-
-fn read_mask(
-    cursor: &mut Cursor<'_>,
-    info: &BlobInfo,
-    inherited_mask: Option<&[u8]>,
-) -> Result<Option<Vec<u8>>> {
-    let num_pixels = info.pixel_count()?;
-    let num_valid = info.valid_pixel_count as usize;
-    if num_valid > num_pixels {
-        return Err(Error::InvalidBlob(format!(
-            "valid pixel count {} exceeds pixel count {}",
-            num_valid, num_pixels
-        )));
-    }
-
-    let num_bytes = cursor.read_u32()? as usize;
-    if num_valid == num_pixels {
-        if num_bytes != 0 {
+fn infer_mask_encoding(
+    valid_pixel_count: u32,
+    pixel_count: usize,
+    mask_num_bytes: usize,
+) -> Result<MaskEncoding> {
+    let num_valid = valid_pixel_count as usize;
+    if num_valid == pixel_count {
+        if mask_num_bytes != 0 {
             return Err(Error::InvalidBlob(
                 "full-valid LERC blob unexpectedly contains mask bytes".into(),
             ));
         }
-        return Ok(None);
+        return Ok(MaskEncoding::None);
     }
 
     if num_valid == 0 {
-        cursor.skip(num_bytes)?;
-        return Ok(Some(vec![0; num_pixels]));
+        return Ok(if mask_num_bytes == 0 {
+            MaskEncoding::ImplicitAllInvalid
+        } else {
+            MaskEncoding::Explicit
+        });
     }
 
-    if num_bytes == 0 {
-        let mask = inherited_mask.ok_or(Error::UnsupportedFeature(
-            "Lerc2 external masks require a caller-supplied mask via the *_with_mask APIs",
-        ))?;
-        if mask.len() != num_pixels {
-            return Err(Error::InvalidBlob(
-                "inherited mask length does not match the current LERC blob".into(),
-            ));
-        }
-        let inherited_valid = mask.iter().filter(|&&value| value != 0).count();
-        if inherited_valid != num_valid {
-            return Err(Error::InvalidBlob(
-                "inherited mask valid count does not match the current LERC blob".into(),
-            ));
-        }
-        return Ok(Some(mask.to_vec()));
+    Ok(if mask_num_bytes == 0 {
+        MaskEncoding::External
+    } else {
+        MaskEncoding::Explicit
+    })
+}
+
+fn should_read_depth_ranges(parsed: &ParsedLerc2) -> bool {
+    matches!(parsed.info.version, Version::Lerc2(version) if version >= 4)
+        && parsed.info.valid_pixel_count != 0
+        && parsed.raw_z_min != parsed.raw_z_max
+}
+
+fn read_public_depth_ranges(
+    cursor: &mut Cursor<'_>,
+    parsed: &ParsedLerc2,
+    info: &mut BlobInfo,
+) -> Result<Option<DepthRanges>> {
+    if !should_read_depth_ranges(parsed) {
+        return Ok(None);
     }
 
-    let bitset = decode_mask_rle(cursor.read_bytes(num_bytes)?, num_pixels.div_ceil(8))?;
-    Ok(Some(unpack_mask_bitset(&bitset, num_pixels)))
+    let ranges = read_depth_ranges(cursor, &parsed.info)?;
+    if !info.uses_no_data_value() {
+        info.min_values = Some(ranges.min_values.clone());
+        info.max_values = Some(ranges.max_values.clone());
+    }
+    Ok(Some(ranges))
+}
+
+fn skip_mask(cursor: &mut Cursor<'_>, parsed: &ParsedLerc2) -> Result<()> {
+    cursor.skip(parsed.mask_num_bytes)
+}
+
+fn validate_external_mask(info: &BlobInfo, mask: &[u8]) -> Result<()> {
+    let num_pixels = info.pixel_count()?;
+    if mask.len() != num_pixels {
+        return Err(Error::InvalidBlob(
+            "inherited mask length does not match the current LERC blob".into(),
+        ));
+    }
+
+    let inherited_valid = mask.iter().filter(|&&value| value != 0).count();
+    if inherited_valid != info.valid_pixel_count as usize {
+        return Err(Error::InvalidBlob(
+            "inherited mask valid count does not match the current LERC blob".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn read_mask(
+    cursor: &mut Cursor<'_>,
+    parsed: &ParsedLerc2,
+    inherited_mask: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>> {
+    let info = &parsed.info;
+    let num_pixels = info.pixel_count()?;
+    match parsed.info.mask_encoding {
+        MaskEncoding::None => Ok(None),
+        MaskEncoding::ImplicitAllInvalid => {
+            cursor.skip(parsed.mask_num_bytes)?;
+            Ok(Some(vec![0; num_pixels]))
+        }
+        MaskEncoding::External => {
+            let mask = inherited_mask.ok_or(Error::UnsupportedFeature(
+                "Lerc2 external masks require a caller-supplied mask via the *_with_mask APIs",
+            ))?;
+            validate_external_mask(info, mask)?;
+            Ok(Some(mask.to_vec()))
+        }
+        MaskEncoding::Explicit => {
+            let bitset = decode_mask_rle(
+                cursor.read_bytes(parsed.mask_num_bytes)?,
+                num_pixels.div_ceil(8),
+            )?;
+            Ok(Some(unpack_mask_bitset(&bitset, num_pixels)))
+        }
+    }
 }
 
 pub(crate) fn decode_mask_rle(encoded: &[u8], bitset_len: usize) -> Result<Vec<u8>> {
@@ -324,6 +469,111 @@ fn read_depth_ranges(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<DepthRa
         min_values,
         max_values,
     })
+}
+
+fn typed_no_data_mapping<T: Sample>(
+    info: &BlobInfo,
+    encoded_no_data_value: Option<f64>,
+) -> Option<(T, T)> {
+    let original = info.no_data_value?;
+    let encoded = encoded_no_data_value?;
+    let encoded = output_value::<T>(encoded, info.data_type);
+    let original = output_value::<T>(original, info.data_type);
+    if encoded.to_f64() == original.to_f64() {
+        None
+    } else {
+        Some((encoded, original))
+    }
+}
+
+fn remap_no_data_values<T: Sample>(
+    values: &mut [T],
+    info: &BlobInfo,
+    mask: Option<&[u8]>,
+    encoded_no_data_value: Option<f64>,
+) {
+    let Some((encoded, original)) = typed_no_data_mapping::<T>(info, encoded_no_data_value) else {
+        return;
+    };
+
+    let depth = info.depth as usize;
+    match mask {
+        Some(mask) => {
+            for (pixel, &is_valid) in mask.iter().enumerate() {
+                if is_valid == 0 {
+                    continue;
+                }
+                for dim in 0..depth {
+                    let index = sample_index(pixel, depth, dim);
+                    if values[index].to_f64() == encoded.to_f64() {
+                        values[index] = original;
+                    }
+                }
+            }
+        }
+        None => {
+            for value in values {
+                if value.to_f64() == encoded.to_f64() {
+                    *value = original;
+                }
+            }
+        }
+    }
+}
+
+fn remap_pixel_data_no_data(
+    pixels: &mut PixelData,
+    info: &BlobInfo,
+    mask: Option<&[u8]>,
+    encoded_no_data_value: Option<f64>,
+) {
+    match pixels {
+        PixelData::I8(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
+        PixelData::U8(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
+        PixelData::I16(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
+        PixelData::U16(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
+        PixelData::I32(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
+        PixelData::U32(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
+        PixelData::F32(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
+        PixelData::F64(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
+    }
+}
+
+fn remap_written_no_data<T: Sample, W: BandWriter<T>>(
+    out: &mut W,
+    info: &BlobInfo,
+    mask: Option<&[u8]>,
+    encoded_no_data_value: Option<f64>,
+) {
+    let Some((encoded, original)) = typed_no_data_mapping::<T>(info, encoded_no_data_value) else {
+        return;
+    };
+
+    let depth = info.depth as usize;
+    let num_pixels = info.width as usize * info.height as usize;
+    match mask {
+        Some(mask) => {
+            for (pixel, &is_valid) in mask.iter().enumerate() {
+                if is_valid == 0 {
+                    continue;
+                }
+                for dim in 0..depth {
+                    if out.read(pixel, dim).to_f64() == encoded.to_f64() {
+                        out.write(pixel, dim, original);
+                    }
+                }
+            }
+        }
+        None => {
+            for pixel in 0..num_pixels {
+                for dim in 0..depth {
+                    if out.read(pixel, dim).to_f64() == encoded.to_f64() {
+                        out.write(pixel, dim, original);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn decode_pixels(
