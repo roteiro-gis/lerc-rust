@@ -197,6 +197,40 @@ fn rejects_zero_depth_lerc2_header() {
 }
 
 #[test]
+fn rejects_no_data_flag_for_unit_depth_lerc2_header() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"Lerc2 ");
+    bytes.extend_from_slice(&6i32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&8i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&6i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.push(1);
+    bytes.push(0);
+    bytes.push(0);
+    bytes.push(0);
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&1.0f64.to_le_bytes());
+    bytes.extend_from_slice(&1.0f64.to_le_bytes());
+    bytes.extend_from_slice(&(-1.0f64).to_le_bytes());
+    bytes.extend_from_slice(&(-9999.0f64).to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+
+    let blob = finalize_v4_with_checksum(bytes);
+    assert!(matches!(
+        lerc_reader::get_blob_info(&blob),
+        Err(Error::InvalidHeader(
+            "no-data values require depth greater than one"
+        ))
+    ));
+}
+
+#[test]
 fn rejects_lerc1_stuffed_block_with_mismatched_valid_count() {
     let blob = build_lerc1_blob_with_stuffed_count(&[1, 0, 0, 0], &[1.0], 2);
     assert!(matches!(

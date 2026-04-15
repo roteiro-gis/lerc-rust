@@ -119,8 +119,8 @@ pub fn get_band_count(blob: &[u8]) -> Result<usize> {
             lerc1_mask = parsed.mask;
             next_len
         } else if lerc2::is_lerc2(slice) {
-            let (info, _) = lerc2::parse(slice)?;
-            info.blob_size
+            let (parsed, _) = lerc2::parse(slice)?;
+            parsed.info.blob_size
         } else {
             return Err(Error::InvalidMagic);
         };
@@ -499,8 +499,8 @@ fn scan_band_infos(blob: &[u8]) -> Result<BandSetInfo> {
             let next_mask = parsed.mask;
             (info, next_mask)
         } else if lerc2::is_lerc2(slice) {
-            let (info, _) = lerc2::parse(slice)?;
-            (info, None)
+            let (parsed, _) = lerc2::parse(slice)?;
+            (parsed.info, None)
         } else {
             return Err(Error::InvalidMagic);
         };

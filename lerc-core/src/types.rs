@@ -134,6 +134,35 @@ pub enum Version {
     Lerc2(u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskEncoding {
+    None,
+    Explicit,
+    External,
+    ImplicitAllInvalid,
+}
+
+impl MaskEncoding {
+    pub fn mask_count(self) -> u32 {
+        match self {
+            Self::None | Self::External => 0,
+            Self::Explicit | Self::ImplicitAllInvalid => 1,
+        }
+    }
+
+    pub fn has_mask(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub fn uses_external_mask(self) -> bool {
+        matches!(self, Self::External)
+    }
+
+    pub fn stores_mask_bytes(self) -> bool {
+        matches!(self, Self::Explicit)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlobInfo {
     pub version: Version,
@@ -149,6 +178,8 @@ pub struct BlobInfo {
     pub max_z_error: f64,
     pub z_min: f64,
     pub z_max: f64,
+    pub mask_encoding: MaskEncoding,
+    pub no_data_value: Option<f64>,
 }
 
 impl BlobInfo {
@@ -167,6 +198,22 @@ impl BlobInfo {
         self.pixel_count()?
             .checked_mul(self.depth as usize)
             .ok_or_else(|| Error::InvalidBlob("sample count overflows usize".into()))
+    }
+
+    pub fn mask_count(&self) -> u32 {
+        self.mask_encoding.mask_count()
+    }
+
+    pub fn has_mask(&self) -> bool {
+        self.mask_encoding.has_mask()
+    }
+
+    pub fn uses_external_mask(&self) -> bool {
+        self.mask_encoding.uses_external_mask()
+    }
+
+    pub fn uses_no_data_value(&self) -> bool {
+        self.no_data_value.is_some()
     }
 
     pub fn raster_shape(&self) -> Vec<usize> {
@@ -229,6 +276,25 @@ impl BandSetInfo {
 
     pub fn depth(&self) -> u32 {
         self.bands[0].depth
+    }
+
+    pub fn mask_count(&self) -> usize {
+        let first_valid_pixel_count = self.bands[0].valid_pixel_count;
+        let first_mask_count = self.bands[0].mask_count() as usize;
+        let has_distinct_band_masks = self.bands[1..].iter().any(|band| {
+            band.mask_encoding.stores_mask_bytes()
+                || band.valid_pixel_count != first_valid_pixel_count
+        });
+
+        if has_distinct_band_masks {
+            self.band_count()
+        } else {
+            first_mask_count
+        }
+    }
+
+    pub fn uses_no_data_value(&self) -> bool {
+        self.bands.iter().any(BlobInfo::uses_no_data_value)
     }
 
     pub fn raster_shape(&self) -> Vec<usize> {
