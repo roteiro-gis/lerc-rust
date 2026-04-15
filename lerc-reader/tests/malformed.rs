@@ -1,4 +1,4 @@
-use lerc_core::Error;
+use lerc_core::{fletcher32, Error};
 
 struct HeaderV2 {
     width: u32,
@@ -25,6 +25,14 @@ fn build_header_v2(header: HeaderV2) -> Vec<u8> {
     bytes.extend_from_slice(&header.max_z_error.to_le_bytes());
     bytes.extend_from_slice(&header.z_min.to_le_bytes());
     bytes.extend_from_slice(&header.z_max.to_le_bytes());
+    bytes
+}
+
+fn finalize_v4_with_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
+    let blob_size = bytes.len() as i32;
+    bytes[34..38].copy_from_slice(&blob_size.to_le_bytes());
+    let checksum = fletcher32(&bytes[14..blob_size as usize]);
+    bytes[10..14].copy_from_slice(&checksum.to_le_bytes());
     bytes
 }
 
@@ -160,6 +168,31 @@ fn rejects_mask_rle_with_trailing_bytes_after_sentinel() {
     assert!(matches!(
         lerc_reader::decode(&blob),
         Err(Error::InvalidBlob(_))
+    ));
+}
+
+#[test]
+fn rejects_zero_depth_lerc2_header() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"Lerc2 ");
+    bytes.extend_from_slice(&4i32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&8i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+
+    let blob = finalize_v4_with_checksum(bytes);
+    assert!(matches!(
+        lerc_reader::get_blob_info(&blob),
+        Err(Error::InvalidHeader("depth must be greater than zero"))
     ));
 }
 

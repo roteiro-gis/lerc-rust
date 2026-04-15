@@ -5,6 +5,7 @@
 //!
 //! - inspect a single blob with [`get_blob_info`]
 //! - inspect only the first blob with [`inspect_first`]
+//! - pass an explicit shared or external mask with the `*_with_mask` single-blob variants
 //! - count concatenated blobs with [`get_band_count`]
 //! - decode a single blob with [`decode`]
 //! - decode only the first blob with [`decode_first`]
@@ -83,9 +84,25 @@ pub fn inspect_first(blob: &[u8]) -> Result<BlobInfo> {
     Err(Error::InvalidMagic)
 }
 
+pub fn inspect_first_with_mask(blob: &[u8], mask: &[u8]) -> Result<BlobInfo> {
+    let (info, _) = inspect_first_mask_with_info(blob, Some(mask), Some(mask))?;
+    Ok(info)
+}
+
 pub fn get_blob_info(blob: &[u8]) -> Result<BlobInfo> {
     let info = inspect_first(blob)?;
     ensure_single_blob_consumed(blob.len(), info.blob_size, "get_blob_info", "inspect_first")?;
+    Ok(info)
+}
+
+pub fn get_blob_info_with_mask(blob: &[u8], mask: &[u8]) -> Result<BlobInfo> {
+    let info = inspect_first_with_mask(blob, mask)?;
+    ensure_single_blob_consumed(
+        blob.len(),
+        info.blob_size,
+        "get_blob_info_with_mask",
+        "inspect_first_with_mask",
+    )?;
     Ok(info)
 }
 
@@ -119,9 +136,24 @@ pub fn decode_first(blob: &[u8]) -> Result<Decoded> {
     decode_first_with_masks(blob, None, None)
 }
 
+pub fn decode_first_with_mask(blob: &[u8], mask: &[u8]) -> Result<Decoded> {
+    decode_first_with_masks(blob, Some(mask), Some(mask))
+}
+
 pub fn decode(blob: &[u8]) -> Result<Decoded> {
     let decoded = decode_first(blob)?;
     ensure_single_blob_consumed(blob.len(), decoded.info.blob_size, "decode", "decode_first")?;
+    Ok(decoded)
+}
+
+pub fn decode_with_mask(blob: &[u8], mask: &[u8]) -> Result<Decoded> {
+    let decoded = decode_first_with_mask(blob, mask)?;
+    ensure_single_blob_consumed(
+        blob.len(),
+        decoded.info.blob_size,
+        "decode_with_mask",
+        "decode_first_with_mask",
+    )?;
     Ok(decoded)
 }
 
@@ -221,16 +253,39 @@ pub fn decode_to_f64(blob: &[u8]) -> Result<DecodedF64> {
     Ok(decoded)
 }
 
+pub fn decode_to_f64_with_mask(blob: &[u8], mask: &[u8]) -> Result<DecodedF64> {
+    let decoded = decode_first_to_f64_with_mask(blob, mask)?;
+    ensure_single_blob_consumed(
+        blob.len(),
+        decoded.info.blob_size,
+        "decode_to_f64_with_mask",
+        "decode_first_to_f64_with_mask",
+    )?;
+    Ok(decoded)
+}
+
 pub fn decode_first_to_f64(blob: &[u8]) -> Result<DecodedF64> {
     decode_first_f64(blob)
+}
+
+pub fn decode_first_to_f64_with_mask(blob: &[u8], mask: &[u8]) -> Result<DecodedF64> {
+    decode_first_f64_with_masks(blob, Some(mask), Some(mask))
 }
 
 pub fn decode_ndarray<T: NdArrayElement>(blob: &[u8]) -> Result<ArrayD<T>> {
     decode(blob)?.into_ndarray()
 }
 
+pub fn decode_ndarray_with_mask<T: NdArrayElement>(blob: &[u8], mask: &[u8]) -> Result<ArrayD<T>> {
+    decode_with_mask(blob, mask)?.into_ndarray()
+}
+
 pub fn decode_ndarray_f64(blob: &[u8]) -> Result<ArrayD<f64>> {
     decode_to_f64(blob)?.into_ndarray()
+}
+
+pub fn decode_ndarray_f64_with_mask(blob: &[u8], mask: &[u8]) -> Result<ArrayD<f64>> {
+    decode_to_f64_with_mask(blob, mask)?.into_ndarray()
 }
 
 pub fn decode_mask_ndarray(blob: &[u8]) -> Result<Option<ArrayD<u8>>> {
@@ -242,6 +297,17 @@ pub fn decode_mask_ndarray(blob: &[u8]) -> Result<Option<ArrayD<u8>>> {
         "inspect_first",
     )?;
     mask_to_ndarray(&info, mask)
+}
+
+pub fn decode_mask_ndarray_with_mask(blob: &[u8], mask: &[u8]) -> Result<Option<ArrayD<u8>>> {
+    let (info, decoded_mask) = inspect_first_mask_with_info(blob, Some(mask), Some(mask))?;
+    ensure_single_blob_consumed(
+        blob.len(),
+        info.blob_size,
+        "decode_mask_ndarray_with_mask",
+        "inspect_first_with_mask",
+    )?;
+    mask_to_ndarray(&info, decoded_mask)
 }
 
 fn decode_first_with_masks(
@@ -273,11 +339,19 @@ fn inspect_first_mask_with_info(
 }
 
 fn decode_first_f64(blob: &[u8]) -> Result<DecodedF64> {
+    decode_first_f64_with_masks(blob, None, None)
+}
+
+fn decode_first_f64_with_masks(
+    blob: &[u8],
+    lerc1_shared_mask: Option<&[u8]>,
+    lerc2_shared_mask: Option<&[u8]>,
+) -> Result<DecodedF64> {
     if lerc1::is_lerc1(blob) {
-        return lerc1::decode_f64(blob, None);
+        return lerc1::decode_f64(blob, lerc1_shared_mask);
     }
     if lerc2::is_lerc2(blob) {
-        return lerc2::decode_f64(blob, None);
+        return lerc2::decode_f64(blob, lerc2_shared_mask);
     }
     Err(Error::InvalidMagic)
 }

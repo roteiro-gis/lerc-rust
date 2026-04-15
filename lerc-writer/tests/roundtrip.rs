@@ -89,6 +89,33 @@ fn roundtrips_masked_f32_raster_with_depth() {
 }
 
 #[test]
+fn compresses_repeated_mask_bytes() {
+    let pixels = vec![7u8; 256];
+    let mask_pixels: Vec<u8> = (0..256).map(|index| u8::from(index >= 128)).collect();
+    let raster = RasterView::new(256, 1, 1, &pixels).unwrap();
+    let mask = MaskView::new(256, 1, &mask_pixels).unwrap();
+
+    let blob = encode(raster, Some(mask), EncodeOptions::default()).unwrap();
+    let mask_num_bytes = u32::from_le_bytes(blob[66..70].try_into().unwrap()) as usize;
+    let literal_mask_num_bytes = 256usize.div_ceil(8) + 4;
+
+    assert_eq!(mask_num_bytes, 8);
+    assert!(mask_num_bytes < literal_mask_num_bytes);
+
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    assert_eq!(decoded.mask, Some(mask_pixels.clone()));
+    assert_eq!(
+        decoded.pixels,
+        lerc_core::PixelData::U8(
+            mask_pixels
+                .iter()
+                .map(|&value| if value != 0 { 7 } else { 0 })
+                .collect()
+        )
+    );
+}
+
+#[test]
 fn emits_per_depth_constant_blob_without_tile_payload() {
     let pixels = vec![10u8, 20, 10, 20, 10, 20, 10, 20];
     let raster = RasterView::new(2, 2, 2, &pixels).unwrap();
