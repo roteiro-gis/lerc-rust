@@ -47,6 +47,8 @@ let blob = encode(
 Single-blob entry points are strict. If you intentionally want first-blob
 inspection or decode from a concatenated payload, use `inspect_first()` or
 `decode_first()`.
+For Lerc1 shared-mask or Lerc2 external-mask blobs, use the corresponding
+single-blob `*_with_mask()` entry points.
 
 Concatenated band sets decode to bands-last arrays by default, and can also be
 requested in BSQ order:

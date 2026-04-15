@@ -115,7 +115,7 @@ pub fn encoded_len_upper_bound<T: Sample>(
     let depth = raster.depth() as usize;
     let num_tiles = tile_count(raster.width() as usize, raster.height() as usize, options)?;
     let byte_len = raster.data_type().byte_len();
-    let mask_len = mask_payload_len(pixel_count, valid_pixel_count)?;
+    let mask_len = mask_payload_len(mask.map(MaskView::data), pixel_count, valid_pixel_count)?;
     let range_len = if valid_pixel_count == 0 {
         0
     } else {
@@ -250,7 +250,7 @@ fn encoded_len_upper_bound_from_analysis<T: Sample>(
     let depth = raster.depth() as usize;
     let num_tiles = tile_count(raster.width() as usize, raster.height() as usize, options)?;
     let byte_len = raster.data_type().byte_len();
-    let mask_len = mask_payload_len(pixel_count, valid_pixel_count)?;
+    let mask_len = mask_payload_len(mask.map(MaskView::data), pixel_count, valid_pixel_count)?;
     let range_len = depth_range_len(analysis)?;
     let prefix_len = if analysis.valid_pixel_count == 0
         || analysis.z_min == analysis.z_max
@@ -290,7 +290,11 @@ fn encode_into_with_analysis<T: Sample>(
     write_header_prefix(&mut sink, analysis)?;
     write_u32(
         &mut sink,
-        mask_payload_len(raster.pixel_count()?, analysis.valid_pixel_count as usize)? as u32,
+        mask_payload_len(
+            mask,
+            raster.pixel_count()?,
+            analysis.valid_pixel_count as usize,
+        )? as u32,
     )?;
     write_mask_rle(
         &mut sink,
@@ -609,6 +613,90 @@ fn pack_lsb_bits_into(values: &[u32], bits_per_value: u8, out: &mut Vec<u8>) {
     }
 }
 
+fn pack_mask_bitset(mask: &[u8], pixel_count: usize) -> Result<Vec<u8>> {
+    if mask.len() != pixel_count {
+        return Err(Error::InvalidArgument(
+            "mask length does not match the raster dimensions".into(),
+        ));
+    }
+
+    let bitset_len = pixel_count.div_ceil(8);
+    let mut bitset = vec![0u8; bitset_len];
+    for (index, &value) in mask.iter().enumerate() {
+        if value != 0 {
+            bitset[index >> 3] |= 1 << (7 - (index & 7));
+        }
+    }
+    Ok(bitset)
+}
+
+fn emit_mask_literal_chunks<F>(bytes: &[u8], emit_literal: &mut F) -> Result<()>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let chunk = (bytes.len() - offset).min(i16::MAX as usize);
+        emit_literal(&bytes[offset..offset + chunk])?;
+        offset += chunk;
+    }
+    Ok(())
+}
+
+enum MaskRleSegment<'a> {
+    Literal(&'a [u8]),
+    Repeat { value: u8, count: usize },
+}
+
+fn emit_mask_rle_segments<F>(bitset: &[u8], mut emit: F) -> Result<()>
+where
+    F: FnMut(MaskRleSegment<'_>) -> Result<()>,
+{
+    let mut literal_start = 0usize;
+    let mut offset = 0usize;
+
+    while offset < bitset.len() {
+        let value = bitset[offset];
+        let mut run_end = offset + 1;
+        while run_end < bitset.len() && bitset[run_end] == value {
+            run_end += 1;
+        }
+
+        let run_len = run_end - offset;
+        let repeat_threshold = if literal_start == offset && run_end == bitset.len() {
+            2
+        } else if literal_start == offset || run_end == bitset.len() {
+            4
+        } else {
+            6
+        };
+
+        if run_len >= repeat_threshold {
+            emit_mask_literal_chunks(&bitset[literal_start..offset], &mut |bytes| {
+                emit(MaskRleSegment::Literal(bytes))
+            })?;
+
+            let mut emitted = 0usize;
+            while emitted < run_len {
+                let chunk = (run_len - emitted).min(i16::MAX as usize);
+                emit(MaskRleSegment::Repeat {
+                    value,
+                    count: chunk,
+                })?;
+                emitted += chunk;
+            }
+
+            literal_start = run_end;
+        }
+
+        offset = run_end;
+    }
+
+    emit_mask_literal_chunks(&bitset[literal_start..], &mut |bytes| {
+        emit(MaskRleSegment::Literal(bytes))
+    })
+}
+
 fn write_mask_rle(
     sink: &mut impl ByteSink,
     mask: Option<&[u8]>,
@@ -620,34 +708,45 @@ fn write_mask_rle(
     }
 
     let mask = mask.expect("partial-valid rasters require a mask");
-    let bitset_len = pixel_count.div_ceil(8);
-    let mut bitset = vec![0u8; bitset_len];
-    for (index, &value) in mask.iter().enumerate() {
-        if value != 0 {
-            bitset[index >> 3] |= 1 << (7 - (index & 7));
+    let bitset = pack_mask_bitset(mask, pixel_count)?;
+    emit_mask_rle_segments(&bitset, |segment| match segment {
+        MaskRleSegment::Literal(bytes) => {
+            write_i16(sink, bytes.len() as i16)?;
+            sink.extend_from_slice(bytes)
         }
-    }
-
-    let mut offset = 0usize;
-    while offset < bitset.len() {
-        let chunk = (bitset.len() - offset).min(i16::MAX as usize);
-        write_i16(sink, chunk as i16)?;
-        sink.extend_from_slice(&bitset[offset..offset + chunk])?;
-        offset += chunk;
-    }
+        MaskRleSegment::Repeat { value, count } => {
+            write_i16(sink, -(count as i16))?;
+            sink.push(value)
+        }
+    })?;
     write_i16(sink, i16::MIN)
 }
 
-fn mask_payload_len(pixel_count: usize, valid_pixel_count: usize) -> Result<usize> {
+fn mask_payload_len(
+    mask: Option<&[u8]>,
+    pixel_count: usize,
+    valid_pixel_count: usize,
+) -> Result<usize> {
     if valid_pixel_count == 0 || valid_pixel_count == pixel_count {
         return Ok(0);
     }
-    let bitset_len = pixel_count.div_ceil(8);
-    let chunk_count = bitset_len.div_ceil(i16::MAX as usize);
-    bitset_len
-        .checked_add(chunk_count * 2)
-        .and_then(|len| len.checked_add(2))
-        .ok_or_else(|| Error::InvalidArgument("mask payload length overflows usize".into()))
+
+    let bitset = pack_mask_bitset(
+        mask.expect("partial-valid rasters require a mask"),
+        pixel_count,
+    )?;
+    let mut len = 2usize;
+    emit_mask_rle_segments(&bitset, |segment| {
+        len = match segment {
+            MaskRleSegment::Literal(bytes) => len
+                .checked_add(2)
+                .and_then(|len| len.checked_add(bytes.len())),
+            MaskRleSegment::Repeat { .. } => len.checked_add(3),
+        }
+        .ok_or_else(|| Error::InvalidArgument("mask payload length overflows usize".into()))?;
+        Ok(())
+    })?;
+    Ok(len)
 }
 
 fn depth_range_len(analysis: &RasterAnalysis) -> Result<usize> {

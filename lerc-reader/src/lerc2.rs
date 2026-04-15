@@ -150,6 +150,9 @@ pub(crate) fn parse(blob: &[u8]) -> Result<(BlobInfo, Cursor<'_>)> {
     if micro_block_size < 0 {
         return Err(Error::InvalidHeader("negative micro block size"));
     }
+    if depth == 0 {
+        return Err(Error::InvalidHeader("depth must be greater than zero"));
+    }
     if blob_size <= 0 {
         return Err(Error::InvalidHeader("non-positive blob size"));
     }
@@ -225,7 +228,7 @@ fn read_mask(
 
     if num_bytes == 0 {
         let mask = inherited_mask.ok_or(Error::UnsupportedFeature(
-            "external masks are not yet supported",
+            "Lerc2 external masks require a caller-supplied mask via the *_with_mask APIs",
         ))?;
         if mask.len() != num_pixels {
             return Err(Error::InvalidBlob(
