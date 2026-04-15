@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::types::{DataType, PixelData};
+use crate::types::{BandLayout, DataType, PixelData};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RasterView<'a, T: Sample> {
@@ -56,6 +56,106 @@ impl<'a, T: Sample> RasterView<'a, T> {
 
     pub fn sample(self, pixel: usize, dim: usize) -> T {
         self.data[sample_index(pixel, self.depth as usize, dim)]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BandSetView<'a, T: Sample> {
+    width: u32,
+    height: u32,
+    depth: u32,
+    band_count: usize,
+    layout: BandLayout,
+    data: &'a [T],
+}
+
+impl<'a, T: Sample> BandSetView<'a, T> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        depth: u32,
+        band_count: usize,
+        layout: BandLayout,
+        data: &'a [T],
+    ) -> Result<Self> {
+        if band_count == 0 {
+            return Err(Error::InvalidArgument(
+                "band_count must be greater than zero".into(),
+            ));
+        }
+
+        let band_sample_count = sample_count_from_dims(width, height, depth)?;
+        let expected_len = band_sample_count
+            .checked_mul(band_count)
+            .ok_or_else(|| Error::InvalidArgument("band set size overflows usize".into()))?;
+        if data.len() != expected_len {
+            return Err(Error::InvalidArgument(format!(
+                "band set slice length {} does not match width={width}, height={height}, depth={depth}, band_count={band_count}",
+                data.len()
+            )));
+        }
+
+        Ok(Self {
+            width,
+            height,
+            depth,
+            band_count,
+            layout,
+            data,
+        })
+    }
+
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    pub fn height(self) -> u32 {
+        self.height
+    }
+
+    pub fn depth(self) -> u32 {
+        self.depth
+    }
+
+    pub fn band_count(self) -> usize {
+        self.band_count
+    }
+
+    pub fn layout(self) -> BandLayout {
+        self.layout
+    }
+
+    pub fn data(self) -> &'a [T] {
+        self.data
+    }
+
+    pub fn data_type(self) -> DataType {
+        T::data_type()
+    }
+
+    pub fn pixel_count(self) -> Result<usize> {
+        pixel_count_from_dims(self.width, self.height)
+    }
+
+    pub fn band_sample_count(self) -> Result<usize> {
+        sample_count_from_dims(self.width, self.height, self.depth)
+    }
+
+    pub fn value_count(self) -> Result<usize> {
+        self.band_sample_count()?
+            .checked_mul(self.band_count)
+            .ok_or_else(|| Error::InvalidArgument("band set size overflows usize".into()))
+    }
+
+    pub fn sample(self, band: usize, pixel: usize, dim: usize) -> T {
+        let depth = self.depth as usize;
+        let pixel_count = self.width as usize * self.height as usize;
+        let band_stride = pixel_count * depth;
+        let index = match self.layout {
+            BandLayout::Interleaved => (pixel * self.band_count + band) * depth + dim,
+            BandLayout::Bsq => band * band_stride + pixel * depth + dim,
+        };
+        self.data[index]
     }
 }
 

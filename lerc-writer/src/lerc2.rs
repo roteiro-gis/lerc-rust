@@ -1,4 +1,6 @@
-use lerc_core::{bits_required, fletcher32, DataType, Error, MaskView, RasterView, Result, Sample};
+use lerc_core::{
+    bits_required, fletcher32, BandSetView, DataType, Error, MaskView, RasterView, Result, Sample,
+};
 
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
 const VERSION: i32 = 4;
@@ -103,19 +105,296 @@ impl TileScratch {
     }
 }
 
+trait RasterSource<T: Sample>: Copy {
+    fn width(self) -> u32;
+    fn height(self) -> u32;
+    fn depth(self) -> u32;
+    fn data_type(self) -> DataType;
+    fn pixel_count(self) -> Result<usize>;
+    fn sample(self, pixel: usize, dim: usize) -> T;
+}
+
+impl<T: Sample> RasterSource<T> for RasterView<'_, T> {
+    fn width(self) -> u32 {
+        self.width()
+    }
+
+    fn height(self) -> u32 {
+        self.height()
+    }
+
+    fn depth(self) -> u32 {
+        self.depth()
+    }
+
+    fn data_type(self) -> DataType {
+        self.data_type()
+    }
+
+    fn pixel_count(self) -> Result<usize> {
+        self.pixel_count()
+    }
+
+    fn sample(self, pixel: usize, dim: usize) -> T {
+        self.sample(pixel, dim)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BandRasterView<'a, T: Sample> {
+    band_set: BandSetView<'a, T>,
+    band_index: usize,
+}
+
+impl<T: Sample> RasterSource<T> for BandRasterView<'_, T> {
+    fn width(self) -> u32 {
+        self.band_set.width()
+    }
+
+    fn height(self) -> u32 {
+        self.band_set.height()
+    }
+
+    fn depth(self) -> u32 {
+        self.band_set.depth()
+    }
+
+    fn data_type(self) -> DataType {
+        self.band_set.data_type()
+    }
+
+    fn pixel_count(self) -> Result<usize> {
+        self.band_set.pixel_count()
+    }
+
+    fn sample(self, pixel: usize, dim: usize) -> T {
+        self.band_set.sample(self.band_index, pixel, dim)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MaskKind<'a> {
+    None,
+    Explicit(&'a [u8]),
+    External(&'a [u8]),
+}
+
+impl<'a> MaskKind<'a> {
+    fn data(self) -> Option<&'a [u8]> {
+        match self {
+            Self::None => None,
+            Self::Explicit(mask) | Self::External(mask) => Some(mask),
+        }
+    }
+
+    fn stored_payload_len(self, pixel_count: usize, valid_pixel_count: usize) -> Result<usize> {
+        match self {
+            Self::Explicit(mask) => explicit_mask_payload_len(mask, pixel_count, valid_pixel_count),
+            Self::None | Self::External(_) => Ok(0),
+        }
+    }
+}
+
+fn shared_mask_for_band(mask: Option<&[u8]>, band_index: usize) -> MaskKind<'_> {
+    match mask {
+        Some(mask) if band_index == 0 => MaskKind::Explicit(mask),
+        Some(mask) => MaskKind::External(mask),
+        None => MaskKind::None,
+    }
+}
+
+fn validate_encode_options(options: EncodeOptions) -> Result<()> {
+    if !options.max_z_error.is_finite() || options.max_z_error < 0.0 {
+        return Err(Error::InvalidArgument(
+            "max_z_error must be finite and non-negative".into(),
+        ));
+    }
+    if options.micro_block_size == 0 {
+        return Err(Error::InvalidArgument(
+            "micro_block_size must be greater than zero".into(),
+        ));
+    }
+    if options.micro_block_size > i32::MAX as u32 {
+        return Err(Error::InvalidArgument(
+            "micro_block_size exceeds the Lerc2 header limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mask_dimensions(width: u32, height: u32, mask: Option<MaskView<'_>>) -> Result<()> {
+    if let Some(mask) = mask {
+        if mask.width() != width || mask.height() != height {
+            return Err(Error::InvalidArgument(
+                "mask dimensions must match the raster dimensions".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_mask_slice(mask: Option<&[u8]>, pixel_count: usize) -> Result<()> {
+    if let Some(mask) = mask {
+        if mask.len() != pixel_count {
+            return Err(Error::InvalidArgument(
+                "mask length does not match the raster dimensions".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn encoded_len_upper_bound<T: Sample>(
     raster: RasterView<'_, T>,
     mask: Option<MaskView<'_>>,
     options: EncodeOptions,
 ) -> Result<usize> {
-    validate_options(raster, mask, options)?;
+    validate_encode_options(options)?;
+    validate_mask_dimensions(raster.width(), raster.height(), mask)?;
+    encoded_len_upper_bound_for_raster(
+        raster,
+        mask.map_or(MaskKind::None, |mask| MaskKind::Explicit(mask.data())),
+        options,
+    )
+}
 
+pub fn encoded_band_set_len_upper_bound<T: Sample>(
+    band_set: BandSetView<'_, T>,
+    mask: Option<MaskView<'_>>,
+    options: EncodeOptions,
+) -> Result<usize> {
+    validate_encode_options(options)?;
+    validate_mask_dimensions(band_set.width(), band_set.height(), mask)?;
+
+    let shared_mask = mask.map(MaskView::data);
+    let mut total = 0usize;
+    for band_index in 0..band_set.band_count() {
+        let band = BandRasterView {
+            band_set,
+            band_index,
+        };
+        total = total
+            .checked_add(encoded_len_upper_bound_for_raster(
+                band,
+                shared_mask_for_band(shared_mask, band_index),
+                options,
+            )?)
+            .ok_or_else(|| {
+                Error::InvalidArgument("encoded band set size overflows usize".into())
+            })?;
+    }
+    Ok(total)
+}
+
+pub fn encode<T: Sample>(
+    raster: RasterView<'_, T>,
+    mask: Option<MaskView<'_>>,
+    options: EncodeOptions,
+) -> Result<Vec<u8>> {
+    validate_encode_options(options)?;
+    validate_mask_dimensions(raster.width(), raster.height(), mask)?;
+
+    let mask = mask.map_or(MaskKind::None, |mask| MaskKind::Explicit(mask.data()));
+    let analysis = analyze_raster(raster, mask, options)?;
+    let upper_bound = encoded_len_upper_bound_from_analysis(raster, mask, options, &analysis)?;
+    let mut out = vec![0u8; upper_bound];
+    let written = encode_into_with_analysis(raster, mask, options, &analysis, &mut out)?;
+    out.truncate(written);
+    Ok(out)
+}
+
+pub fn encode_band_set<T: Sample>(
+    band_set: BandSetView<'_, T>,
+    mask: Option<MaskView<'_>>,
+    options: EncodeOptions,
+) -> Result<Vec<u8>> {
+    validate_encode_options(options)?;
+    validate_mask_dimensions(band_set.width(), band_set.height(), mask)?;
+
+    let shared_mask = mask.map(MaskView::data);
+    let mut analyses = Vec::with_capacity(band_set.band_count());
+    let mut upper_bound = 0usize;
+
+    for band_index in 0..band_set.band_count() {
+        let band = BandRasterView {
+            band_set,
+            band_index,
+        };
+        let mask_kind = shared_mask_for_band(shared_mask, band_index);
+        let analysis = analyze_raster(band, mask_kind, options)?;
+        upper_bound = upper_bound
+            .checked_add(encoded_len_upper_bound_from_analysis(
+                band, mask_kind, options, &analysis,
+            )?)
+            .ok_or_else(|| {
+                Error::InvalidArgument("encoded band set size overflows usize".into())
+            })?;
+        analyses.push(analysis);
+    }
+
+    let mut out = vec![0u8; upper_bound];
+    let written =
+        encode_band_set_into_with_analysis(band_set, shared_mask, options, &analyses, &mut out)?;
+    out.truncate(written);
+    Ok(out)
+}
+
+pub fn encode_into<T: Sample>(
+    raster: RasterView<'_, T>,
+    mask: Option<MaskView<'_>>,
+    options: EncodeOptions,
+    out: &mut [u8],
+) -> Result<usize> {
+    validate_encode_options(options)?;
+    validate_mask_dimensions(raster.width(), raster.height(), mask)?;
+
+    let mask = mask.map_or(MaskKind::None, |mask| MaskKind::Explicit(mask.data()));
+    let analysis = analyze_raster(raster, mask, options)?;
+    encode_into_with_analysis(raster, mask, options, &analysis, out)
+}
+
+pub fn encode_band_set_into<T: Sample>(
+    band_set: BandSetView<'_, T>,
+    mask: Option<MaskView<'_>>,
+    options: EncodeOptions,
+    out: &mut [u8],
+) -> Result<usize> {
+    validate_encode_options(options)?;
+    validate_mask_dimensions(band_set.width(), band_set.height(), mask)?;
+
+    let shared_mask = mask.map(MaskView::data);
+    let mut analyses = Vec::with_capacity(band_set.band_count());
+    for band_index in 0..band_set.band_count() {
+        let band = BandRasterView {
+            band_set,
+            band_index,
+        };
+        analyses.push(analyze_raster(
+            band,
+            shared_mask_for_band(shared_mask, band_index),
+            options,
+        )?);
+    }
+
+    encode_band_set_into_with_analysis(band_set, shared_mask, options, &analyses, out)
+}
+
+fn encoded_len_upper_bound_for_raster<T: Sample, R: RasterSource<T>>(
+    raster: R,
+    mask: MaskKind<'_>,
+    options: EncodeOptions,
+) -> Result<usize> {
     let pixel_count = raster.pixel_count()?;
-    let valid_pixel_count = mask.map(|mask| mask.valid_count()).unwrap_or(pixel_count);
+    validate_mask_slice(mask.data(), pixel_count)?;
+
+    let valid_pixel_count = mask
+        .data()
+        .map(|mask| mask.iter().filter(|&&value| value != 0).count())
+        .unwrap_or(pixel_count);
     let depth = raster.depth() as usize;
     let num_tiles = tile_count(raster.width() as usize, raster.height() as usize, options)?;
     let byte_len = raster.data_type().byte_len();
-    let mask_len = mask_payload_len(mask.map(MaskView::data), pixel_count, valid_pixel_count)?;
+    let mask_len = mask.stored_payload_len(pixel_count, valid_pixel_count)?;
     let range_len = if valid_pixel_count == 0 {
         0
     } else {
@@ -143,45 +422,14 @@ pub fn encoded_len_upper_bound<T: Sample>(
         .ok_or_else(|| Error::InvalidArgument("encoded upper bound overflows usize".into()))
 }
 
-pub fn encode<T: Sample>(
-    raster: RasterView<'_, T>,
-    mask: Option<MaskView<'_>>,
-    options: EncodeOptions,
-) -> Result<Vec<u8>> {
-    let analysis = analyze_raster(raster, mask, options)?;
-    let upper_bound = encoded_len_upper_bound_from_analysis(raster, mask, options, &analysis)?;
-    let mut out = vec![0u8; upper_bound];
-    let written = encode_into_with_analysis(
-        raster,
-        mask.map(MaskView::data),
-        options,
-        &analysis,
-        &mut out,
-    )?;
-    out.truncate(written);
-    Ok(out)
-}
-
-pub fn encode_into<T: Sample>(
-    raster: RasterView<'_, T>,
-    mask: Option<MaskView<'_>>,
-    options: EncodeOptions,
-    out: &mut [u8],
-) -> Result<usize> {
-    let analysis = analyze_raster(raster, mask, options)?;
-    encode_into_with_analysis(raster, mask.map(MaskView::data), options, &analysis, out)
-}
-
-fn analyze_raster<T: Sample>(
-    raster: RasterView<'_, T>,
-    mask: Option<MaskView<'_>>,
+fn analyze_raster<T: Sample, R: RasterSource<T>>(
+    raster: R,
+    mask: MaskKind<'_>,
     options: EncodeOptions,
 ) -> Result<RasterAnalysis> {
-    validate_options(raster, mask, options)?;
-
     let pixel_count = raster.pixel_count()?;
+    validate_mask_slice(mask.data(), pixel_count)?;
     let depth = raster.depth() as usize;
-    let mask_slice = mask.map(MaskView::data);
     let data_type = raster.data_type();
 
     let mut valid_pixel_count = 0usize;
@@ -191,7 +439,7 @@ fn analyze_raster<T: Sample>(
     let mut max_values = vec![f64::NEG_INFINITY; depth];
 
     for pixel in 0..pixel_count {
-        if !pixel_is_valid(mask_slice, pixel) {
+        if !pixel_is_valid(mask.data(), pixel) {
             continue;
         }
         valid_pixel_count += 1;
@@ -237,20 +485,19 @@ fn analyze_raster<T: Sample>(
     })
 }
 
-fn encoded_len_upper_bound_from_analysis<T: Sample>(
-    raster: RasterView<'_, T>,
-    mask: Option<MaskView<'_>>,
+fn encoded_len_upper_bound_from_analysis<T: Sample, R: RasterSource<T>>(
+    raster: R,
+    mask: MaskKind<'_>,
     options: EncodeOptions,
     analysis: &RasterAnalysis,
 ) -> Result<usize> {
-    validate_options(raster, mask, options)?;
-
     let pixel_count = raster.pixel_count()?;
+    validate_mask_slice(mask.data(), pixel_count)?;
     let valid_pixel_count = analysis.valid_pixel_count as usize;
     let depth = raster.depth() as usize;
     let num_tiles = tile_count(raster.width() as usize, raster.height() as usize, options)?;
     let byte_len = raster.data_type().byte_len();
-    let mask_len = mask_payload_len(mask.map(MaskView::data), pixel_count, valid_pixel_count)?;
+    let mask_len = mask.stored_payload_len(pixel_count, valid_pixel_count)?;
     let range_len = depth_range_len(analysis)?;
     let prefix_len = if analysis.valid_pixel_count == 0
         || analysis.z_min == analysis.z_max
@@ -278,32 +525,38 @@ fn encoded_len_upper_bound_from_analysis<T: Sample>(
         .ok_or_else(|| Error::InvalidArgument("encoded upper bound overflows usize".into()))
 }
 
-fn encode_into_with_analysis<T: Sample>(
-    raster: RasterView<'_, T>,
-    mask: Option<&[u8]>,
+fn encode_into_with_analysis<T: Sample, R: RasterSource<T>>(
+    raster: R,
+    mask: MaskKind<'_>,
     options: EncodeOptions,
     analysis: &RasterAnalysis,
     out: &mut [u8],
 ) -> Result<usize> {
+    let pixel_count = raster.pixel_count()?;
+    validate_mask_slice(mask.data(), pixel_count)?;
+
     let mut sink = SliceSink::new(out);
     let mut scratch = TileScratch::default();
     write_header_prefix(&mut sink, analysis)?;
     write_u32(
         &mut sink,
-        mask_payload_len(
-            mask,
-            raster.pixel_count()?,
-            analysis.valid_pixel_count as usize,
-        )? as u32,
+        mask.stored_payload_len(pixel_count, analysis.valid_pixel_count as usize)? as u32,
     )?;
     write_mask_rle(
         &mut sink,
         mask,
-        raster.pixel_count()?,
+        pixel_count,
         analysis.valid_pixel_count as usize,
     )?;
     write_depth_ranges(&mut sink, analysis)?;
-    write_tile_body(&mut sink, &mut scratch, raster, mask, options, analysis)?;
+    write_tile_body(
+        &mut sink,
+        &mut scratch,
+        raster,
+        mask.data(),
+        options,
+        analysis,
+    )?;
 
     let written = sink.len();
     if written > i32::MAX as usize {
@@ -318,34 +571,37 @@ fn encode_into_with_analysis<T: Sample>(
     Ok(written)
 }
 
-fn validate_options<T: Sample>(
-    raster: RasterView<'_, T>,
-    mask: Option<MaskView<'_>>,
+fn encode_band_set_into_with_analysis<T: Sample>(
+    band_set: BandSetView<'_, T>,
+    shared_mask: Option<&[u8]>,
     options: EncodeOptions,
-) -> Result<()> {
-    if !options.max_z_error.is_finite() || options.max_z_error < 0.0 {
+    analyses: &[RasterAnalysis],
+    out: &mut [u8],
+) -> Result<usize> {
+    if analyses.len() != band_set.band_count() {
         return Err(Error::InvalidArgument(
-            "max_z_error must be finite and non-negative".into(),
+            "band analysis count does not match band_count".into(),
         ));
     }
-    if options.micro_block_size == 0 {
-        return Err(Error::InvalidArgument(
-            "micro_block_size must be greater than zero".into(),
-        ));
+
+    let mut offset = 0usize;
+    for (band_index, analysis) in analyses.iter().enumerate() {
+        let band = BandRasterView {
+            band_set,
+            band_index,
+        };
+        let written = encode_into_with_analysis(
+            band,
+            shared_mask_for_band(shared_mask, band_index),
+            options,
+            analysis,
+            &mut out[offset..],
+        )?;
+        offset = offset.checked_add(written).ok_or_else(|| {
+            Error::InvalidArgument("encoded band set size overflows usize".into())
+        })?;
     }
-    if options.micro_block_size > i32::MAX as u32 {
-        return Err(Error::InvalidArgument(
-            "micro_block_size exceeds the Lerc2 header limit".into(),
-        ));
-    }
-    if let Some(mask) = mask {
-        if mask.width() != raster.width() || mask.height() != raster.height() {
-            return Err(Error::InvalidArgument(
-                "mask dimensions must match the raster dimensions".into(),
-            ));
-        }
-    }
-    Ok(())
+    Ok(offset)
 }
 
 fn write_header_prefix(sink: &mut impl ByteSink, analysis: &RasterAnalysis) -> Result<()> {
@@ -377,10 +633,10 @@ fn write_depth_ranges(sink: &mut impl ByteSink, analysis: &RasterAnalysis) -> Re
     Ok(())
 }
 
-fn write_tile_body<T: Sample>(
+fn write_tile_body<T: Sample, R: RasterSource<T>>(
     sink: &mut impl ByteSink,
     scratch: &mut TileScratch,
-    raster: RasterView<'_, T>,
+    raster: R,
     mask: Option<&[u8]>,
     options: EncodeOptions,
     analysis: &RasterAnalysis,
@@ -699,7 +955,7 @@ where
 
 fn write_mask_rle(
     sink: &mut impl ByteSink,
-    mask: Option<&[u8]>,
+    mask: MaskKind<'_>,
     pixel_count: usize,
     valid_pixel_count: usize,
 ) -> Result<()> {
@@ -707,7 +963,9 @@ fn write_mask_rle(
         return Ok(());
     }
 
-    let mask = mask.expect("partial-valid rasters require a mask");
+    let MaskKind::Explicit(mask) = mask else {
+        return Ok(());
+    };
     let bitset = pack_mask_bitset(mask, pixel_count)?;
     emit_mask_rle_segments(&bitset, |segment| match segment {
         MaskRleSegment::Literal(bytes) => {
@@ -722,8 +980,8 @@ fn write_mask_rle(
     write_i16(sink, i16::MIN)
 }
 
-fn mask_payload_len(
-    mask: Option<&[u8]>,
+fn explicit_mask_payload_len(
+    mask: &[u8],
     pixel_count: usize,
     valid_pixel_count: usize,
 ) -> Result<usize> {
@@ -731,10 +989,7 @@ fn mask_payload_len(
         return Ok(0);
     }
 
-    let bitset = pack_mask_bitset(
-        mask.expect("partial-valid rasters require a mask"),
-        pixel_count,
-    )?;
+    let bitset = pack_mask_bitset(mask, pixel_count)?;
     let mut len = 2usize;
     emit_mask_rle_segments(&bitset, |segment| {
         len = match segment {

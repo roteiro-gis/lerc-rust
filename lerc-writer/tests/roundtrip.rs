@@ -1,5 +1,8 @@
-use lerc_core::{Error, MaskView, RasterView};
-use lerc_writer::{encode, encode_into, encoded_len_upper_bound, EncodeOptions};
+use lerc_core::{BandLayout, BandSetView, Error, MaskView, RasterView};
+use lerc_writer::{
+    encode, encode_band_set, encode_band_set_into, encode_into, encoded_band_set_len_upper_bound,
+    encoded_len_upper_bound, EncodeOptions,
+};
 
 #[test]
 fn roundtrips_constant_u16_raster() {
@@ -89,6 +92,67 @@ fn roundtrips_masked_f32_raster_with_depth() {
 }
 
 #[test]
+fn roundtrips_shared_mask_band_set_from_interleaved_input() {
+    let pixels = vec![10u8, 50, 0, 0, 11, 51, 12, 52];
+    let mask_pixels = vec![1u8, 0, 1, 1];
+    let band_set = BandSetView::new(2, 2, 1, 2, BandLayout::Interleaved, &pixels).unwrap();
+    let mask = MaskView::new(2, 2, &mask_pixels).unwrap();
+
+    let upper =
+        encoded_band_set_len_upper_bound(band_set, Some(mask), EncodeOptions::default()).unwrap();
+    let blob = encode_band_set(band_set, Some(mask), EncodeOptions::default()).unwrap();
+    assert!(upper >= blob.len());
+
+    let first_info = lerc_reader::inspect_first(&blob).unwrap();
+    let second_info = lerc_reader::get_blob_info(&blob[first_info.blob_size..]).unwrap();
+    assert_eq!(first_info.mask_encoding, lerc_core::MaskEncoding::Explicit);
+    assert_eq!(first_info.mask_count(), 1);
+    assert_eq!(second_info.mask_encoding, lerc_core::MaskEncoding::External);
+    assert_eq!(second_info.mask_count(), 0);
+
+    let decoded = lerc_reader::decode_band_set(&blob).unwrap();
+    assert_eq!(decoded.info.band_count(), 2);
+    assert_eq!(decoded.info.mask_count(), 1);
+    assert_eq!(
+        decoded.band_masks,
+        vec![Some(mask_pixels.clone()), Some(mask_pixels.clone())]
+    );
+    assert_eq!(
+        decoded.bands[0],
+        lerc_core::PixelData::U8(vec![10, 0, 11, 12])
+    );
+    assert_eq!(
+        decoded.bands[1],
+        lerc_core::PixelData::U8(vec![50, 0, 51, 52])
+    );
+}
+
+#[test]
+fn roundtrips_shared_mask_band_set_from_bsq_input() {
+    let pixels = vec![10u8, 0, 11, 12, 50, 0, 51, 52];
+    let mask_pixels = vec![1u8, 0, 1, 1];
+    let band_set = BandSetView::new(2, 2, 1, 2, BandLayout::Bsq, &pixels).unwrap();
+    let mask = MaskView::new(2, 2, &mask_pixels).unwrap();
+
+    let blob = encode_band_set(band_set, Some(mask), EncodeOptions::default()).unwrap();
+    let decoded = lerc_reader::decode_band_set(&blob).unwrap();
+    assert_eq!(decoded.info.band_count(), 2);
+    assert_eq!(decoded.info.mask_count(), 1);
+    assert_eq!(
+        decoded.band_masks,
+        vec![Some(mask_pixels.clone()), Some(mask_pixels.clone())]
+    );
+    assert_eq!(
+        decoded.bands[0],
+        lerc_core::PixelData::U8(vec![10, 0, 11, 12])
+    );
+    assert_eq!(
+        decoded.bands[1],
+        lerc_core::PixelData::U8(vec![50, 0, 51, 52])
+    );
+}
+
+#[test]
 fn compresses_repeated_mask_bytes() {
     let pixels = vec![7u8; 256];
     let mask_pixels: Vec<u8> = (0..256).map(|index| u8::from(index >= 128)).collect();
@@ -113,6 +177,21 @@ fn compresses_repeated_mask_bytes() {
                 .collect()
         )
     );
+}
+
+#[test]
+fn encode_band_set_into_reports_small_output_buffers() {
+    let pixels = vec![10u8, 50, 0, 0, 11, 51, 12, 52];
+    let mask_pixels = vec![1u8, 0, 1, 1];
+    let band_set = BandSetView::new(2, 2, 1, 2, BandLayout::Interleaved, &pixels).unwrap();
+    let mask = MaskView::new(2, 2, &mask_pixels).unwrap();
+    let blob = encode_band_set(band_set, Some(mask), EncodeOptions::default()).unwrap();
+    let mut out = vec![0u8; blob.len() - 1];
+
+    assert!(matches!(
+        encode_band_set_into(band_set, Some(mask), EncodeOptions::default(), &mut out),
+        Err(Error::OutputTooSmall { .. })
+    ));
 }
 
 #[test]

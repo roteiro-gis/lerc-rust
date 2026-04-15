@@ -46,9 +46,27 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     )
     .unwrap();
 
+    let band_set_pixels = vec![10u8, 50, 0, 0, 11, 51, 12, 52];
+    let band_set_mask = vec![1u8, 0, 1, 1];
+    let band_set_blob = lerc_writer::encode_band_set(
+        lerc_core::BandSetView::new(
+            2,
+            2,
+            1,
+            2,
+            lerc_core::BandLayout::Interleaved,
+            &band_set_pixels,
+        )
+        .unwrap(),
+        Some(lerc_core::MaskView::new(2, 2, &band_set_mask).unwrap()),
+        lerc_writer::EncodeOptions::default(),
+    )
+    .unwrap();
+
     for (name, blob, kind) in [
         ("u8-bitstuff", u8_blob, 0u8),
         ("f32-depth-mask", f32_blob, 1u8),
+        ("u8-band-set-shared-mask", band_set_blob, 2u8),
     ] {
         let path = write_temp_blob(name, &blob);
         let reference_json =
@@ -66,6 +84,28 @@ fn generated_blobs_match_liblerc_decode_hashes() {
             1 => {
                 let raster = lerc_reader::decode_ndarray_f64(&blob).unwrap();
                 let mask = lerc_reader::decode_mask_ndarray(&blob).unwrap().unwrap();
+                let (pixel_len, pixel_hash) = reference::array_hash(&raster);
+                let (mask_len, mask_hash) = reference::array_hash(&mask);
+                assert_eq!(
+                    pixel_len,
+                    reference_json["pixel_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(pixel_hash, reference_json["pixel_hash"].as_str().unwrap());
+                assert_eq!(
+                    mask_len,
+                    reference_json["mask_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(mask_hash, reference_json["mask_hash"].as_str().unwrap());
+            }
+            2 => {
+                let raster = lerc_reader::decode_band_set_ndarray_with_layout::<u8>(
+                    &blob,
+                    lerc_core::BandLayout::Interleaved,
+                )
+                .unwrap();
+                let mask = lerc_reader::decode_band_mask_ndarray(&blob)
+                    .unwrap()
+                    .unwrap();
                 let (pixel_len, pixel_hash) = reference::array_hash(&raster);
                 let (mask_len, mask_hash) = reference::array_hash(&mask);
                 assert_eq!(
