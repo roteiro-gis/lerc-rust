@@ -36,6 +36,12 @@ struct Lerc1Block {
 type ValueRange = Option<(f64, f64)>;
 type TypedPixels<T> = (Vec<T>, ValueRange);
 
+#[derive(Debug, Clone, Copy)]
+enum MaskSource<'a> {
+    Inline,
+    External(&'a [u8]),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Lerc1Blob {
     pub(crate) info: BlobInfo,
@@ -133,6 +139,28 @@ pub(crate) fn decode_into<T: Sample, W: BandWriter<T>>(
 }
 
 pub(crate) fn parse(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Lerc1Blob> {
+    let Some(shared_mask) = shared_mask else {
+        return parse_with_mask_source(blob, MaskSource::Inline);
+    };
+
+    let inline_result = parse_with_mask_source(blob, MaskSource::Inline);
+    if inline_result.is_ok() {
+        return inline_result;
+    }
+
+    let external_result = parse_with_mask_source(blob, MaskSource::External(shared_mask));
+    if external_result.is_ok() {
+        return external_result;
+    }
+
+    let inline_error = inline_result.err().unwrap();
+    let external_error = external_result.err().unwrap();
+    Err(Error::InvalidBlob(format!(
+        "failed to parse Lerc1 blob with either an inline mask ({inline_error}) or the supplied shared mask ({external_error})"
+    )))
+}
+
+fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Lerc1Blob> {
     let mut cursor = Cursor::new(blob);
     let magic = cursor.read_bytes(10)?;
     if !magic.starts_with(MAGIC_LERC1_PREFIX) {
@@ -148,10 +176,12 @@ pub(crate) fn parse(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Lerc1Blob
     let width = cursor.read_u32()?;
     let max_z_error = cursor.read_f64()?;
 
-    let (mask_encoding, mask) = if let Some(shared_mask) = shared_mask {
-        (MaskEncoding::External, Some(shared_mask.to_vec()))
-    } else {
-        read_mask(&mut cursor, width, height)?
+    let (mask_encoding, mask) = match mask_source {
+        MaskSource::Inline => read_mask(&mut cursor, width, height)?,
+        MaskSource::External(shared_mask) => {
+            validate_shared_mask(shared_mask, width, height)?;
+            (MaskEncoding::External, Some(shared_mask.to_vec()))
+        }
     };
 
     let pixels_num_blocks_y = cursor.read_u32()? as usize;
@@ -315,6 +345,18 @@ pub(crate) fn parse(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Lerc1Blob
         base_block_height,
         base_block_width,
     })
+}
+
+fn validate_shared_mask(mask: &[u8], width: u32, height: u32) -> Result<()> {
+    let num_pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::InvalidBlob("pixel count overflows usize".into()))?;
+    if mask.len() != num_pixels {
+        return Err(Error::InvalidBlob(
+            "shared mask length does not match the current Lerc1 blob".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn map_lerc1_data_type(_image_type: i32) -> DataType {

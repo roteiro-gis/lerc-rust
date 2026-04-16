@@ -68,6 +68,34 @@ fn build_lerc1_blob(
     bytes
 }
 
+fn build_external_mask_lerc2_blob(values: &[u8]) -> Vec<u8> {
+    assert_eq!(values.len(), 3);
+
+    let z_min = f64::from(*values.iter().min().unwrap());
+    let z_max = f64::from(*values.iter().max().unwrap());
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"Lerc2 ");
+    bytes.extend_from_slice(&4i32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&8i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&z_min.to_le_bytes());
+    bytes.extend_from_slice(&z_max.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.push(1);
+    bytes.push(values.len() as u8);
+    bytes.push(1);
+    bytes.extend_from_slice(values);
+    finalize_lerc2_with_checksum(bytes)
+}
+
 #[test]
 fn reads_blob_info_for_constant_lerc2() {
     let mut blob = build_header_v2(HeaderV2 {
@@ -131,27 +159,7 @@ fn decodes_one_sweep_all_valid() {
 
 #[test]
 fn decodes_external_mask_lerc2_via_single_blob_with_mask_apis() {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"Lerc2 ");
-    bytes.extend_from_slice(&4i32.to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    bytes.extend_from_slice(&2u32.to_le_bytes());
-    bytes.extend_from_slice(&2u32.to_le_bytes());
-    bytes.extend_from_slice(&1u32.to_le_bytes());
-    bytes.extend_from_slice(&3u32.to_le_bytes());
-    bytes.extend_from_slice(&8i32.to_le_bytes());
-    bytes.extend_from_slice(&0i32.to_le_bytes());
-    bytes.extend_from_slice(&1i32.to_le_bytes());
-    bytes.extend_from_slice(&0.0f64.to_le_bytes());
-    bytes.extend_from_slice(&1.0f64.to_le_bytes());
-    bytes.extend_from_slice(&3.0f64.to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    bytes.push(1);
-    bytes.push(3);
-    bytes.push(1);
-    bytes.extend_from_slice(&[1, 2, 3]);
-
-    let blob = finalize_lerc2_with_checksum(bytes);
+    let blob = build_external_mask_lerc2_blob(&[1, 2, 3]);
     let external_mask = [1u8, 0, 1, 1];
 
     assert!(matches!(decode(&blob), Err(Error::UnsupportedFeature(_))));
@@ -210,6 +218,83 @@ fn decodes_external_mask_lerc2_via_single_blob_with_mask_apis() {
     assert_eq!(mask[IxDyn(&[0, 1])], 0);
     assert_eq!(mask[IxDyn(&[1, 0])], 1);
     assert_eq!(mask[IxDyn(&[1, 1])], 1);
+}
+
+#[test]
+fn decodes_external_mask_lerc2_band_set_via_with_mask_apis() {
+    let external_mask = [1u8, 0, 1, 1];
+    let mut blob = build_external_mask_lerc2_blob(&[1, 2, 3]);
+    blob.extend_from_slice(&build_external_mask_lerc2_blob(&[4, 5, 6]));
+
+    assert!(matches!(
+        decode_band_set(&blob),
+        Err(Error::UnsupportedFeature(_))
+    ));
+
+    let decoded = decode_band_set_with_mask(&blob, &external_mask).unwrap();
+    assert_eq!(decoded.info.band_count(), 2);
+    assert_eq!(
+        decoded.bands,
+        vec![
+            PixelData::U8(vec![1, 0, 2, 3]),
+            PixelData::U8(vec![4, 0, 5, 6]),
+        ]
+    );
+    assert_eq!(
+        decoded.band_masks,
+        vec![Some(external_mask.to_vec()), Some(external_mask.to_vec()),]
+    );
+
+    let (info, bsq) =
+        decode_band_set_vec_with_mask::<u8>(&blob, &external_mask, BandLayout::Bsq).unwrap();
+    assert_eq!(info.band_count(), 2);
+    assert_eq!(bsq, vec![1, 0, 2, 3, 4, 0, 5, 6]);
+
+    let mut interleaved = vec![0u8; 8];
+    let info_into = decode_band_set_into_with_mask(
+        &blob,
+        &external_mask,
+        BandLayout::Interleaved,
+        &mut interleaved,
+    )
+    .unwrap();
+    assert_eq!(info_into, info);
+    assert_eq!(interleaved, vec![1, 4, 0, 0, 2, 5, 3, 6]);
+
+    let array = decode_band_set_ndarray_with_mask::<u8>(&blob, &external_mask).unwrap();
+    assert_eq!(array.shape(), &[2, 2, 2]);
+    assert_eq!(array[IxDyn(&[0, 0, 0])], 1);
+    assert_eq!(array[IxDyn(&[0, 0, 1])], 4);
+    assert_eq!(array[IxDyn(&[0, 1, 0])], 0);
+    assert_eq!(array[IxDyn(&[0, 1, 1])], 0);
+    assert_eq!(array[IxDyn(&[1, 0, 0])], 2);
+    assert_eq!(array[IxDyn(&[1, 0, 1])], 5);
+    assert_eq!(array[IxDyn(&[1, 1, 0])], 3);
+    assert_eq!(array[IxDyn(&[1, 1, 1])], 6);
+
+    let promoted = decode_band_set_ndarray_f64_with_mask(&blob, &external_mask).unwrap();
+    assert_eq!(promoted.shape(), &[2, 2, 2]);
+    assert_eq!(promoted[IxDyn(&[0, 0, 0])], 1.0);
+    assert_eq!(promoted[IxDyn(&[0, 0, 1])], 4.0);
+    assert_eq!(promoted[IxDyn(&[0, 1, 0])], 0.0);
+    assert_eq!(promoted[IxDyn(&[0, 1, 1])], 0.0);
+    assert_eq!(promoted[IxDyn(&[1, 0, 0])], 2.0);
+    assert_eq!(promoted[IxDyn(&[1, 0, 1])], 5.0);
+    assert_eq!(promoted[IxDyn(&[1, 1, 0])], 3.0);
+    assert_eq!(promoted[IxDyn(&[1, 1, 1])], 6.0);
+
+    let band_mask = decode_band_mask_ndarray_with_mask(&blob, &external_mask)
+        .unwrap()
+        .unwrap();
+    assert_eq!(band_mask.shape(), &[2, 2, 2]);
+    assert_eq!(band_mask[IxDyn(&[0, 0, 0])], 1);
+    assert_eq!(band_mask[IxDyn(&[0, 0, 1])], 1);
+    assert_eq!(band_mask[IxDyn(&[0, 1, 0])], 0);
+    assert_eq!(band_mask[IxDyn(&[0, 1, 1])], 0);
+    assert_eq!(band_mask[IxDyn(&[1, 0, 0])], 1);
+    assert_eq!(band_mask[IxDyn(&[1, 0, 1])], 1);
+    assert_eq!(band_mask[IxDyn(&[1, 1, 0])], 1);
+    assert_eq!(band_mask[IxDyn(&[1, 1, 1])], 1);
 }
 
 #[test]
@@ -352,6 +437,45 @@ fn decodes_lerc1_masked_bitstuffed_block() {
     assert_eq!(decoded.pixels, PixelData::F32(vec![1.0, 0.0, 3.0, 4.0]));
     assert_eq!(decoded.info.z_min, 1.0);
     assert_eq!(decoded.info.z_max, 4.0);
+}
+
+#[test]
+fn lerc1_with_mask_prefers_inline_masked_blob_over_caller_mask() {
+    let blob = build_lerc1_blob(true, Some(&[1, 0, 1, 1]), &[1.0, 3.0, 4.0], 0.5, 4.0);
+    let caller_mask = [1u8, 1, 1, 1];
+
+    let info = get_blob_info_with_mask(&blob, &caller_mask).unwrap();
+    assert_eq!(info.mask_encoding, MaskEncoding::Explicit);
+    assert_eq!(info.valid_pixel_count, 3);
+
+    let decoded = decode_with_mask(&blob, &caller_mask).unwrap();
+    assert_eq!(decoded.mask, Some(vec![1, 0, 1, 1]));
+    assert_eq!(decoded.pixels, PixelData::F32(vec![1.0, 0.0, 3.0, 4.0]));
+
+    let mask = decode_mask_ndarray_with_mask(&blob, &caller_mask)
+        .unwrap()
+        .unwrap();
+    assert_eq!(mask.shape(), &[2, 2]);
+    assert_eq!(mask[IxDyn(&[0, 0])], 1);
+    assert_eq!(mask[IxDyn(&[0, 1])], 0);
+    assert_eq!(mask[IxDyn(&[1, 0])], 1);
+    assert_eq!(mask[IxDyn(&[1, 1])], 1);
+}
+
+#[test]
+fn lerc1_with_mask_still_decodes_detached_shared_mask_blob() {
+    let blob = build_lerc1_blob(false, None, &[1.0, 3.0, 4.0], 0.5, 4.0);
+    let shared_mask = [1u8, 0, 1, 1];
+
+    assert!(matches!(decode(&blob), Err(Error::Truncated { .. })));
+
+    let info = get_blob_info_with_mask(&blob, &shared_mask).unwrap();
+    assert_eq!(info.mask_encoding, MaskEncoding::External);
+    assert_eq!(info.valid_pixel_count, 3);
+
+    let decoded = decode_with_mask(&blob, &shared_mask).unwrap();
+    assert_eq!(decoded.mask, Some(shared_mask.to_vec()));
+    assert_eq!(decoded.pixels, PixelData::F32(vec![1.0, 0.0, 3.0, 4.0]));
 }
 
 #[test]

@@ -10,7 +10,7 @@ as `geotiff-rust`.
 |---|---|
 | `lerc-core` | Codec-neutral shared types, errors, typed raster views, and sample helpers |
 | `lerc-reader` | Pure-Rust LERC inspection and decode paths for Lerc1 and Lerc2 blobs |
-| `lerc-writer` | Pure-Rust Lerc2 single-blob writer with mask, depth, checksum, and tiled emit paths |
+| `lerc-writer` | Pure-Rust Lerc2 writer for single blobs and concatenated band sets |
 
 ## Usage
 
@@ -49,6 +49,8 @@ inspection or decode from a concatenated payload, use `inspect_first()` or
 `decode_first()`.
 For Lerc1 shared-mask or Lerc2 external-mask blobs, use the corresponding
 single-blob `*_with_mask()` entry points.
+For concatenated Lerc2 band sets whose first blob uses an external mask, use
+the matching band-set `*_with_mask()` entry points.
 
 Concatenated band sets decode to bands-last arrays by default, and can also be
 requested in BSQ order:
@@ -68,8 +70,10 @@ assert_eq!(bsq.len(), (info.width() * info.height() * info.band_count() as u32) 
   shared-mask band sets
 - Lerc2 header parsing, Fletcher32 verification, mask decoding, constant/raw,
   tiled, bit-stuffed, and Huffman decode paths
-- Lerc2 single-blob writes with optional masks, depth metadata, checksum, and
-  constant/raw/bit-stuffed tiles
+- Lerc2 writes for single blobs and concatenated band sets with optional masks,
+  depth metadata, checksum, constant/per-depth constant, one-sweep, tiled,
+  Huffman, and v5 diff-tile encode paths
+- Lerc2 v6/no-data decode support; writer emission currently stops at v5 headers
 - Native typed decode and type-promoting `f64` decode
 - Strict single-blob APIs plus permissive first-blob adapters for concatenated payloads
 - Direct `ndarray::ArrayD` conversion for rasters, band sets, and masks, with selectable band layout
