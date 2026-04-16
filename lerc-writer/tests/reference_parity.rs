@@ -3,17 +3,6 @@ use ndarray::ArrayD;
 #[path = "../../test-support/reference.rs"]
 mod reference;
 
-fn write_temp_blob(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-    let mut path = std::env::temp_dir();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    path.push(format!("lerc-writer-{name}-{nanos}.lerc2"));
-    std::fs::write(&path, bytes).unwrap();
-    path
-}
-
 #[test]
 fn generated_blobs_match_liblerc_decode_hashes() {
     let Some(helper) = reference::helper_path() else {
@@ -102,6 +91,30 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     )
     .unwrap();
 
+    let i8_huffman_pixels: Vec<i8> = (0..256)
+        .map(|index| if index % 32 < 24 { -7 } else { 11 })
+        .collect();
+    let i8_huffman_blob = lerc_writer::encode(
+        lerc_core::RasterView::new(16, 16, 1, &i8_huffman_pixels).unwrap(),
+        None,
+        lerc_writer::EncodeOptions {
+            max_z_error: 0.5,
+            micro_block_size: 1,
+        },
+    )
+    .unwrap();
+
+    let f64_pixels = vec![1.25f64, -2.5, 3.75, 4.5, -5.25, 6.0];
+    let f64_blob = lerc_writer::encode(
+        lerc_core::RasterView::new(3, 2, 1, &f64_pixels).unwrap(),
+        None,
+        lerc_writer::EncodeOptions {
+            max_z_error: 0.0,
+            micro_block_size: 1,
+        },
+    )
+    .unwrap();
+
     for (name, blob, kind) in [
         ("u8-bitstuff", u8_blob, 0u8),
         ("f32-depth-mask", f32_blob, 1u8),
@@ -109,8 +122,10 @@ fn generated_blobs_match_liblerc_decode_hashes() {
         ("u16-one-sweep", one_sweep_blob, 3u8),
         ("u8-huffman", huffman_blob, 4u8),
         ("u16-v5-diff", diff_blob, 5u8),
+        ("i8-huffman", i8_huffman_blob, 6u8),
+        ("f64-lossless", f64_blob, 7u8),
     ] {
-        let path = write_temp_blob(name, &blob);
+        let path = reference::write_temp_bytes(&format!("lerc-writer-{name}"), "lerc2", &blob);
         let reference_json =
             reference::run_reference_json(&helper, &["hash", path.to_str().unwrap()]);
         match kind {
@@ -181,6 +196,24 @@ fn generated_blobs_match_liblerc_decode_hashes() {
             }
             5 => {
                 let raster: ArrayD<u16> = lerc_reader::decode_ndarray(&blob).unwrap();
+                let (byte_len, hash) = reference::array_hash(&raster);
+                assert_eq!(
+                    byte_len,
+                    reference_json["pixel_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(hash, reference_json["pixel_hash"].as_str().unwrap());
+            }
+            6 => {
+                let raster: ArrayD<i8> = lerc_reader::decode_ndarray(&blob).unwrap();
+                let (byte_len, hash) = reference::array_hash(&raster);
+                assert_eq!(
+                    byte_len,
+                    reference_json["pixel_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(hash, reference_json["pixel_hash"].as_str().unwrap());
+            }
+            7 => {
+                let raster: ArrayD<f64> = lerc_reader::decode_ndarray(&blob).unwrap();
                 let (byte_len, hash) = reference::array_hash(&raster);
                 assert_eq!(
                     byte_len,

@@ -85,6 +85,30 @@ fn selects_huffman_for_repeated_lossless_u8_data() {
 }
 
 #[test]
+fn roundtrips_signed_huffman_i8_data() {
+    let pixels: Vec<i8> = (0..256)
+        .map(|index| if index % 32 < 24 { -7 } else { 11 })
+        .collect();
+    let raster = RasterView::new(16, 16, 1, &pixels).unwrap();
+    let options = EncodeOptions {
+        max_z_error: 0.5,
+        micro_block_size: 1,
+    };
+
+    let blob = encode(raster, None, options).unwrap();
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+    let offset = body_offset(&blob, &info);
+
+    assert_eq!(info.version, lerc_core::Version::Lerc2(4));
+    assert_eq!(blob[offset], 0);
+    assert_ne!(blob[offset + 1], 0);
+    assert_eq!(
+        lerc_reader::decode(&blob).unwrap().pixels,
+        lerc_core::PixelData::I8(pixels)
+    );
+}
+
+#[test]
 fn selects_v5_diff_tiles_for_lossless_depth_data() {
     let mut pixels = Vec::new();
     for value in 0u16..8 {
@@ -108,6 +132,24 @@ fn selects_v5_diff_tiles_for_lossless_depth_data() {
         lerc_reader::decode(&blob).unwrap().pixels,
         lerc_core::PixelData::U16(pixels)
     );
+}
+
+#[test]
+fn roundtrips_lossless_f64_raster() {
+    let pixels = vec![1.25f64, -2.5, 3.75, 4.5, -5.25, 6.0];
+    let raster = RasterView::new(3, 2, 1, &pixels).unwrap();
+    let blob = encode(
+        raster,
+        None,
+        EncodeOptions {
+            max_z_error: 0.0,
+            micro_block_size: 1,
+        },
+    )
+    .unwrap();
+
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    assert_eq!(decoded.pixels, lerc_core::PixelData::F64(pixels));
 }
 
 #[test]

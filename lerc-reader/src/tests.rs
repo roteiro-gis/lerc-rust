@@ -3,112 +3,13 @@ use ndarray::IxDyn;
 use crate::*;
 use lerc_core::{BandLayout, DataType, Error, MaskEncoding, PixelData, Version};
 
-#[allow(clippy::too_many_arguments)]
-fn build_header_v2(
-    width: u32,
-    height: u32,
-    valid_pixel_count: u32,
-    image_type: i32,
-    max_z_error: f64,
-    z_min: f64,
-    z_max: f64,
-    payload_len: usize,
-) -> Vec<u8> {
-    let blob_size = 58 + 4 + payload_len;
-    let mut bytes = Vec::with_capacity(blob_size);
-    bytes.extend_from_slice(b"Lerc2 ");
-    bytes.extend_from_slice(&2i32.to_le_bytes());
-    bytes.extend_from_slice(&height.to_le_bytes());
-    bytes.extend_from_slice(&width.to_le_bytes());
-    bytes.extend_from_slice(&valid_pixel_count.to_le_bytes());
-    bytes.extend_from_slice(&8i32.to_le_bytes());
-    bytes.extend_from_slice(&(blob_size as i32).to_le_bytes());
-    bytes.extend_from_slice(&image_type.to_le_bytes());
-    bytes.extend_from_slice(&max_z_error.to_le_bytes());
-    bytes.extend_from_slice(&z_min.to_le_bytes());
-    bytes.extend_from_slice(&z_max.to_le_bytes());
-    bytes
-}
+#[path = "../../test-support/lerc_test.rs"]
+mod lerc_test;
 
-#[allow(clippy::too_many_arguments)]
-fn build_header_v6(
-    width: u32,
-    height: u32,
-    depth: u32,
-    valid_pixel_count: u32,
-    image_type: i32,
-    max_z_error: f64,
-    z_min: f64,
-    z_max: f64,
-    internal_no_data_value: f64,
-    original_no_data_value: f64,
-    payload_len: usize,
-) -> Vec<u8> {
-    let blob_size = 90 + 4 + payload_len;
-    let mut bytes = Vec::with_capacity(blob_size);
-    bytes.extend_from_slice(b"Lerc2 ");
-    bytes.extend_from_slice(&6i32.to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    bytes.extend_from_slice(&height.to_le_bytes());
-    bytes.extend_from_slice(&width.to_le_bytes());
-    bytes.extend_from_slice(&depth.to_le_bytes());
-    bytes.extend_from_slice(&valid_pixel_count.to_le_bytes());
-    bytes.extend_from_slice(&8i32.to_le_bytes());
-    bytes.extend_from_slice(&(blob_size as i32).to_le_bytes());
-    bytes.extend_from_slice(&image_type.to_le_bytes());
-    bytes.extend_from_slice(&0i32.to_le_bytes());
-    bytes.push(1);
-    bytes.push(0);
-    bytes.push(0);
-    bytes.push(0);
-    bytes.extend_from_slice(&max_z_error.to_le_bytes());
-    bytes.extend_from_slice(&z_min.to_le_bytes());
-    bytes.extend_from_slice(&z_max.to_le_bytes());
-    bytes.extend_from_slice(&internal_no_data_value.to_le_bytes());
-    bytes.extend_from_slice(&original_no_data_value.to_le_bytes());
-    bytes
-}
-
-fn finalize_v4_with_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
-    let blob_size = bytes.len() as i32;
-    bytes[34..38].copy_from_slice(&blob_size.to_le_bytes());
-    let checksum = crate::pixel::fletcher32(&bytes[14..blob_size as usize]);
-    bytes[10..14].copy_from_slice(&checksum.to_le_bytes());
-    bytes
-}
-
-fn encode_mask_rle(mask: &[u8]) -> Vec<u8> {
-    let bitset_len = mask.len().div_ceil(8);
-    let mut bitset = vec![0u8; bitset_len];
-    for (index, &value) in mask.iter().enumerate() {
-        if value != 0 {
-            bitset[index >> 3] |= 1 << (7 - (index & 7));
-        }
-    }
-
-    let mut encoded = Vec::with_capacity(bitset_len + 4);
-    encoded.extend_from_slice(&(bitset_len as i16).to_le_bytes());
-    encoded.extend_from_slice(&bitset);
-    encoded.extend_from_slice(&i16::MIN.to_le_bytes());
-    encoded
-}
-
-fn pack_msb_bits(values: &[u32], bits_per_pixel: u8) -> Vec<u8> {
-    let total_bits = values.len() * usize::from(bits_per_pixel);
-    let mut bytes = vec![0u8; total_bits.div_ceil(8)];
-    let mut bit_offset = 0usize;
-    for &value in values {
-        for bit in (0..bits_per_pixel).rev() {
-            if ((value >> bit) & 1) != 0 {
-                let byte_index = bit_offset / 8;
-                let bit_index = 7 - (bit_offset % 8);
-                bytes[byte_index] |= 1 << bit_index;
-            }
-            bit_offset += 1;
-        }
-    }
-    bytes
-}
+use lerc_test::{
+    build_header_v2, build_header_v6, encode_mask_rle, finalize_lerc2_with_checksum, pack_msb_bits,
+    HeaderV2, HeaderV6,
+};
 
 fn build_lerc1_blob(
     include_mask_header: bool,
@@ -169,7 +70,16 @@ fn build_lerc1_blob(
 
 #[test]
 fn reads_blob_info_for_constant_lerc2() {
-    let mut blob = build_header_v2(3, 2, 6, 3, 0.0, 7.0, 7.0, 0);
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 3,
+        height: 2,
+        valid_pixel_count: 6,
+        image_type: 3,
+        max_z_error: 0.0,
+        z_min: 7.0,
+        z_max: 7.0,
+        payload_len: 0,
+    });
     blob.extend_from_slice(&0u32.to_le_bytes());
 
     let info = get_blob_info(&blob).unwrap();
@@ -182,7 +92,16 @@ fn reads_blob_info_for_constant_lerc2() {
 
 #[test]
 fn decodes_constant_surface() {
-    let mut blob = build_header_v2(2, 2, 4, 1, 0.0, 9.0, 9.0, 0);
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 2,
+        height: 2,
+        valid_pixel_count: 4,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 9.0,
+        z_max: 9.0,
+        payload_len: 0,
+    });
     blob.extend_from_slice(&0u32.to_le_bytes());
 
     let decoded = decode(&blob).unwrap();
@@ -192,7 +111,16 @@ fn decodes_constant_surface() {
 
 #[test]
 fn decodes_one_sweep_all_valid() {
-    let mut blob = build_header_v2(2, 2, 4, 1, 0.0, 1.0, 4.0, 1 + 4);
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 2,
+        height: 2,
+        valid_pixel_count: 4,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 1.0,
+        z_max: 4.0,
+        payload_len: 1 + 4,
+    });
     blob.extend_from_slice(&0u32.to_le_bytes());
     blob.push(1);
     blob.extend_from_slice(&[1, 2, 3, 4]);
@@ -223,7 +151,7 @@ fn decodes_external_mask_lerc2_via_single_blob_with_mask_apis() {
     bytes.push(1);
     bytes.extend_from_slice(&[1, 2, 3]);
 
-    let blob = finalize_v4_with_checksum(bytes);
+    let blob = finalize_lerc2_with_checksum(bytes);
     let external_mask = [1u8, 0, 1, 1];
 
     assert!(matches!(decode(&blob), Err(Error::UnsupportedFeature(_))));
@@ -288,26 +216,26 @@ fn decodes_external_mask_lerc2_via_single_blob_with_mask_apis() {
 fn decodes_lerc2_v6_no_data_values_without_public_ranges() {
     let internal_no_data = -7777.0f64;
     let original_no_data = -9999.0f64;
-    let mut bytes = build_header_v6(
-        1,
-        1,
-        2,
-        1,
-        6,
-        0.0,
-        internal_no_data,
-        5.0,
-        internal_no_data,
-        original_no_data,
-        16,
-    );
+    let mut bytes = build_header_v6(HeaderV6 {
+        width: 1,
+        height: 1,
+        depth: 2,
+        valid_pixel_count: 1,
+        image_type: 6,
+        max_z_error: 0.0,
+        z_min: internal_no_data,
+        z_max: 5.0,
+        internal_no_data_value: internal_no_data,
+        original_no_data_value: original_no_data,
+        payload_len: 16,
+    });
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&5.0f32.to_le_bytes());
     bytes.extend_from_slice(&(internal_no_data as f32).to_le_bytes());
     bytes.extend_from_slice(&5.0f32.to_le_bytes());
     bytes.extend_from_slice(&(internal_no_data as f32).to_le_bytes());
 
-    let blob = finalize_v4_with_checksum(bytes);
+    let blob = finalize_lerc2_with_checksum(bytes);
 
     let info = get_blob_info(&blob).unwrap();
     assert_eq!(info.version, Version::Lerc2(6));
@@ -368,16 +296,34 @@ fn decodes_constant_surface_with_per_depth_ranges() {
     bytes.extend_from_slice(&10.0f32.to_le_bytes());
     bytes.extend_from_slice(&20.0f32.to_le_bytes());
 
-    let blob = finalize_v4_with_checksum(bytes);
+    let blob = finalize_lerc2_with_checksum(bytes);
     let decoded = decode(&blob).unwrap();
     assert_eq!(decoded.pixels, PixelData::F32(vec![10.0, 20.0, 10.0, 20.0]));
 }
 
 #[test]
 fn counts_concatenated_bands() {
-    let mut blob1 = build_header_v2(1, 1, 1, 1, 0.0, 3.0, 3.0, 0);
+    let mut blob1 = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 3.0,
+        z_max: 3.0,
+        payload_len: 0,
+    });
     blob1.extend_from_slice(&0u32.to_le_bytes());
-    let mut blob2 = build_header_v2(1, 1, 1, 1, 0.0, 4.0, 4.0, 0);
+    let mut blob2 = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 4.0,
+        z_max: 4.0,
+        payload_len: 0,
+    });
     blob2.extend_from_slice(&0u32.to_le_bytes());
 
     let mut merged = blob1;
@@ -420,7 +366,16 @@ fn counts_concatenated_lerc1_bands_with_shared_mask() {
 
 #[test]
 fn decodes_lerc2_to_ndarray() {
-    let mut blob = build_header_v2(2, 2, 4, 1, 0.0, 1.0, 4.0, 1 + 4);
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 2,
+        height: 2,
+        valid_pixel_count: 4,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 1.0,
+        z_max: 4.0,
+        payload_len: 1 + 4,
+    });
     blob.extend_from_slice(&0u32.to_le_bytes());
     blob.push(1);
     blob.extend_from_slice(&[1, 2, 3, 4]);
@@ -455,7 +410,7 @@ fn decodes_multidimensional_lerc2_to_f64_ndarray() {
     bytes.extend_from_slice(&10.0f32.to_le_bytes());
     bytes.extend_from_slice(&20.0f32.to_le_bytes());
 
-    let blob = finalize_v4_with_checksum(bytes);
+    let blob = finalize_lerc2_with_checksum(bytes);
     let array = decode_ndarray_f64(&blob).unwrap();
     assert_eq!(array.shape(), &[1, 2, 2]);
     assert_eq!(array[IxDyn(&[0, 0, 0])], 10.0);
@@ -478,9 +433,27 @@ fn decodes_lerc1_mask_to_ndarray() {
 
 #[test]
 fn strict_single_blob_apis_reject_trailing_bytes() {
-    let mut blob1 = build_header_v2(1, 1, 1, 1, 0.0, 3.0, 3.0, 0);
+    let mut blob1 = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 3.0,
+        z_max: 3.0,
+        payload_len: 0,
+    });
     blob1.extend_from_slice(&0u32.to_le_bytes());
-    let mut blob2 = build_header_v2(1, 1, 1, 1, 0.0, 4.0, 4.0, 0);
+    let mut blob2 = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 4.0,
+        z_max: 4.0,
+        payload_len: 0,
+    });
     blob2.extend_from_slice(&0u32.to_le_bytes());
     let mut merged = blob1.clone();
     merged.extend_from_slice(&blob2);
@@ -502,11 +475,29 @@ fn strict_single_blob_apis_reject_trailing_bytes() {
 
 #[test]
 fn decode_band_set_into_supports_bsq_layout() {
-    let mut blob1 = build_header_v2(1, 2, 2, 1, 0.0, 1.0, 2.0, 1 + 2);
+    let mut blob1 = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 2,
+        valid_pixel_count: 2,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 1.0,
+        z_max: 2.0,
+        payload_len: 1 + 2,
+    });
     blob1.extend_from_slice(&0u32.to_le_bytes());
     blob1.push(1);
     blob1.extend_from_slice(&[1, 2]);
-    let mut blob2 = build_header_v2(1, 2, 2, 1, 0.0, 3.0, 4.0, 1 + 2);
+    let mut blob2 = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 2,
+        valid_pixel_count: 2,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 3.0,
+        z_max: 4.0,
+        payload_len: 1 + 2,
+    });
     blob2.extend_from_slice(&0u32.to_le_bytes());
     blob2.push(1);
     blob2.extend_from_slice(&[3, 4]);
@@ -522,11 +513,29 @@ fn decode_band_set_into_supports_bsq_layout() {
 
 #[test]
 fn decode_band_set_ndarray_f64_promotes_concatenated_bands_directly() {
-    let mut blob1 = build_header_v2(1, 2, 2, 1, 0.0, 1.0, 2.0, 1 + 2);
+    let mut blob1 = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 2,
+        valid_pixel_count: 2,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 1.0,
+        z_max: 2.0,
+        payload_len: 1 + 2,
+    });
     blob1.extend_from_slice(&0u32.to_le_bytes());
     blob1.push(1);
     blob1.extend_from_slice(&[1, 2]);
-    let mut blob2 = build_header_v2(1, 2, 2, 1, 0.0, 3.0, 4.0, 1 + 2);
+    let mut blob2 = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 2,
+        valid_pixel_count: 2,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 3.0,
+        z_max: 4.0,
+        payload_len: 1 + 2,
+    });
     blob2.extend_from_slice(&0u32.to_le_bytes());
     blob2.push(1);
     blob2.extend_from_slice(&[3, 4]);

@@ -21,6 +21,17 @@ pub fn fixture(manifest_dir: &str, relative_path: &str) -> PathBuf {
         .join(relative_path)
 }
 
+pub fn write_temp_bytes(prefix: &str, extension: &str, bytes: &[u8]) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("{prefix}-{nanos}.{extension}"));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
 pub fn helper_path() -> Option<PathBuf> {
     static HELPER: OnceLock<Option<PathBuf>> = OnceLock::new();
     HELPER
