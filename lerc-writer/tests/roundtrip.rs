@@ -4,6 +4,22 @@ use lerc_writer::{
     encoded_len_upper_bound, EncodeOptions,
 };
 
+fn body_offset(blob: &[u8], info: &lerc_core::BlobInfo) -> usize {
+    let header_len = match info.version {
+        lerc_core::Version::Lerc2(version) if version >= 6 => 90,
+        lerc_core::Version::Lerc2(_) => 66,
+        lerc_core::Version::Lerc1(_) => unreachable!("writer only emits Lerc2"),
+    };
+    let mask_num_bytes =
+        u32::from_le_bytes(blob[header_len..header_len + 4].try_into().unwrap()) as usize;
+    let range_len = info
+        .min_values
+        .as_ref()
+        .map(|_| info.depth as usize * 2 * info.data_type.byte_len())
+        .unwrap_or(0);
+    header_len + 4 + mask_num_bytes + range_len
+}
+
 #[test]
 fn roundtrips_constant_u16_raster() {
     let pixels = vec![9u16; 6];
@@ -21,6 +37,77 @@ fn roundtrips_constant_u16_raster() {
     let decoded = lerc_reader::decode(&blob).unwrap();
     assert_eq!(decoded.pixels, lerc_core::PixelData::U16(pixels));
     assert_eq!(decoded.mask, None);
+}
+
+#[test]
+fn selects_one_sweep_when_tile_headers_would_dominate() {
+    let pixels = vec![5u16, 9, 6, 10];
+    let raster = RasterView::new(2, 2, 1, &pixels).unwrap();
+    let options = EncodeOptions {
+        max_z_error: 0.0,
+        micro_block_size: 1,
+    };
+
+    let blob = encode(raster, None, options).unwrap();
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+    let offset = body_offset(&blob, &info);
+
+    assert_eq!(info.version, lerc_core::Version::Lerc2(4));
+    assert_eq!(blob[offset], 1);
+    assert_eq!(
+        lerc_reader::decode(&blob).unwrap().pixels,
+        lerc_core::PixelData::U16(pixels)
+    );
+}
+
+#[test]
+fn selects_huffman_for_repeated_lossless_u8_data() {
+    let pixels: Vec<u8> = (0..256)
+        .map(|index| if index % 64 < 48 { 7 } else { 9 })
+        .collect();
+    let raster = RasterView::new(16, 16, 1, &pixels).unwrap();
+    let options = EncodeOptions {
+        max_z_error: 0.5,
+        micro_block_size: 1,
+    };
+
+    let blob = encode(raster, None, options).unwrap();
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+    let offset = body_offset(&blob, &info);
+
+    assert_eq!(info.version, lerc_core::Version::Lerc2(4));
+    assert_eq!(blob[offset], 0);
+    assert_ne!(blob[offset + 1], 0);
+    assert_eq!(
+        lerc_reader::decode(&blob).unwrap().pixels,
+        lerc_core::PixelData::U8(pixels)
+    );
+}
+
+#[test]
+fn selects_v5_diff_tiles_for_lossless_depth_data() {
+    let mut pixels = Vec::new();
+    for value in 0u16..8 {
+        pixels.push(value);
+        pixels.push(value);
+    }
+    let raster = RasterView::new(4, 2, 2, &pixels).unwrap();
+    let options = EncodeOptions {
+        max_z_error: 0.5,
+        micro_block_size: 8,
+    };
+
+    let blob = encode(raster, None, options).unwrap();
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+    let offset = body_offset(&blob, &info);
+
+    assert_eq!(info.version, lerc_core::Version::Lerc2(5));
+    assert_eq!(blob[offset], 0);
+    assert_ne!(blob[offset + 8] & 4, 0);
+    assert_eq!(
+        lerc_reader::decode(&blob).unwrap().pixels,
+        lerc_core::PixelData::U16(pixels)
+    );
 }
 
 #[test]

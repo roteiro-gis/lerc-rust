@@ -63,10 +63,52 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     )
     .unwrap();
 
+    let one_sweep_pixels = vec![5u16, 9, 6, 10];
+    let one_sweep_blob = lerc_writer::encode(
+        lerc_core::RasterView::new(2, 2, 1, &one_sweep_pixels).unwrap(),
+        None,
+        lerc_writer::EncodeOptions {
+            max_z_error: 0.0,
+            micro_block_size: 1,
+        },
+    )
+    .unwrap();
+
+    let huffman_pixels: Vec<u8> = (0..256)
+        .map(|index| if index % 64 < 48 { 7 } else { 9 })
+        .collect();
+    let huffman_blob = lerc_writer::encode(
+        lerc_core::RasterView::new(16, 16, 1, &huffman_pixels).unwrap(),
+        None,
+        lerc_writer::EncodeOptions {
+            max_z_error: 0.5,
+            micro_block_size: 1,
+        },
+    )
+    .unwrap();
+
+    let mut diff_pixels = Vec::new();
+    for value in 0u16..8 {
+        diff_pixels.push(value);
+        diff_pixels.push(value);
+    }
+    let diff_blob = lerc_writer::encode(
+        lerc_core::RasterView::new(4, 2, 2, &diff_pixels).unwrap(),
+        None,
+        lerc_writer::EncodeOptions {
+            max_z_error: 0.5,
+            micro_block_size: 8,
+        },
+    )
+    .unwrap();
+
     for (name, blob, kind) in [
         ("u8-bitstuff", u8_blob, 0u8),
         ("f32-depth-mask", f32_blob, 1u8),
         ("u8-band-set-shared-mask", band_set_blob, 2u8),
+        ("u16-one-sweep", one_sweep_blob, 3u8),
+        ("u8-huffman", huffman_blob, 4u8),
+        ("u16-v5-diff", diff_blob, 5u8),
     ] {
         let path = write_temp_blob(name, &blob);
         let reference_json =
@@ -118,6 +160,33 @@ fn generated_blobs_match_liblerc_decode_hashes() {
                     reference_json["mask_byte_len"].as_u64().unwrap() as usize
                 );
                 assert_eq!(mask_hash, reference_json["mask_hash"].as_str().unwrap());
+            }
+            3 => {
+                let raster: ArrayD<u16> = lerc_reader::decode_ndarray(&blob).unwrap();
+                let (byte_len, hash) = reference::array_hash(&raster);
+                assert_eq!(
+                    byte_len,
+                    reference_json["pixel_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(hash, reference_json["pixel_hash"].as_str().unwrap());
+            }
+            4 => {
+                let raster: ArrayD<u8> = lerc_reader::decode_ndarray(&blob).unwrap();
+                let (byte_len, hash) = reference::array_hash(&raster);
+                assert_eq!(
+                    byte_len,
+                    reference_json["pixel_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(hash, reference_json["pixel_hash"].as_str().unwrap());
+            }
+            5 => {
+                let raster: ArrayD<u16> = lerc_reader::decode_ndarray(&blob).unwrap();
+                let (byte_len, hash) = reference::array_hash(&raster);
+                assert_eq!(
+                    byte_len,
+                    reference_json["pixel_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(hash, reference_json["pixel_hash"].as_str().unwrap());
             }
             _ => unreachable!(),
         }
