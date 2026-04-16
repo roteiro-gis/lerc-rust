@@ -954,29 +954,30 @@ fn plan_tiled_body<T: Sample, R: RasterSource<T>>(
                         Error::InvalidArgument("tile payload length overflows usize".into())
                     })?;
 
-                if diff_supported && dim > 0 {
-                    if build_diff_values(
+                if diff_supported
+                    && dim > 0
+                    && build_diff_values(
                         &scratch.values_f64,
                         &scratch.prev_values_f64,
                         &mut scratch.diff_values_f64,
+                    )?
+                {
+                    if let Some(diff_plan) = choose_diff_block_plan(
+                        &scratch.diff_values_f64,
+                        analysis.max_z_error,
+                        &mut scratch.quantized,
+                        &mut scratch.bitstuff_payload,
                     )? {
-                        if let Some(diff_plan) = choose_diff_block_plan(
-                            &scratch.diff_values_f64,
-                            analysis.max_z_error,
-                            &mut scratch.quantized,
-                            &mut scratch.bitstuff_payload,
-                        )? {
-                            if diff_plan.encoded_len() < absolute_plan.encoded_len() {
-                                version5_len = version5_len
-                                    .checked_sub(absolute_plan.encoded_len())
-                                    .and_then(|len| len.checked_add(diff_plan.encoded_len()))
-                                    .ok_or_else(|| {
-                                        Error::InvalidArgument(
-                                            "tile payload length overflows usize".into(),
-                                        )
-                                    })?;
-                                used_diff = true;
-                            }
+                        if diff_plan.encoded_len() < absolute_plan.encoded_len() {
+                            version5_len = version5_len
+                                .checked_sub(absolute_plan.encoded_len())
+                                .and_then(|len| len.checked_add(diff_plan.encoded_len()))
+                                .ok_or_else(|| {
+                                    Error::InvalidArgument(
+                                        "tile payload length overflows usize".into(),
+                                    )
+                                })?;
+                            used_diff = true;
                         }
                     }
                 }
@@ -1086,22 +1087,23 @@ fn write_tiled_body<T: Sample, R: RasterSource<T>>(
 
                 let mut chosen_plan = absolute_plan.clone();
                 let mut chose_diff = false;
-                if diff_supported && dim > 0 {
-                    if build_diff_values(
+                if diff_supported
+                    && dim > 0
+                    && build_diff_values(
                         &scratch.values_f64,
                         &scratch.prev_values_f64,
                         &mut scratch.diff_values_f64,
+                    )?
+                {
+                    if let Some(diff_plan) = choose_diff_block_plan(
+                        &scratch.diff_values_f64,
+                        analysis.max_z_error,
+                        &mut scratch.quantized,
+                        &mut scratch.bitstuff_payload,
                     )? {
-                        if let Some(diff_plan) = choose_diff_block_plan(
-                            &scratch.diff_values_f64,
-                            analysis.max_z_error,
-                            &mut scratch.quantized,
-                            &mut scratch.bitstuff_payload,
-                        )? {
-                            if diff_plan.encoded_len() < absolute_plan.encoded_len() {
-                                chosen_plan = diff_plan;
-                                chose_diff = true;
-                            }
+                        if diff_plan.encoded_len() < absolute_plan.encoded_len() {
+                            chosen_plan = diff_plan;
+                            chose_diff = true;
                         }
                     }
                 }
@@ -1622,10 +1624,10 @@ fn write_raw_bitstuff_block(out: &mut Vec<u8>, values: &[u32]) -> Result<()> {
         ));
     }
     let (count_code, count_bytes) = count_field(values.len())?;
-    out.push((count_code << 6) | (bits as u8));
+    out.push((count_code << 6) | bits);
     append_count(out, values.len(), count_bytes)?;
     if bits != 0 {
-        pack_lsb_bits_into(values, bits as u8, out);
+        pack_lsb_bits_into(values, bits, out);
     }
     Ok(())
 }
@@ -1687,9 +1689,9 @@ fn try_bitstuff_tile(
     let (type_code, offset_type) = reduce_data_type(offset, base_type)?;
     payload.clear();
     payload.reserve(1 + count_bytes + (values.len() * bits as usize).div_ceil(8));
-    payload.push((count_code << 6) | bits as u8);
+    payload.push((count_code << 6) | bits);
     append_count(payload, values.len(), count_bytes)?;
-    pack_lsb_bits_into(quantized, bits as u8, payload);
+    pack_lsb_bits_into(quantized, bits, payload);
     Ok(Some(BitstuffTile {
         offset,
         offset_type,
