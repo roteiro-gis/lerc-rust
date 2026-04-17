@@ -10,6 +10,7 @@
 //! - decode a single blob with [`decode`]
 //! - decode only the first blob with [`decode_first`]
 //! - decode concatenated band sets with [`decode_band_set`]
+//! - seed a first-band external mask with the band-set `*_with_mask` variants
 //! - decode promoted `f64` buffers with [`decode_to_f64`]
 //! - decode only the first promoted `f64` blob with [`decode_first_to_f64`]
 //! - decode directly into `ndarray::ArrayD` with [`decode_ndarray`]
@@ -158,12 +159,99 @@ pub fn decode_with_mask(blob: &[u8], mask: &[u8]) -> Result<Decoded> {
 }
 
 pub fn decode_band_set(blob: &[u8]) -> Result<DecodedBandSet> {
+    decode_band_set_with_lerc2_mask(blob, None)
+}
+
+pub fn decode_band_set_with_mask(blob: &[u8], mask: &[u8]) -> Result<DecodedBandSet> {
+    decode_band_set_with_lerc2_mask(blob, Some(mask))
+}
+
+pub fn decode_band_set_vec<T: BandElement>(
+    blob: &[u8],
+    layout: BandLayout,
+) -> Result<(BandSetInfo, Vec<T>)> {
+    decode_band_set_owned(blob, layout, None)
+}
+
+pub fn decode_band_set_vec_with_mask<T: BandElement>(
+    blob: &[u8],
+    mask: &[u8],
+    layout: BandLayout,
+) -> Result<(BandSetInfo, Vec<T>)> {
+    decode_band_set_owned(blob, layout, Some(mask))
+}
+
+pub fn decode_band_set_into<T: BandElement>(
+    blob: &[u8],
+    layout: BandLayout,
+    out: &mut [T],
+) -> Result<BandSetInfo> {
+    decode_band_set_into_direct(blob, layout, None, out)
+}
+
+pub fn decode_band_set_into_with_mask<T: BandElement>(
+    blob: &[u8],
+    mask: &[u8],
+    layout: BandLayout,
+    out: &mut [T],
+) -> Result<BandSetInfo> {
+    decode_band_set_into_direct(blob, layout, Some(mask), out)
+}
+
+pub fn decode_band_set_ndarray<T: BandElement>(blob: &[u8]) -> Result<ArrayD<T>> {
+    decode_band_set_ndarray_with_layout(blob, BandLayout::Interleaved)
+}
+
+pub fn decode_band_set_ndarray_with_mask<T: BandElement>(
+    blob: &[u8],
+    mask: &[u8],
+) -> Result<ArrayD<T>> {
+    decode_band_set_ndarray_with_layout_and_mask(blob, BandLayout::Interleaved, mask)
+}
+
+pub fn decode_band_set_ndarray_with_layout<T: BandElement>(
+    blob: &[u8],
+    layout: BandLayout,
+) -> Result<ArrayD<T>> {
+    decode_band_set_ndarray_with_layout_impl(blob, layout, None)
+}
+
+pub fn decode_band_set_ndarray_with_layout_and_mask<T: BandElement>(
+    blob: &[u8],
+    layout: BandLayout,
+    mask: &[u8],
+) -> Result<ArrayD<T>> {
+    decode_band_set_ndarray_with_layout_impl(blob, layout, Some(mask))
+}
+
+pub fn decode_band_set_ndarray_f64(blob: &[u8]) -> Result<ArrayD<f64>> {
+    decode_band_set_ndarray_f64_with_optional_mask(blob, None)
+}
+
+pub fn decode_band_set_ndarray_f64_with_mask(blob: &[u8], mask: &[u8]) -> Result<ArrayD<f64>> {
+    decode_band_set_ndarray_f64_with_optional_mask(blob, Some(mask))
+}
+
+pub fn decode_band_mask_ndarray(blob: &[u8]) -> Result<Option<ArrayD<u8>>> {
+    let (info, band_masks) = inspect_band_masks(blob, None)?;
+    into_band_mask_ndarray(info, band_masks)
+}
+
+pub fn decode_band_mask_ndarray_with_mask(blob: &[u8], mask: &[u8]) -> Result<Option<ArrayD<u8>>> {
+    let (info, band_masks) = inspect_band_masks(blob, Some(mask))?;
+    into_band_mask_ndarray(info, band_masks)
+}
+
+fn decode_band_set_with_lerc2_mask(
+    blob: &[u8],
+    initial_lerc2_mask: Option<&[u8]>,
+) -> Result<DecodedBandSet> {
     let mut offset = 0usize;
     let mut bands = Vec::new();
     let mut infos = Vec::new();
     let mut band_masks = Vec::new();
     let mut lerc1_mask: Option<Vec<u8>> = None;
-    let mut lerc2_mask: Option<Vec<u8>> = None;
+    let mut lerc2_mask = initial_lerc2_mask.map(|mask| mask.to_vec());
 
     while offset < blob.len() {
         let decoded = decode_first_with_masks(
@@ -193,30 +281,12 @@ pub fn decode_band_set(blob: &[u8]) -> Result<DecodedBandSet> {
     })
 }
 
-pub fn decode_band_set_vec<T: BandElement>(
+fn decode_band_set_ndarray_with_layout_impl<T: BandElement>(
     blob: &[u8],
     layout: BandLayout,
-) -> Result<(BandSetInfo, Vec<T>)> {
-    decode_band_set_owned(blob, layout)
-}
-
-pub fn decode_band_set_into<T: BandElement>(
-    blob: &[u8],
-    layout: BandLayout,
-    out: &mut [T],
-) -> Result<BandSetInfo> {
-    decode_band_set_into_direct(blob, layout, out)
-}
-
-pub fn decode_band_set_ndarray<T: BandElement>(blob: &[u8]) -> Result<ArrayD<T>> {
-    decode_band_set_ndarray_with_layout(blob, BandLayout::Interleaved)
-}
-
-pub fn decode_band_set_ndarray_with_layout<T: BandElement>(
-    blob: &[u8],
-    layout: BandLayout,
+    initial_lerc2_mask: Option<&[u8]>,
 ) -> Result<ArrayD<T>> {
-    let (info, values) = decode_band_set_owned(blob, layout)?;
+    let (info, values) = decode_band_set_owned(blob, layout, initial_lerc2_mask)?;
     let shape = info.ndarray_shape_for_layout(layout);
     ArrayD::from_shape_vec(ndarray::IxDyn(&shape), values).map_err(|e| {
         Error::InvalidBlob(format!(
@@ -225,8 +295,11 @@ pub fn decode_band_set_ndarray_with_layout<T: BandElement>(
     })
 }
 
-pub fn decode_band_set_ndarray_f64(blob: &[u8]) -> Result<ArrayD<f64>> {
-    let band_info = decode_band_set_to_f64_info(blob, BandLayout::Interleaved)?;
+fn decode_band_set_ndarray_f64_with_optional_mask(
+    blob: &[u8],
+    initial_lerc2_mask: Option<&[u8]>,
+) -> Result<ArrayD<f64>> {
+    let band_info = decode_band_set_to_f64_info(blob, BandLayout::Interleaved, initial_lerc2_mask)?;
     let shape = band_info
         .0
         .ndarray_shape_for_layout(BandLayout::Interleaved);
@@ -235,11 +308,6 @@ pub fn decode_band_set_ndarray_f64(blob: &[u8]) -> Result<ArrayD<f64>> {
             "failed to build ndarray from decoded band set: {e}"
         ))
     })
-}
-
-pub fn decode_band_mask_ndarray(blob: &[u8]) -> Result<Option<ArrayD<u8>>> {
-    let (info, band_masks) = inspect_band_masks(blob)?;
-    into_band_mask_ndarray(info, band_masks)
 }
 
 pub fn decode_to_f64(blob: &[u8]) -> Result<DecodedF64> {
@@ -359,18 +427,25 @@ fn decode_first_f64_with_masks(
 fn decode_band_set_owned<T: BandElement>(
     blob: &[u8],
     layout: BandLayout,
+    initial_lerc2_mask: Option<&[u8]>,
 ) -> Result<(BandSetInfo, Vec<T>)> {
     let band_info = scan_band_infos(blob)?;
-    decode_band_set_owned_direct(blob, layout, band_info)
+    decode_band_set_owned_direct(blob, layout, band_info, initial_lerc2_mask)
 }
 
 fn decode_band_set_into_direct<T: BandElement>(
     blob: &[u8],
     layout: BandLayout,
+    initial_lerc2_mask: Option<&[u8]>,
     out: &mut [T],
 ) -> Result<BandSetInfo> {
     dispatch_band_element!(T, |Concrete| {
-        decode_band_set_into_impl::<Concrete>(blob, layout, cast_slice_mut::<T, Concrete>(out))
+        decode_band_set_into_impl::<Concrete>(
+            blob,
+            layout,
+            initial_lerc2_mask,
+            cast_slice_mut::<T, Concrete>(out),
+        )
     })
 }
 
@@ -378,9 +453,10 @@ fn decode_band_set_owned_direct<T: BandElement>(
     blob: &[u8],
     layout: BandLayout,
     band_info: BandSetInfo,
+    initial_lerc2_mask: Option<&[u8]>,
 ) -> Result<(BandSetInfo, Vec<T>)> {
     dispatch_band_element!(T, |Concrete| {
-        decode_band_set_owned_direct_impl::<Concrete>(blob, layout, band_info)
+        decode_band_set_owned_direct_impl::<Concrete>(blob, layout, band_info, initial_lerc2_mask)
             .map(|(info, values)| (info, cast_vec::<T, Concrete>(values)))
     })
 }
@@ -388,16 +464,18 @@ fn decode_band_set_owned_direct<T: BandElement>(
 fn decode_band_set_into_impl<T: Sample + NdArrayElement>(
     blob: &[u8],
     layout: BandLayout,
+    initial_lerc2_mask: Option<&[u8]>,
     out: &mut [T],
 ) -> Result<BandSetInfo> {
     let band_info = scan_band_infos(blob)?;
-    decode_band_set_into_impl_with_info(blob, layout, &band_info, out)?;
+    decode_band_set_into_impl_with_info(blob, layout, initial_lerc2_mask, &band_info, out)?;
     Ok(band_info)
 }
 
 fn decode_band_set_into_impl_with_info<T: Sample + NdArrayElement>(
     blob: &[u8],
     layout: BandLayout,
+    initial_lerc2_mask: Option<&[u8]>,
     band_info: &BandSetInfo,
     out: &mut [T],
 ) -> Result<()> {
@@ -416,7 +494,7 @@ fn decode_band_set_into_impl_with_info<T: Sample + NdArrayElement>(
     let mut offset = 0usize;
     let mut band_index = 0usize;
     let mut lerc1_mask: Option<Vec<u8>> = None;
-    let mut lerc2_mask: Option<Vec<u8>> = None;
+    let mut lerc2_mask = initial_lerc2_mask.map(|mask| mask.to_vec());
 
     while offset < blob.len() {
         let slice = &blob[offset..];
@@ -452,17 +530,24 @@ fn decode_band_set_into_impl_with_info<T: Sample + NdArrayElement>(
     Ok(())
 }
 
-fn decode_band_set_to_f64_info(blob: &[u8], layout: BandLayout) -> Result<(BandSetInfo, Vec<f64>)> {
+fn decode_band_set_to_f64_info(
+    blob: &[u8],
+    layout: BandLayout,
+    initial_lerc2_mask: Option<&[u8]>,
+) -> Result<(BandSetInfo, Vec<f64>)> {
     let band_info = scan_band_infos(blob)?;
-    decode_band_set_owned_direct_impl::<f64>(blob, layout, band_info)
+    decode_band_set_owned_direct_impl::<f64>(blob, layout, band_info, initial_lerc2_mask)
 }
 
-fn inspect_band_masks(blob: &[u8]) -> Result<(BandSetInfo, Vec<Option<Vec<u8>>>)> {
+fn inspect_band_masks(
+    blob: &[u8],
+    initial_lerc2_mask: Option<&[u8]>,
+) -> Result<(BandSetInfo, Vec<Option<Vec<u8>>>)> {
     let mut offset = 0usize;
     let mut infos = Vec::new();
     let mut band_masks = Vec::new();
     let mut lerc1_mask: Option<Vec<u8>> = None;
-    let mut lerc2_mask: Option<Vec<u8>> = None;
+    let mut lerc2_mask = initial_lerc2_mask.map(|mask| mask.to_vec());
 
     while offset < blob.len() {
         let slice = &blob[offset..];
@@ -565,6 +650,7 @@ fn decode_band_set_owned_direct_impl<T: Sample + NdArrayElement + Copy + Default
     blob: &[u8],
     layout: BandLayout,
     band_info: BandSetInfo,
+    initial_lerc2_mask: Option<&[u8]>,
 ) -> Result<(BandSetInfo, Vec<T>)> {
     let expected_len = band_info.value_count()?;
     if expected_len == 0 {
@@ -580,7 +666,7 @@ fn decode_band_set_owned_direct_impl<T: Sample + NdArrayElement + Copy + Default
     let mut offset = 0usize;
     let mut band_index = 0usize;
     let mut lerc1_mask: Option<Vec<u8>> = None;
-    let mut lerc2_mask: Option<Vec<u8>> = None;
+    let mut lerc2_mask = initial_lerc2_mask.map(|mask| mask.to_vec());
 
     while offset < blob.len() {
         let slice = &blob[offset..];
