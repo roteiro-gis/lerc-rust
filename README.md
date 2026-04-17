@@ -1,8 +1,8 @@
 # lerc-rust
 
-Pure-Rust LERC decoding for raster and elevation data. No C/C++ FFI, no build
-scripts, and a decoder-first API designed to be reused by container crates such
-as `geotiff-rust`.
+Pure-Rust LERC encoding and decoding for raster and elevation data. No C/C++
+FFI, no build scripts, and shared codec primitives designed to be reused by
+higher-level raster/container crates such as `geotiff-rust`.
 
 ## Crates
 
@@ -86,6 +86,9 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+For coordinated workspace publishes, see
+[docs/release-checklist.md](./docs/release-checklist.md).
 
 Interop fixtures are vendored in the repository under
 [`testdata/interoperability`](https://github.com/i-norden/lerc-rust/tree/main/testdata/interoperability).
