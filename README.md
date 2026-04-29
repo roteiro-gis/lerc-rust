@@ -1,5 +1,12 @@
 # lerc-rust
 
+[![lerc-core crates.io](https://img.shields.io/crates/v/lerc-core.svg)](https://crates.io/crates/lerc-core)
+[![lerc-core docs.rs](https://docs.rs/lerc-core/badge.svg)](https://docs.rs/lerc-core)
+[![lerc-reader crates.io](https://img.shields.io/crates/v/lerc-reader.svg)](https://crates.io/crates/lerc-reader)
+[![lerc-reader docs.rs](https://docs.rs/lerc-reader/badge.svg)](https://docs.rs/lerc-reader)
+[![lerc-writer crates.io](https://img.shields.io/crates/v/lerc-writer.svg)](https://crates.io/crates/lerc-writer)
+[![lerc-writer docs.rs](https://docs.rs/lerc-writer/badge.svg)](https://docs.rs/lerc-writer)
+
 Pure-Rust LERC encoding and decoding for raster and elevation data. No C/C++
 FFI, no build scripts, and shared codec primitives designed to be reused by
 higher-level raster/container crates such as `geotiff-rust`.
