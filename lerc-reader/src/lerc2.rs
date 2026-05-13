@@ -1209,15 +1209,17 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
 
                 match block_encoding {
                     2 => {
-                        if is_diff_encoding {
-                            for row in 0..this_block_height {
-                                let pixel_row = block_y * micro_block_size + row;
-                                for col in 0..this_block_width {
-                                    let pixel =
-                                        pixel_row * width + block_x * micro_block_size + col;
-                                    if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
-                                        out.write(pixel, dim, out.read(pixel, dim - 1));
-                                    }
+                        for row in 0..this_block_height {
+                            let pixel_row = block_y * micro_block_size + row;
+                            for col in 0..this_block_width {
+                                let pixel = pixel_row * width + block_x * micro_block_size + col;
+                                if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
+                                    let value = if is_diff_encoding {
+                                        out.read(pixel, dim - 1)
+                                    } else {
+                                        T::default()
+                                    };
+                                    out.write(pixel, dim, value);
                                 }
                             }
                         }

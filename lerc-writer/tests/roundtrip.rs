@@ -181,6 +181,45 @@ fn roundtrips_bitstuffed_u8_tiles_exactly() {
 }
 
 #[test]
+fn direct_band_set_apis_materialize_zero_tiles_from_writer_output() {
+    let width = 16usize;
+    let height = 8usize;
+    let mut pixels = vec![0u8; width * height];
+    for row in 0..height {
+        for col in 8..width {
+            pixels[row * width + col] = 7;
+        }
+    }
+
+    let raster = RasterView::new(width as u32, height as u32, 1, &pixels).unwrap();
+    let options = EncodeOptions {
+        max_z_error: 0.0,
+        micro_block_size: 8,
+    };
+    let blob = encode(raster, None, options).unwrap();
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+    let offset = body_offset(&blob, &info);
+
+    assert_eq!(blob[offset], 0);
+    assert_eq!(blob[offset + 1] & 3, 2);
+    assert_eq!(blob[offset + 2] & 3, 3);
+
+    let (vec_info, decoded_vec) =
+        lerc_reader::decode_band_set_vec::<u8>(&blob, BandLayout::Bsq).unwrap();
+    assert_eq!(vec_info.band_count(), 1);
+    assert_eq!(decoded_vec, pixels);
+
+    let array = lerc_reader::decode_band_set_ndarray::<u8>(&blob).unwrap();
+    assert_eq!(array.shape(), &[height, width]);
+    assert_eq!(array.iter().copied().collect::<Vec<_>>(), pixels);
+
+    let mut out = vec![99u8; pixels.len()];
+    let into_info = lerc_reader::decode_band_set_into(&blob, BandLayout::Bsq, &mut out).unwrap();
+    assert_eq!(into_info.band_count(), 1);
+    assert_eq!(out, pixels);
+}
+
+#[test]
 fn roundtrips_masked_f32_raster_with_depth() {
     let pixels = vec![
         10.0f32, 20.0, 11.0, 21.0, 12.0, 22.0, 13.0, 23.0, 14.0, 24.0, 15.0, 25.0,
