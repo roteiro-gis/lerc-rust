@@ -58,7 +58,7 @@ enum BodyPlan {
     Constant,
     PerDepthConstant,
     OneSweep,
-    Tiled,
+    Tiled(TilingPlan),
     Huffman(HuffmanPlan),
 }
 
@@ -849,15 +849,16 @@ fn write_body<T: Sample, R: RasterSource<T>>(
     match &analysis.plan.body {
         BodyPlan::Constant | BodyPlan::PerDepthConstant => Ok(()),
         BodyPlan::OneSweep => write_one_sweep_body(sink, raster, mask),
-        BodyPlan::Tiled => write_tiled_body(sink, scratch, raster, mask, analysis),
+        BodyPlan::Tiled(plan) => write_tiled_body(sink, scratch, raster, mask, analysis, plan),
         BodyPlan::Huffman(plan) => write_huffman_body(sink, raster, mask, analysis, plan),
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TilingPlan {
     version: i32,
     data_len: usize,
+    blocks: Vec<BlockPlan>,
 }
 
 fn plan_raster<T: Sample, R: RasterSource<T>>(
@@ -879,7 +880,7 @@ fn plan_raster<T: Sample, R: RasterSource<T>>(
     }
 
     let tiling = plan_tiled_body(raster, mask, analysis)?;
-    let mut best_body = BodyPlan::Tiled;
+    let mut best_body = BodyPlan::Tiled(tiling.clone());
     let mut best_version = tiling.version;
     let mut best_non_one_len =
         tiling.data_len + usize::from(needs_huffman_flag(analysis.data_type, analysis.max_z_error));
@@ -935,10 +936,16 @@ fn plan_tiled_body<T: Sample, R: RasterSource<T>>(
     };
     let diff_supported =
         supports_diff_tiles(analysis.data_type, analysis.max_z_error, analysis.depth);
+    let plan_capacity = num_blocks_x
+        .checked_mul(num_blocks_y)
+        .and_then(|count| count.checked_mul(depth))
+        .ok_or_else(|| Error::InvalidArgument("tile plan block count overflows usize".into()))?;
 
     let mut scratch = TileScratch::default();
     let mut version4_len = 0usize;
     let mut version5_len = 0usize;
+    let mut version4_blocks = Vec::with_capacity(plan_capacity);
+    let mut version5_blocks: Option<Vec<BlockPlan>> = None;
     let mut used_diff = false;
 
     for block_y in 0..num_blocks_y {
@@ -988,6 +995,7 @@ fn plan_tiled_body<T: Sample, R: RasterSource<T>>(
                         Error::InvalidArgument("tile payload length overflows usize".into())
                     })?;
 
+                let mut diff_selection = None;
                 if diff_supported
                     && dim > 0
                     && build_diff_values(
@@ -1011,10 +1019,20 @@ fn plan_tiled_body<T: Sample, R: RasterSource<T>>(
                                         "tile payload length overflows usize".into(),
                                     )
                                 })?;
+                            diff_selection = Some(diff_plan);
                             used_diff = true;
                         }
                     }
                 }
+                if let Some(diff_plan) = diff_selection {
+                    if version5_blocks.is_none() {
+                        version5_blocks = Some(version4_blocks.clone());
+                    }
+                    version5_blocks.as_mut().unwrap().push(diff_plan);
+                } else if let Some(version5_blocks) = version5_blocks.as_mut() {
+                    version5_blocks.push(absolute_plan.clone());
+                }
+                version4_blocks.push(absolute_plan);
             }
         }
     }
@@ -1023,11 +1041,13 @@ fn plan_tiled_body<T: Sample, R: RasterSource<T>>(
         TilingPlan {
             version: VERSION_5,
             data_len: version5_len,
+            blocks: version5_blocks.expect("diff use initializes the version 5 tile plan"),
         }
     } else {
         TilingPlan {
             version: VERSION_4,
             data_len: version4_len,
+            blocks: version4_blocks,
         }
     })
 }
@@ -1057,6 +1077,7 @@ fn write_tiled_body<T: Sample, R: RasterSource<T>>(
     raster: R,
     mask: Option<&[u8]>,
     analysis: &RasterAnalysis,
+    plan: &TilingPlan,
 ) -> Result<()> {
     let width = raster.width() as usize;
     let height = raster.height() as usize;
@@ -1074,14 +1095,12 @@ fn write_tiled_body<T: Sample, R: RasterSource<T>>(
     } else {
         height % micro
     };
-    let diff_supported = analysis.plan.version >= VERSION_5
-        && supports_diff_tiles(analysis.data_type, analysis.max_z_error, analysis.depth);
-
     sink.push(0)?;
     if needs_huffman_flag(analysis.data_type, analysis.max_z_error) {
         sink.push(0)?;
     }
 
+    let mut block_plan_index = 0usize;
     for block_y in 0..num_blocks_y {
         let block_height = if block_y + 1 == num_blocks_y {
             last_block_height
@@ -1096,6 +1115,10 @@ fn write_tiled_body<T: Sample, R: RasterSource<T>>(
             };
 
             for dim in 0..depth {
+                let block_plan = plan.blocks.get(block_plan_index).ok_or_else(|| {
+                    Error::InvalidArgument("cached tile plan is missing a block".into())
+                })?;
+                block_plan_index += 1;
                 collect_block_values(
                     scratch,
                     raster,
@@ -1107,55 +1130,22 @@ fn write_tiled_body<T: Sample, R: RasterSource<T>>(
                     block_width,
                     block_height,
                     dim,
-                    diff_supported && dim > 0,
+                    block_plan.is_diff,
                 );
                 let check_code = (((block_x * micro) >> 3) as u8) & 15;
-                let absolute_plan = choose_absolute_block_plan(
+                prepare_cached_block_payload(
+                    block_plan,
                     &scratch.values_f64,
-                    scratch.raw_bytes.len(),
-                    analysis.data_type,
+                    &scratch.prev_values_f64,
+                    &mut scratch.diff_values_f64,
                     analysis.max_z_error,
                     &mut scratch.quantized,
                     &mut scratch.bitstuff_payload,
                 )?;
 
-                let mut chosen_plan = absolute_plan.clone();
-                let mut chose_diff = false;
-                if diff_supported
-                    && dim > 0
-                    && build_diff_values(
-                        &scratch.values_f64,
-                        &scratch.prev_values_f64,
-                        &mut scratch.diff_values_f64,
-                    )?
-                {
-                    if let Some(diff_plan) = choose_diff_block_plan(
-                        &scratch.diff_values_f64,
-                        analysis.max_z_error,
-                        &mut scratch.quantized,
-                        &mut scratch.bitstuff_payload,
-                    )? {
-                        if diff_plan.encoded_len() < absolute_plan.encoded_len() {
-                            chosen_plan = diff_plan;
-                            chose_diff = true;
-                        }
-                    }
-                }
-
-                if !chose_diff {
-                    chosen_plan = choose_absolute_block_plan(
-                        &scratch.values_f64,
-                        scratch.raw_bytes.len(),
-                        analysis.data_type,
-                        analysis.max_z_error,
-                        &mut scratch.quantized,
-                        &mut scratch.bitstuff_payload,
-                    )?;
-                }
-
                 write_block_plan(
                     sink,
-                    &chosen_plan,
+                    block_plan,
                     check_code,
                     analysis.plan.version,
                     &scratch.raw_bytes,
@@ -1163,6 +1153,12 @@ fn write_tiled_body<T: Sample, R: RasterSource<T>>(
                 )?;
             }
         }
+    }
+
+    if block_plan_index != plan.blocks.len() {
+        return Err(Error::InvalidArgument(
+            "cached tile plan contains trailing blocks".into(),
+        ));
     }
 
     Ok(())
@@ -1400,6 +1396,89 @@ fn write_block_plan(
             sink.extend_from_slice(&bitstuff_payload[..payload_len])
         }
     }
+}
+
+fn prepare_cached_block_payload(
+    plan: &BlockPlan,
+    values: &[f64],
+    prev_values: &[f64],
+    diff_values: &mut Vec<f64>,
+    max_z_error: f64,
+    quantized: &mut Vec<u32>,
+    payload: &mut Vec<u8>,
+) -> Result<()> {
+    payload.clear();
+    let values = if plan.is_diff {
+        if !build_diff_values(values, prev_values, diff_values)? {
+            return Err(Error::InvalidArgument(
+                "cached diff tile plan cannot be rebuilt".into(),
+            ));
+        }
+        diff_values.as_slice()
+    } else {
+        values
+    };
+
+    if let BlockBody::Bitstuff {
+        offset,
+        payload_len,
+        ..
+    } = &plan.body
+    {
+        encode_cached_bitstuff_payload(values, *offset, max_z_error, quantized, payload)?;
+        if payload.len() != *payload_len {
+            return Err(Error::InvalidArgument(
+                "cached bit-stuffed tile payload length changed".into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn encode_cached_bitstuff_payload(
+    values: &[f64],
+    offset: f64,
+    max_z_error: f64,
+    quantized: &mut Vec<u32>,
+    payload: &mut Vec<u8>,
+) -> Result<()> {
+    if max_z_error <= 0.0 {
+        return Err(Error::InvalidArgument(
+            "cached bit-stuffed tile requires positive max_z_error".into(),
+        ));
+    }
+
+    let scale = 2.0 * max_z_error;
+    quantized.clear();
+    quantized.reserve(values.len());
+    let mut max_quantized = 0u32;
+    for &value in values {
+        let quantized_value = ((value - offset) / scale).round();
+        if !quantized_value.is_finite() || !(0.0..=(u32::MAX as f64)).contains(&quantized_value) {
+            return Err(Error::InvalidArgument(
+                "cached bit-stuffed tile quantized value is out of range".into(),
+            ));
+        }
+        let quantized_value = quantized_value as u32;
+        max_quantized = max_quantized.max(quantized_value);
+        quantized.push(quantized_value);
+    }
+
+    let bits = bits_required(max_quantized as usize);
+    if bits == 0 || bits > 31 {
+        return Err(Error::InvalidArgument(
+            "cached bit-stuffed tile has an invalid bit width".into(),
+        ));
+    }
+
+    let (count_code, count_bytes) = count_field(values.len())?;
+    payload.clear();
+    payload.reserve(1 + count_bytes + (values.len() * bits as usize).div_ceil(8));
+    payload.push((count_code << 6) | bits);
+    append_count(payload, values.len(), count_bytes)?;
+    pack_lsb_bits_into(quantized, bits, payload);
+    Ok(())
 }
 
 fn build_diff_values(current: &[f64], previous: &[f64], out: &mut Vec<f64>) -> Result<bool> {
