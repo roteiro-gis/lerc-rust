@@ -19,6 +19,7 @@ fuzz_target!(|data: &[u8]| {
     let options = lerc_writer::EncodeOptions {
         max_z_error: if data[3] & 1 == 0 { 0.0 } else { 0.5 },
         micro_block_size: u32::from(data[3] % 8) + 1,
+        no_data_value: None,
     };
 
     let pixels = &data[4..4 + sample_count];

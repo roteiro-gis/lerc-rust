@@ -46,6 +46,7 @@ fn selects_one_sweep_when_tile_headers_would_dominate() {
     let options = EncodeOptions {
         max_z_error: 0.0,
         micro_block_size: 1,
+        ..EncodeOptions::default()
     };
 
     let blob = encode(raster, None, options).unwrap();
@@ -69,6 +70,7 @@ fn selects_huffman_for_repeated_lossless_u8_data() {
     let options = EncodeOptions {
         max_z_error: 0.5,
         micro_block_size: 1,
+        ..EncodeOptions::default()
     };
 
     let blob = encode(raster, None, options).unwrap();
@@ -93,6 +95,7 @@ fn roundtrips_signed_huffman_i8_data() {
     let options = EncodeOptions {
         max_z_error: 0.5,
         micro_block_size: 1,
+        ..EncodeOptions::default()
     };
 
     let blob = encode(raster, None, options).unwrap();
@@ -119,6 +122,7 @@ fn selects_v5_diff_tiles_for_lossless_depth_data() {
     let options = EncodeOptions {
         max_z_error: 0.5,
         micro_block_size: 8,
+        ..EncodeOptions::default()
     };
 
     let blob = encode(raster, None, options).unwrap();
@@ -144,6 +148,7 @@ fn roundtrips_lossless_f64_raster() {
         EncodeOptions {
             max_z_error: 0.0,
             micro_block_size: 1,
+            ..EncodeOptions::default()
         },
     )
     .unwrap();
@@ -170,6 +175,7 @@ fn roundtrips_bitstuffed_u8_tiles_exactly() {
     let options = EncodeOptions {
         max_z_error: 0.5,
         micro_block_size: 2,
+        ..EncodeOptions::default()
     };
 
     let upper_bound = encoded_len_upper_bound(raster, None, options).unwrap();
@@ -195,6 +201,7 @@ fn direct_band_set_apis_materialize_zero_tiles_from_writer_output() {
     let options = EncodeOptions {
         max_z_error: 0.0,
         micro_block_size: 8,
+        ..EncodeOptions::default()
     };
     let blob = encode(raster, None, options).unwrap();
     let info = lerc_reader::get_blob_info(&blob).unwrap();
@@ -220,6 +227,50 @@ fn direct_band_set_apis_materialize_zero_tiles_from_writer_output() {
 }
 
 #[test]
+fn emits_v6_no_data_tiled_body_for_depth_rasters() {
+    let width = 16usize;
+    let height = 8usize;
+    let depth = 2usize;
+    let no_data = -9999.0f32;
+    let mut pixels = Vec::with_capacity(width * height * depth);
+    for row in 0..height {
+        for col in 0..width {
+            if col < 8 {
+                pixels.push(row as f32);
+                pixels.push(no_data);
+            } else {
+                pixels.push(7.0 + row as f32);
+                pixels.push(9.0);
+            }
+        }
+    }
+
+    let raster = RasterView::new(width as u32, height as u32, depth as u32, &pixels).unwrap();
+    let options = EncodeOptions {
+        max_z_error: 0.0,
+        micro_block_size: 8,
+        no_data_value: Some(f64::from(no_data)),
+    };
+    let blob = encode(raster, None, options).unwrap();
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+
+    assert_eq!(info.version, lerc_core::Version::Lerc2(6));
+    assert_eq!(info.no_data_value, Some(f64::from(no_data)));
+    assert!(info.uses_no_data_value());
+    assert_eq!(info.z_min, -1.0);
+    assert_eq!(info.z_max, -1.0);
+    assert_eq!(info.min_values, None);
+    assert_eq!(info.max_values, None);
+    assert_eq!(blob[46], 1);
+
+    let body_offset = 90 + 4 + depth * 2 * info.data_type.byte_len();
+    assert_eq!(blob[body_offset], 0);
+
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    assert_eq!(decoded.pixels, lerc_core::PixelData::F32(pixels));
+}
+
+#[test]
 fn roundtrips_masked_f32_raster_with_depth() {
     let pixels = vec![
         10.0f32, 20.0, 11.0, 21.0, 12.0, 22.0, 13.0, 23.0, 14.0, 24.0, 15.0, 25.0,
@@ -230,6 +281,7 @@ fn roundtrips_masked_f32_raster_with_depth() {
     let options = EncodeOptions {
         max_z_error: 0.25,
         micro_block_size: 2,
+        ..EncodeOptions::default()
     };
 
     let blob = encode(raster, Some(mask), options).unwrap();

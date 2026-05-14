@@ -8,6 +8,7 @@ use lerc_core::{
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
 const VERSION_4: i32 = 4;
 const VERSION_5: i32 = 5;
+const VERSION_6: i32 = 6;
 const FIXED_HEADER_LEN_V4_V5: usize = 66;
 const FIXED_HEADER_LEN_V6: usize = 90;
 const MASK_COUNT_LEN: usize = 4;
@@ -16,6 +17,7 @@ const MASK_COUNT_LEN: usize = 4;
 pub struct EncodeOptions {
     pub max_z_error: f64,
     pub micro_block_size: u32,
+    pub no_data_value: Option<f64>,
 }
 
 impl Default for EncodeOptions {
@@ -23,6 +25,7 @@ impl Default for EncodeOptions {
         Self {
             max_z_error: 0.0,
             micro_block_size: 8,
+            no_data_value: None,
         }
     }
 }
@@ -38,6 +41,7 @@ struct RasterAnalysis {
     micro_block_size: u32,
     z_min: f64,
     z_max: f64,
+    no_data_value: Option<f64>,
     min_values: Option<Vec<f64>>,
     max_values: Option<Vec<f64>>,
     plan: EncodePlan,
@@ -136,6 +140,11 @@ impl BlockPlan {
     }
 
     fn header_byte(&self, check_code: u8, version: i32) -> u8 {
+        let check_code = if version >= VERSION_5 {
+            check_code & 14
+        } else {
+            check_code & 15
+        };
         let mut header = tile_header(
             check_code,
             match self.body {
@@ -392,6 +401,13 @@ fn validate_encode_options(options: EncodeOptions) -> Result<()> {
             "micro_block_size exceeds the Lerc2 header limit".into(),
         ));
     }
+    if let Some(no_data_value) = options.no_data_value {
+        if !no_data_value.is_finite() {
+            return Err(Error::InvalidArgument(
+                "no_data_value must be finite when provided".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -602,6 +618,11 @@ fn analyze_raster<T: Sample, R: RasterSource<T>>(
 ) -> Result<RasterAnalysis> {
     let pixel_count = raster.pixel_count()?;
     validate_mask_slice(mask.data(), pixel_count)?;
+    if options.no_data_value.is_some() && raster.depth() <= 1 {
+        return Err(Error::InvalidArgument(
+            "no_data_value requires depth greater than one".into(),
+        ));
+    }
     let depth = raster.depth() as usize;
     let data_type = raster.data_type();
 
@@ -653,6 +674,7 @@ fn analyze_raster<T: Sample, R: RasterSource<T>>(
         micro_block_size: options.micro_block_size,
         z_min,
         z_max,
+        no_data_value: options.no_data_value,
         min_values,
         max_values,
         plan: EncodePlan {
@@ -787,9 +809,21 @@ fn write_header_prefix(sink: &mut impl ByteSink, analysis: &RasterAnalysis) -> R
     write_i32(sink, analysis.micro_block_size as i32)?;
     write_i32(sink, 0)?;
     write_i32(sink, analysis.data_type.code() as i32)?;
+    if analysis.plan.version >= VERSION_6 {
+        write_i32(sink, 0)?;
+        sink.push(u8::from(analysis.no_data_value.is_some()))?;
+        sink.push(0)?;
+        sink.push(0)?;
+        sink.push(0)?;
+    }
     write_f64(sink, analysis.max_z_error)?;
     write_f64(sink, analysis.z_min)?;
     write_f64(sink, analysis.z_max)?;
+    if analysis.plan.version >= VERSION_6 {
+        let no_data_value = analysis.no_data_value.unwrap_or(0.0);
+        write_f64(sink, no_data_value)?;
+        write_f64(sink, no_data_value)?;
+    }
     Ok(())
 }
 
@@ -833,13 +867,13 @@ fn plan_raster<T: Sample, R: RasterSource<T>>(
 ) -> Result<EncodePlan> {
     if analysis.valid_pixel_count == 0 || analysis.z_min == analysis.z_max {
         return Ok(EncodePlan {
-            version: VERSION_4,
+            version: version_with_no_data(analysis, VERSION_4),
             body: BodyPlan::Constant,
         });
     }
     if has_per_depth_constant(analysis) {
         return Ok(EncodePlan {
-            version: VERSION_4,
+            version: version_with_no_data(analysis, VERSION_4),
             body: BodyPlan::PerDepthConstant,
         });
     }
@@ -856,7 +890,7 @@ fn plan_raster<T: Sample, R: RasterSource<T>>(
         })?;
         if huffman_total_len < best_non_one_len {
             best_non_one_len = huffman_total_len;
-            best_version = VERSION_4;
+            best_version = version_with_no_data(analysis, VERSION_4);
             best_body = BodyPlan::Huffman(huffman);
         }
     }
@@ -867,13 +901,13 @@ fn plan_raster<T: Sample, R: RasterSource<T>>(
         .ok_or_else(|| Error::InvalidArgument("one-sweep byte count overflows usize".into()))?;
     if one_sweep_len <= best_non_one_len {
         return Ok(EncodePlan {
-            version: VERSION_4,
+            version: version_with_no_data(analysis, VERSION_4),
             body: BodyPlan::OneSweep,
         });
     }
 
     Ok(EncodePlan {
-        version: best_version,
+        version: version_with_no_data(analysis, best_version),
         body: best_body,
     })
 }
@@ -2082,6 +2116,14 @@ fn write_i16(sink: &mut impl ByteSink, value: i16) -> Result<()> {
 
 fn write_f64(sink: &mut impl ByteSink, value: f64) -> Result<()> {
     sink.extend_from_slice(&value.to_le_bytes())
+}
+
+fn version_with_no_data(analysis: &RasterAnalysis, version: i32) -> i32 {
+    if analysis.no_data_value.is_some() {
+        VERSION_6
+    } else {
+        version
+    }
 }
 
 fn tile_header(check_code: u8, encoding: u8) -> u8 {
