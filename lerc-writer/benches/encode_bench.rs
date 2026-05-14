@@ -16,6 +16,7 @@ fn encode_benchmarks(c: &mut Criterion) {
     let u8_options = lerc_writer::EncodeOptions {
         max_z_error: 0.5,
         micro_block_size: 8,
+        ..lerc_writer::EncodeOptions::default()
     };
     c.bench_function("lerc-writer/encode/u8-bitstuff", |b| {
         b.iter(|| {
@@ -30,6 +31,7 @@ fn encode_benchmarks(c: &mut Criterion) {
     let f32_options = lerc_writer::EncodeOptions {
         max_z_error: 0.125,
         micro_block_size: 8,
+        ..lerc_writer::EncodeOptions::default()
     };
     c.bench_function("lerc-writer/encode-plus-decode/f32", |b| {
         b.iter(|| {

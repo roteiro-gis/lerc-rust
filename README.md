@@ -47,9 +47,13 @@ let blob = encode(
     EncodeOptions {
         max_z_error: 0.5,
         micro_block_size: 8,
+        ..EncodeOptions::default()
     },
 )?;
 ```
+
+Set `EncodeOptions::no_data_value` to emit Lerc2 v6 no-data metadata for
+depth rasters.
 
 Single-blob entry points are strict. If you intentionally want first-blob
 inspection or decode from a concatenated payload, use `inspect_first()` or
@@ -79,8 +83,8 @@ assert_eq!(bsq.len(), (info.width() * info.height() * info.band_count() as u32) 
   tiled, bit-stuffed, and Huffman decode paths
 - Lerc2 writes for single blobs and concatenated band sets with optional masks,
   depth metadata, checksum, constant/per-depth constant, one-sweep, tiled,
-  Huffman, and v5 diff-tile encode paths
-- Lerc2 v6/no-data decode support; writer emission currently stops at v5 headers
+  Huffman, v5 diff-tile encode paths, and v6/no-data emission
+- Lerc2 v6/no-data decode support
 - Native typed decode and type-promoting `f64` decode
 - Strict single-blob APIs plus permissive first-blob adapters for concatenated payloads
 - Direct `ndarray::ArrayD` conversion for rasters, band sets, and masks, with selectable band layout

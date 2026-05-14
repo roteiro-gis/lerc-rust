@@ -9,6 +9,7 @@ fn sample_blob() -> Vec<u8> {
         EncodeOptions {
             max_z_error: 0.5,
             micro_block_size: 2,
+            ..EncodeOptions::default()
         },
     )
     .unwrap()
@@ -55,5 +56,39 @@ fn rejects_blob_with_invalid_mask_length() {
     assert!(matches!(
         lerc_reader::decode(&blob),
         Err(lerc_core::Error::InvalidBlob(_) | lerc_core::Error::Truncated { .. })
+    ));
+}
+
+#[test]
+fn rejects_no_data_for_unit_depth_rasters() {
+    let pixels = vec![1.0f32, -9999.0, 3.0, 4.0];
+
+    assert!(matches!(
+        encode(
+            RasterView::new(2, 2, 1, &pixels).unwrap(),
+            None,
+            EncodeOptions {
+                no_data_value: Some(-9999.0),
+                ..EncodeOptions::default()
+            },
+        ),
+        Err(lerc_core::Error::InvalidArgument(_))
+    ));
+}
+
+#[test]
+fn rejects_non_finite_no_data_value() {
+    let pixels = vec![1.0f32, -9999.0, 3.0, 4.0];
+
+    assert!(matches!(
+        encode(
+            RasterView::new(1, 2, 2, &pixels).unwrap(),
+            None,
+            EncodeOptions {
+                no_data_value: Some(f64::NAN),
+                ..EncodeOptions::default()
+            },
+        ),
+        Err(lerc_core::Error::InvalidArgument(_))
     ));
 }

@@ -17,6 +17,7 @@ fn generated_blobs_match_liblerc_decode_hashes() {
         lerc_writer::EncodeOptions {
             max_z_error: 0.5,
             micro_block_size: 2,
+            ..lerc_writer::EncodeOptions::default()
         },
     )
     .unwrap();
@@ -31,6 +32,7 @@ fn generated_blobs_match_liblerc_decode_hashes() {
         lerc_writer::EncodeOptions {
             max_z_error: 0.25,
             micro_block_size: 2,
+            ..lerc_writer::EncodeOptions::default()
         },
     )
     .unwrap();
@@ -59,6 +61,7 @@ fn generated_blobs_match_liblerc_decode_hashes() {
         lerc_writer::EncodeOptions {
             max_z_error: 0.0,
             micro_block_size: 1,
+            ..lerc_writer::EncodeOptions::default()
         },
     )
     .unwrap();
@@ -72,6 +75,7 @@ fn generated_blobs_match_liblerc_decode_hashes() {
         lerc_writer::EncodeOptions {
             max_z_error: 0.5,
             micro_block_size: 1,
+            ..lerc_writer::EncodeOptions::default()
         },
     )
     .unwrap();
@@ -87,6 +91,7 @@ fn generated_blobs_match_liblerc_decode_hashes() {
         lerc_writer::EncodeOptions {
             max_z_error: 0.5,
             micro_block_size: 8,
+            ..lerc_writer::EncodeOptions::default()
         },
     )
     .unwrap();
@@ -100,6 +105,7 @@ fn generated_blobs_match_liblerc_decode_hashes() {
         lerc_writer::EncodeOptions {
             max_z_error: 0.5,
             micro_block_size: 1,
+            ..lerc_writer::EncodeOptions::default()
         },
     )
     .unwrap();
@@ -111,6 +117,7 @@ fn generated_blobs_match_liblerc_decode_hashes() {
         lerc_writer::EncodeOptions {
             max_z_error: 0.0,
             micro_block_size: 1,
+            ..lerc_writer::EncodeOptions::default()
         },
     )
     .unwrap();
