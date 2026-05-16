@@ -914,221 +914,54 @@ fn decode_one_sweep_into<T: Sample, W: BandWriter<T>>(
     Ok(())
 }
 
+struct PixelDataWriter<'a, T> {
+    values: &'a mut [T],
+    depth: usize,
+}
+
+impl<T: Copy> PixelDataWriter<'_, T> {
+    fn index(&self, pixel: usize, dim: usize) -> usize {
+        pixel * self.depth + dim
+    }
+}
+
+impl<T: Sample> BandWriter<T> for PixelDataWriter<'_, T> {
+    fn fill_default(&mut self) {
+        self.values.fill(T::default());
+    }
+
+    fn write(&mut self, pixel: usize, dim: usize, value: T) {
+        let index = self.index(pixel, dim);
+        self.values[index] = value;
+    }
+
+    fn read(&self, pixel: usize, dim: usize) -> T {
+        self.values[self.index(pixel, dim)]
+    }
+
+    fn depth(&self) -> usize {
+        self.depth
+    }
+}
+
 fn decode_tiles<T: Sample>(
     cursor: &mut Cursor<'_>,
     info: &BlobInfo,
     depth_ranges: Option<&DepthRanges>,
     mask: Option<&[u8]>,
 ) -> Result<PixelData> {
-    let width = info.width as usize;
-    let height = info.height as usize;
-    let depth = info.depth as usize;
-    let num_pixels = width
-        .checked_mul(height)
-        .ok_or_else(|| Error::InvalidBlob("pixel count overflows usize".into()))?;
-    let micro_block_size = info.micro_block_size as usize;
-    if micro_block_size == 0 {
+    if info.micro_block_size == 0 {
         return Err(Error::InvalidBlob(
             "micro block size must be greater than zero".into(),
         ));
     }
-
-    let num_blocks_x = width.div_ceil(micro_block_size);
-    let num_blocks_y = height.div_ceil(micro_block_size);
-    let last_block_width = if width % micro_block_size == 0 {
-        micro_block_size
-    } else {
-        width % micro_block_size
-    };
-    let last_block_height = if height % micro_block_size == 0 {
-        micro_block_size
-    } else {
-        height % micro_block_size
-    };
-
     let mut result = vec![T::default(); info.sample_count()?];
-    let mut block_buffer = vec![0.0; micro_block_size * micro_block_size];
-    let version = match info.version {
-        Version::Lerc2(version) => version,
-        _ => unreachable!("Lerc2 tile decode called with a non-Lerc2 blob"),
+    let depth = info.depth as usize;
+    let mut writer = PixelDataWriter {
+        values: &mut result,
+        depth,
     };
-    let file_version_check_num = if version >= 5 { 14u8 } else { 15u8 };
-
-    for block_y in 0..num_blocks_y {
-        let this_block_height = if block_y + 1 == num_blocks_y {
-            last_block_height
-        } else {
-            micro_block_size
-        };
-        for block_x in 0..num_blocks_x {
-            let this_block_width = if block_x + 1 == num_blocks_x {
-                last_block_width
-            } else {
-                micro_block_size
-            };
-
-            for dim in 0..depth {
-                let header_byte = cursor.read_u8()?;
-                let is_diff_encoding = version >= 5 && (header_byte & 4) != 0;
-                let bits67 = header_byte >> 6;
-                let test_code = (header_byte >> 2) & file_version_check_num;
-                let expected_code =
-                    (((block_x * micro_block_size) >> 3) as u8) & file_version_check_num;
-                if test_code != expected_code {
-                    return Err(Error::InvalidBlob(
-                        "tile block integrity check failed".into(),
-                    ));
-                }
-                if is_diff_encoding && dim == 0 {
-                    return Err(Error::InvalidBlob(
-                        "diff-encoded tile block encountered in first dimension".into(),
-                    ));
-                }
-
-                let block_encoding = header_byte & 3;
-                let z_max = depth_ranges
-                    .and_then(|ranges| ranges.max_values.get(dim))
-                    .copied()
-                    .unwrap_or(info.z_max);
-
-                match block_encoding {
-                    2 => {
-                        if is_diff_encoding {
-                            for row in 0..this_block_height {
-                                let pixel_row = block_y * micro_block_size + row;
-                                for col in 0..this_block_width {
-                                    let pixel =
-                                        pixel_row * width + block_x * micro_block_size + col;
-                                    if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
-                                        let prev = result[sample_index(pixel, depth, dim - 1)];
-                                        result[sample_index(pixel, depth, dim)] = prev;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    0 => {
-                        if is_diff_encoding {
-                            return Err(Error::InvalidBlob(
-                                "uncompressed diff-encoded tile block is invalid".into(),
-                            ));
-                        }
-                        let values_needed = if let Some(mask) = mask {
-                            count_valid_in_block(
-                                mask,
-                                width,
-                                block_x * micro_block_size,
-                                block_y * micro_block_size,
-                                this_block_width,
-                                this_block_height,
-                            )
-                        } else {
-                            this_block_width * this_block_height
-                        };
-                        let byte_len = values_needed
-                            .checked_mul(info.data_type.byte_len())
-                            .ok_or_else(|| {
-                                Error::InvalidBlob(
-                                    "uncompressed block byte length overflows usize".into(),
-                                )
-                            })?;
-                        let raw_values =
-                            read_values_as::<T>(cursor.read_bytes(byte_len)?, info.data_type)?;
-                        let mut src = 0usize;
-                        for row in 0..this_block_height {
-                            let pixel_row = block_y * micro_block_size + row;
-                            for col in 0..this_block_width {
-                                let pixel = pixel_row * width + block_x * micro_block_size + col;
-                                if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
-                                    result[sample_index(pixel, depth, dim)] = raw_values[src];
-                                    src += 1;
-                                }
-                            }
-                        }
-                        if src != raw_values.len() {
-                            return Err(Error::InvalidBlob(
-                                "uncompressed tile block payload contains trailing values".into(),
-                            ));
-                        }
-                    }
-                    1 | 3 => {
-                        let offset_type = data_type_used(
-                            if is_diff_encoding && info.data_type.code() < 6 {
-                                DataType::I32
-                            } else {
-                                info.data_type
-                            },
-                            bits67,
-                        )?;
-                        let offset = read_typed_scalar(cursor, offset_type)?;
-
-                        if block_encoding == 3 {
-                            for row in 0..this_block_height {
-                                let pixel_row = block_y * micro_block_size + row;
-                                for col in 0..this_block_width {
-                                    let pixel =
-                                        pixel_row * width + block_x * micro_block_size + col;
-                                    if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
-                                        let value = if is_diff_encoding {
-                                            (result[sample_index(pixel, depth, dim - 1)].to_f64()
-                                                + offset)
-                                                .min(z_max)
-                                        } else {
-                                            offset
-                                        };
-                                        result[sample_index(pixel, depth, dim)] =
-                                            output_value::<T>(value, info.data_type);
-                                    }
-                                }
-                            }
-                        } else {
-                            block_buffer.fill(0.0);
-                            let block_values = decode_bits(
-                                cursor,
-                                version,
-                                &mut block_buffer,
-                                Some(offset),
-                                info.max_z_error,
-                                z_max,
-                            )?;
-                            let mut src = 0usize;
-                            for row in 0..this_block_height {
-                                let pixel_row = block_y * micro_block_size + row;
-                                for col in 0..this_block_width {
-                                    let pixel =
-                                        pixel_row * width + block_x * micro_block_size + col;
-                                    if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
-                                        let value = if is_diff_encoding {
-                                            block_buffer[src]
-                                                + result[sample_index(pixel, depth, dim - 1)]
-                                                    .to_f64()
-                                        } else {
-                                            block_buffer[src]
-                                        };
-                                        result[sample_index(pixel, depth, dim)] =
-                                            output_value::<T>(value, info.data_type);
-                                        src += 1;
-                                    }
-                                }
-                            }
-                            if src != block_values {
-                                return Err(Error::InvalidBlob(
-                                    "bit-stuffed tile block value count does not match the block mask".into(),
-                                ));
-                            }
-                        }
-                    }
-                    _ => {
-                        return Err(Error::InvalidBlob(format!(
-                            "invalid tile block encoding {block_encoding}"
-                        )));
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = num_pixels;
+    decode_tiles_into(cursor, info, depth_ranges, mask, &mut writer)?;
     Ok(T::into_pixel_data(result))
 }
 
