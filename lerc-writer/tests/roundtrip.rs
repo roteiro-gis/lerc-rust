@@ -271,6 +271,87 @@ fn emits_v6_no_data_tiled_body_for_depth_rasters() {
 }
 
 #[test]
+fn upper_bound_covers_v6_no_data_output() {
+    let width = 16usize;
+    let height = 8usize;
+    let depth = 2usize;
+    let no_data = -9999.0f32;
+    let mut pixels = Vec::with_capacity(width * height * depth);
+    for row in 0..height {
+        for col in 0..width {
+            if col < 8 {
+                pixels.push(row as f32);
+                pixels.push(no_data);
+            } else {
+                pixels.push(7.0 + row as f32);
+                pixels.push(9.0);
+            }
+        }
+    }
+
+    let raster = RasterView::new(width as u32, height as u32, depth as u32, &pixels).unwrap();
+    let options = EncodeOptions {
+        max_z_error: 0.0,
+        micro_block_size: 8,
+        no_data_value: Some(f64::from(no_data)),
+    };
+    let upper_bound = encoded_len_upper_bound(raster, None, options).unwrap();
+    let blob = encode(raster, None, options).unwrap();
+    assert!(upper_bound >= blob.len());
+
+    let mut out = vec![0; upper_bound];
+    let written = encode_into(raster, None, options, &mut out).unwrap();
+    assert_eq!(written, blob.len());
+    assert_eq!(&out[..written], blob.as_slice());
+}
+
+#[test]
+fn band_set_upper_bound_covers_v6_no_data_output() {
+    let width = 16usize;
+    let height = 8usize;
+    let depth = 2usize;
+    let band_count = 2usize;
+    let no_data = -9999.0f32;
+    let mut pixels = Vec::with_capacity(width * height * depth * band_count);
+    for band in 0..band_count {
+        for row in 0..height {
+            for col in 0..width {
+                if col < 8 {
+                    pixels.push(row as f32 + band as f32);
+                    pixels.push(no_data);
+                } else {
+                    pixels.push(7.0 + row as f32 + band as f32);
+                    pixels.push(9.0 + band as f32);
+                }
+            }
+        }
+    }
+
+    let band_set = BandSetView::new(
+        width as u32,
+        height as u32,
+        depth as u32,
+        band_count,
+        BandLayout::Bsq,
+        &pixels,
+    )
+    .unwrap();
+    let options = EncodeOptions {
+        max_z_error: 0.0,
+        micro_block_size: 8,
+        no_data_value: Some(f64::from(no_data)),
+    };
+    let upper_bound = encoded_band_set_len_upper_bound(band_set, None, options).unwrap();
+    let blob = encode_band_set(band_set, None, options).unwrap();
+    assert!(upper_bound >= blob.len());
+
+    let mut out = vec![0; upper_bound];
+    let written = encode_band_set_into(band_set, None, options, &mut out).unwrap();
+    assert_eq!(written, blob.len());
+    assert_eq!(&out[..written], blob.as_slice());
+}
+
+#[test]
 fn roundtrips_masked_f32_raster_with_depth() {
     let pixels = vec![
         10.0f32, 20.0, 11.0, 21.0, 12.0, 22.0, 13.0, 23.0, 14.0, 24.0, 15.0, 25.0,

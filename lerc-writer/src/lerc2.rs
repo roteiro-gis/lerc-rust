@@ -440,11 +440,10 @@ pub fn encoded_len_upper_bound<T: Sample>(
 ) -> Result<usize> {
     validate_encode_options(options)?;
     validate_mask_dimensions(raster.width(), raster.height(), mask)?;
-    encoded_len_upper_bound_for_raster(
-        raster,
-        mask.map_or(MaskKind::None, |mask| MaskKind::Explicit(mask.data())),
-        options,
-    )
+
+    let mask = mask.map_or(MaskKind::None, |mask| MaskKind::Explicit(mask.data()));
+    let analysis = analyze_raster(raster, mask, options)?;
+    encoded_len_upper_bound_from_analysis(raster, mask, options, &analysis)
 }
 
 pub fn encoded_band_set_len_upper_bound<T: Sample>(
@@ -462,11 +461,11 @@ pub fn encoded_band_set_len_upper_bound<T: Sample>(
             band_set,
             band_index,
         };
+        let mask = shared_mask_for_band(shared_mask, band_index);
+        let analysis = analyze_raster(band, mask, options)?;
         total = total
-            .checked_add(encoded_len_upper_bound_for_raster(
-                band,
-                shared_mask_for_band(shared_mask, band_index),
-                options,
+            .checked_add(encoded_len_upper_bound_from_analysis(
+                band, mask, options, &analysis,
             )?)
             .ok_or_else(|| {
                 Error::InvalidArgument("encoded band set size overflows usize".into())
@@ -566,49 +565,6 @@ pub fn encode_band_set_into<T: Sample>(
     }
 
     encode_band_set_into_with_analysis(band_set, shared_mask, options, &analyses, out)
-}
-
-fn encoded_len_upper_bound_for_raster<T: Sample, R: RasterSource<T>>(
-    raster: R,
-    mask: MaskKind<'_>,
-    options: EncodeOptions,
-) -> Result<usize> {
-    let pixel_count = raster.pixel_count()?;
-    validate_mask_slice(mask.data(), pixel_count)?;
-
-    let valid_pixel_count = mask
-        .data()
-        .map(|mask| mask.iter().filter(|&&value| value != 0).count())
-        .unwrap_or(pixel_count);
-    let depth = raster.depth() as usize;
-    let num_tiles = tile_count(raster.width() as usize, raster.height() as usize, options)?;
-    let byte_len = raster.data_type().byte_len();
-    let mask_len = mask.stored_payload_len(pixel_count, valid_pixel_count)?;
-    let range_len = if valid_pixel_count == 0 {
-        0
-    } else {
-        depth
-            .checked_mul(2)
-            .and_then(|len| len.checked_mul(byte_len))
-            .ok_or_else(|| Error::InvalidArgument("range byte count overflows usize".into()))?
-    };
-    let prefix_len = body_prefix_len(raster.data_type(), options.max_z_error);
-    let tile_header_len = num_tiles
-        .checked_mul(depth)
-        .ok_or_else(|| Error::InvalidArgument("tile header length overflows usize".into()))?;
-    let raw_data_len = valid_pixel_count
-        .checked_mul(depth)
-        .and_then(|len| len.checked_mul(byte_len))
-        .ok_or_else(|| Error::InvalidArgument("raw tile payload length overflows usize".into()))?;
-
-    header_len(VERSION_4)
-        .checked_add(MASK_COUNT_LEN)
-        .and_then(|len| len.checked_add(mask_len))
-        .and_then(|len| len.checked_add(range_len))
-        .and_then(|len| len.checked_add(prefix_len))
-        .and_then(|len| len.checked_add(tile_header_len))
-        .and_then(|len| len.checked_add(raw_data_len))
-        .ok_or_else(|| Error::InvalidArgument("encoded upper bound overflows usize".into()))
 }
 
 fn analyze_raster<T: Sample, R: RasterSource<T>>(

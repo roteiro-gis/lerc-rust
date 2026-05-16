@@ -1,5 +1,7 @@
-use lerc_core::RasterView;
-use lerc_writer::{encode, EncodeOptions};
+use lerc_core::{BandLayout, BandSetView, RasterView};
+use lerc_writer::{
+    encode, encoded_band_set_len_upper_bound, encoded_len_upper_bound, EncodeOptions,
+};
 
 fn sample_blob() -> Vec<u8> {
     let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
@@ -62,16 +64,24 @@ fn rejects_blob_with_invalid_mask_length() {
 #[test]
 fn rejects_no_data_for_unit_depth_rasters() {
     let pixels = vec![1.0f32, -9999.0, 3.0, 4.0];
+    let raster = RasterView::new(2, 2, 1, &pixels).unwrap();
+    let options = EncodeOptions {
+        no_data_value: Some(-9999.0),
+        ..EncodeOptions::default()
+    };
 
     assert!(matches!(
-        encode(
-            RasterView::new(2, 2, 1, &pixels).unwrap(),
-            None,
-            EncodeOptions {
-                no_data_value: Some(-9999.0),
-                ..EncodeOptions::default()
-            },
-        ),
+        encode(raster, None, options),
+        Err(lerc_core::Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        encoded_len_upper_bound(raster, None, options),
+        Err(lerc_core::Error::InvalidArgument(_))
+    ));
+
+    let band_set = BandSetView::new(2, 2, 1, 1, BandLayout::Bsq, &pixels).unwrap();
+    assert!(matches!(
+        encoded_band_set_len_upper_bound(band_set, None, options),
         Err(lerc_core::Error::InvalidArgument(_))
     ));
 }
