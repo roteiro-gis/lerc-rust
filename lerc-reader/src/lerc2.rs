@@ -1,5 +1,6 @@
 use lerc_core::{BlobInfo, DataType, Error, MaskEncoding, PixelData, Result, Version};
 
+use crate::allocation::{check_allocation, checked_mul, default_vec};
 use crate::bitstuff::{data_type_used, decode_bits, read_typed_scalar};
 use crate::huffman::{decode_huffman, decode_huffman_into};
 use crate::io::Cursor;
@@ -379,7 +380,7 @@ fn read_mask(
         MaskEncoding::None => Ok(None),
         MaskEncoding::ImplicitAllInvalid => {
             cursor.skip(parsed.mask_num_bytes)?;
-            Ok(Some(vec![0; num_pixels]))
+            Ok(Some(default_vec(num_pixels, "Lerc2 implicit mask")?))
         }
         MaskEncoding::External => {
             let mask = inherited_mask.ok_or(Error::UnsupportedFeature(
@@ -393,13 +394,13 @@ fn read_mask(
                 cursor.read_bytes(parsed.mask_num_bytes)?,
                 num_pixels.div_ceil(8),
             )?;
-            Ok(Some(unpack_mask_bitset(&bitset, num_pixels)))
+            Ok(Some(unpack_mask_bitset(&bitset, num_pixels)?))
         }
     }
 }
 
 pub(crate) fn decode_mask_rle(encoded: &[u8], bitset_len: usize) -> Result<Vec<u8>> {
-    let mut bitset = vec![0u8; bitset_len];
+    let mut bitset = default_vec(bitset_len, "Lerc2 mask bitset")?;
     let mut inner = Cursor::new(encoded);
     let mut out = 0usize;
 
@@ -453,14 +454,14 @@ pub(crate) fn decode_mask_rle(encoded: &[u8], bitset_len: usize) -> Result<Vec<u
     Ok(bitset)
 }
 
-pub(crate) fn unpack_mask_bitset(bitset: &[u8], num_pixels: usize) -> Vec<u8> {
-    let mut mask = vec![0u8; num_pixels];
+pub(crate) fn unpack_mask_bitset(bitset: &[u8], num_pixels: usize) -> Result<Vec<u8>> {
+    let mut mask = default_vec(num_pixels, "Lerc2 unpacked mask")?;
     for (i, item) in mask.iter_mut().enumerate() {
         let byte = bitset[i >> 3];
         let bit = 7 - (i & 7);
         *item = (byte >> bit) & 1;
     }
-    mask
+    Ok(mask)
 }
 
 fn read_depth_ranges(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<DepthRanges> {
@@ -609,7 +610,10 @@ fn decode_pixels_typed<T: Sample>(
     let sample_count = info.sample_count()?;
 
     if info.valid_pixel_count == 0 {
-        return Ok(T::into_pixel_data(vec![T::default(); sample_count]));
+        return Ok(T::into_pixel_data(default_vec(
+            sample_count,
+            "Lerc2 empty pixel buffer",
+        )?));
     }
 
     if info.z_min == info.z_max {
@@ -619,7 +623,7 @@ fn decode_pixels_typed<T: Sample>(
             info.depth as usize,
             mask,
             ConstantValues::Single(info.z_max),
-        )));
+        )?));
     }
 
     if let Some(ranges) = depth_ranges {
@@ -630,7 +634,7 @@ fn decode_pixels_typed<T: Sample>(
                 info.depth as usize,
                 mask,
                 ConstantValues::PerDepth(&ranges.max_values),
-            )));
+            )?));
         }
     }
 
@@ -753,8 +757,9 @@ fn constant_pixels<T: Sample>(
     depth: usize,
     mask: Option<&[u8]>,
     values: ConstantValues<'_>,
-) -> Vec<T> {
-    let mut out = vec![T::default(); num_pixels * depth];
+) -> Result<Vec<T>> {
+    let sample_count = checked_mul(num_pixels, depth, "Lerc2 sample count")?;
+    let mut out = default_vec(sample_count, "Lerc2 constant pixel buffer")?;
     match values {
         ConstantValues::Single(value) => {
             let value = output_value::<T>(value, data_type);
@@ -789,7 +794,7 @@ fn constant_pixels<T: Sample>(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn write_constant_pixels<T: Sample, W: BandWriter<T>>(
@@ -853,6 +858,10 @@ fn decode_one_sweep<T: Sample>(
         .checked_mul(num_valid)
         .and_then(|v| v.checked_mul(depth))
         .ok_or_else(|| Error::InvalidBlob("one-sweep byte count overflows usize".into()))?;
+    check_allocation::<T>(
+        checked_mul(num_valid, depth, "Lerc2 one-sweep sample count")?,
+        "Lerc2 one-sweep raw values",
+    )?;
     let raw = read_values_as::<T>(cursor.read_bytes(sample_len)?, info.data_type)?;
 
     if num_valid == num_pixels {
@@ -862,7 +871,7 @@ fn decode_one_sweep<T: Sample>(
     let mask = mask.ok_or(Error::InvalidBlob(
         "partial-valid one-sweep block is missing its decoded mask".into(),
     ))?;
-    let mut out = vec![T::default(); info.sample_count()?];
+    let mut out = default_vec(info.sample_count()?, "Lerc2 one-sweep output")?;
     let mut src = 0usize;
     for (pixel, &is_valid) in mask.iter().enumerate() {
         if is_valid == 0 {
@@ -901,6 +910,10 @@ fn decode_one_sweep_into<T: Sample, W: BandWriter<T>>(
         .checked_mul(num_valid)
         .and_then(|v| v.checked_mul(depth))
         .ok_or_else(|| Error::InvalidBlob("one-sweep byte count overflows usize".into()))?;
+    check_allocation::<T>(
+        checked_mul(num_valid, depth, "Lerc2 one-sweep sample count")?,
+        "Lerc2 one-sweep raw values",
+    )?;
     let raw = read_values_as::<T>(cursor.read_bytes(sample_len)?, info.data_type)?;
 
     if num_valid == num_pixels {
@@ -981,7 +994,7 @@ fn decode_tiles<T: Sample>(
             "micro block size must be greater than zero".into(),
         ));
     }
-    let mut result = vec![T::default(); info.sample_count()?];
+    let mut result = default_vec(info.sample_count()?, "Lerc2 tile output")?;
     let depth = info.depth as usize;
     let mut writer = PixelDataWriter {
         values: &mut result,
@@ -1022,7 +1035,12 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
         height % micro_block_size
     };
 
-    let mut block_buffer = vec![0.0; micro_block_size * micro_block_size];
+    let block_samples = checked_mul(
+        micro_block_size,
+        micro_block_size,
+        "Lerc2 micro-block sample count",
+    )?;
+    let mut block_buffer = default_vec(block_samples, "Lerc2 micro-block buffer")?;
     let version = match info.version {
         Version::Lerc2(version) => version,
         _ => unreachable!("Lerc2 tile decode called with a non-Lerc2 blob"),

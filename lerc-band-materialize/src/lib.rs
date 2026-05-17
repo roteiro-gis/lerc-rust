@@ -1,5 +1,8 @@
 use std::fmt;
+use std::mem;
 use std::mem::MaybeUninit;
+
+const MAX_MATERIALIZED_ALLOCATION_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BandLayout {
@@ -203,7 +206,13 @@ impl<T> BandMaterializer<T> {
         band_count: usize,
         layout: BandLayout,
     ) -> Result<Self> {
-        let sample_count = total_len(pixel_count, depth, band_count)?;
+        let band_sample_count = band_len(pixel_count, depth)?;
+        let sample_count = band_sample_count
+            .checked_mul(band_count)
+            .ok_or_else(|| MaterializeError::new("decoded band set length overflows usize"))?;
+        check_allocation::<T>(sample_count, "materialized band set")?;
+        check_allocation::<bool>(band_count, "materialized band completion flags")?;
+        check_allocation::<bool>(band_sample_count, "materialized sparse band progress")?;
         let mut out = Vec::with_capacity(sample_count);
         if sample_count != 0 {
             unsafe {
@@ -748,10 +757,16 @@ fn band_len(pixel_count: usize, depth: usize) -> Result<usize> {
         .ok_or_else(|| MaterializeError::new("decoded band length overflows usize"))
 }
 
-fn total_len(pixel_count: usize, depth: usize, band_count: usize) -> Result<usize> {
-    band_len(pixel_count, depth)?
-        .checked_mul(band_count)
-        .ok_or_else(|| MaterializeError::new("decoded band set length overflows usize"))
+fn check_allocation<T>(len: usize, label: &str) -> Result<()> {
+    let bytes = len
+        .checked_mul(mem::size_of::<T>())
+        .ok_or_else(|| MaterializeError::new(format!("{label} byte count overflows usize")))?;
+    if bytes > MAX_MATERIALIZED_ALLOCATION_BYTES {
+        return Err(MaterializeError::new(format!(
+            "{label} allocation request of {bytes} bytes exceeds materializer limit of {MAX_MATERIALIZED_ALLOCATION_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_active_band_complete(shape: BandShape, active_band: &ActiveBand) -> Result<()> {
@@ -906,6 +921,17 @@ mod tests {
             err.to_string(),
             "band 0 is still active; finalize it before starting another band"
         );
+    }
+
+    #[test]
+    fn rejects_materialized_band_set_that_exceeds_allocation_limit() {
+        let err =
+            match BandMaterializer::<u8>::new(512 * 1024 * 1024 + 1, 1, 1, BandLayout::Interleaved)
+            {
+                Ok(_) => panic!("oversized materialized band set should fail"),
+                Err(err) => err,
+            };
+        assert!(err.to_string().contains("allocation request"));
     }
 
     #[test]
