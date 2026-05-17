@@ -180,7 +180,7 @@ fn generated_blobs_match_liblerc_decode_hashes() {
                 assert_eq!(hash, reference_json["pixel_hash"].as_str().unwrap());
             }
             1 => {
-                let raster = lerc_reader::decode_ndarray_f64(&blob).unwrap();
+                let raster: ArrayD<f32> = lerc_reader::decode_ndarray(&blob).unwrap();
                 let mask = lerc_reader::decode_mask_ndarray(&blob).unwrap().unwrap();
                 let (pixel_len, pixel_hash) = reference::array_hash(&raster);
                 let (mask_len, mask_hash) = reference::array_hash(&mask);

@@ -662,7 +662,11 @@ fn encoded_len_upper_bound_from_analysis<T: Sample, R: RasterSource<T>>(
     {
         0
     } else {
-        body_prefix_len(raster.data_type(), options.max_z_error)
+        body_prefix_len(
+            raster.data_type(),
+            options.max_z_error,
+            analysis.plan.version,
+        )
     };
     let tile_header_len = num_tiles
         .checked_mul(depth)
@@ -838,8 +842,12 @@ fn plan_raster<T: Sample, R: RasterSource<T>>(
     let tiling = plan_tiled_body(raster, mask, analysis)?;
     let mut best_body = BodyPlan::Tiled(tiling.clone());
     let mut best_version = tiling.version;
-    let mut best_non_one_len =
-        tiling.data_len + usize::from(needs_huffman_flag(analysis.data_type, analysis.max_z_error));
+    let mut best_non_one_len = tiling.data_len
+        + usize::from(needs_encode_mode_flag(
+            analysis.data_type,
+            analysis.max_z_error,
+            version_with_no_data(analysis, tiling.version),
+        ));
 
     if let Some(huffman) = build_huffman_plan(raster, mask, analysis)? {
         let huffman_total_len = huffman.data_len.checked_add(1).ok_or_else(|| {
@@ -1052,7 +1060,11 @@ fn write_tiled_body<T: Sample, R: RasterSource<T>>(
         height % micro
     };
     sink.push(0)?;
-    if needs_huffman_flag(analysis.data_type, analysis.max_z_error) {
+    if needs_encode_mode_flag(
+        analysis.data_type,
+        analysis.max_z_error,
+        analysis.plan.version,
+    ) {
         sink.push(0)?;
     }
 
@@ -1483,7 +1495,7 @@ fn build_huffman_plan<T: Sample, R: RasterSource<T>>(
     mask: Option<&[u8]>,
     analysis: &RasterAnalysis,
 ) -> Result<Option<HuffmanPlan>> {
-    if !needs_huffman_flag(analysis.data_type, analysis.max_z_error) {
+    if !supports_integer_huffman(analysis.data_type, analysis.max_z_error) {
         return Ok(None);
     }
 
@@ -2107,11 +2119,18 @@ fn header_len(version: i32) -> usize {
     }
 }
 
-fn body_prefix_len(data_type: DataType, max_z_error: f64) -> usize {
-    1 + usize::from(needs_huffman_flag(data_type, max_z_error))
+fn body_prefix_len(data_type: DataType, max_z_error: f64, version: i32) -> usize {
+    1 + usize::from(needs_encode_mode_flag(data_type, max_z_error, version))
 }
 
-fn needs_huffman_flag(data_type: DataType, max_z_error: f64) -> bool {
+fn needs_encode_mode_flag(data_type: DataType, max_z_error: f64, version: i32) -> bool {
+    supports_integer_huffman(data_type, max_z_error)
+        || (version >= VERSION_6
+            && matches!(data_type, DataType::F32 | DataType::F64)
+            && max_z_error == 0.0)
+}
+
+fn supports_integer_huffman(data_type: DataType, max_z_error: f64) -> bool {
     matches!(data_type, DataType::I8 | DataType::U8) && (max_z_error - 0.5).abs() < 1e-5
 }
 

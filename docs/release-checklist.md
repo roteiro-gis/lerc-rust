@@ -6,7 +6,8 @@ Use this checklist for coordinated `lerc-rust` workspace releases.
 
 1. Update `[workspace.package].version` in the root `Cargo.toml`.
 2. Update all internal dependency pins to the same version.
-3. Run the standard workspace checks:
+3. Update `CHANGELOG.md` with the release date and user-facing changes.
+4. Run the standard workspace checks:
 
 ```sh
 cargo fmt --all --check
@@ -24,14 +25,14 @@ cargo package -p lerc-band-materialize --offline
 ```
 
 For `lerc-reader` and `lerc-writer`, `cargo package` / `cargo publish --dry-run`
-resolve their internal dependencies from crates.io during verification. That
-means full verification only succeeds after matching versions of
-`lerc-core` and `lerc-band-materialize` have already been published. Before
-that point, use `--no-verify` for tarball sanity checks:
+resolve their internal dependencies from crates.io once path dependencies are
+rewritten. That means full package preparation only succeeds after matching
+versions of `lerc-core` and `lerc-band-materialize` have already been
+published. Before that point, use `--list` for tarball contents sanity checks:
 
 ```sh
-cargo package -p lerc-reader --no-verify --offline
-cargo package -p lerc-writer --no-verify --offline
+cargo package -p lerc-reader --list
+cargo package -p lerc-writer --list
 ```
 
 After the dependency crates are live on crates.io, rerun dry-runs for the

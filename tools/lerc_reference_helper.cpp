@@ -201,26 +201,43 @@ std::vector<int> pixel_shape_for(const BlobInfo& info) {
 
 std::vector<std::uint8_t> normalize_pixels(
     const std::vector<std::uint8_t>& raw,
+    const std::vector<std::uint8_t>& raw_masks,
     const BlobInfo& info) {
   const auto element_size = data_type_size(info.data_type);
+  const std::size_t pixel_count =
+      static_cast<std::size_t>(info.height) * static_cast<std::size_t>(info.width);
   std::vector<std::uint8_t> normalized;
   normalized.reserve(raw.size());
 
   for (int row = 0; row < info.height; ++row) {
     for (int col = 0; col < info.width; ++col) {
+      const std::size_t pixel =
+          static_cast<std::size_t>(row) * static_cast<std::size_t>(info.width) +
+          static_cast<std::size_t>(col);
       if (info.bands <= 1) {
+        const bool valid =
+            info.mask_count == 0 || raw_masks[pixel] != 0;
         for (int depth = 0; depth < std::max(info.depth, 1); ++depth) {
           auto raw_index = raw_sample_index(0, row, col, depth, info.height, info.width, std::max(info.depth, 1));
           auto offset = raw_index * element_size;
-          normalized.insert(
-              normalized.end(),
-              raw.begin() + static_cast<std::ptrdiff_t>(offset),
-              raw.begin() + static_cast<std::ptrdiff_t>(offset + element_size));
+          if (valid) {
+            normalized.insert(
+                normalized.end(),
+                raw.begin() + static_cast<std::ptrdiff_t>(offset),
+                raw.begin() + static_cast<std::ptrdiff_t>(offset + element_size));
+          } else {
+            normalized.insert(normalized.end(), element_size, 0);
+          }
         }
         continue;
       }
 
       for (int band = 0; band < info.bands; ++band) {
+        const bool valid =
+            info.mask_count == 0 ||
+            (info.mask_count == 1
+                 ? raw_masks[pixel] != 0
+                 : raw_masks[static_cast<std::size_t>(band) * pixel_count + pixel] != 0);
         for (int depth = 0; depth < std::max(info.depth, 1); ++depth) {
           auto raw_index = raw_sample_index(
               band,
@@ -231,10 +248,14 @@ std::vector<std::uint8_t> normalize_pixels(
               info.width,
               std::max(info.depth, 1));
           auto offset = raw_index * element_size;
-          normalized.insert(
-              normalized.end(),
-              raw.begin() + static_cast<std::ptrdiff_t>(offset),
-              raw.begin() + static_cast<std::ptrdiff_t>(offset + element_size));
+          if (valid) {
+            normalized.insert(
+                normalized.end(),
+                raw.begin() + static_cast<std::ptrdiff_t>(offset),
+                raw.begin() + static_cast<std::ptrdiff_t>(offset + element_size));
+          } else {
+            normalized.insert(normalized.end(), element_size, 0);
+          }
         }
       }
     }
@@ -381,7 +402,7 @@ DecodeResult decode_blob(const std::vector<std::uint8_t>& blob) {
 
   DecodeResult result;
   result.pixel_shape = pixel_shape_for(info);
-  result.pixel_bytes = normalize_pixels(raw, info);
+  result.pixel_bytes = normalize_pixels(raw, raw_masks, info);
   result.mask_shape = mask_shape_for(info);
   result.mask_bytes = normalize_masks(raw_masks, info);
   result.checksum = checksum_for(raw, info.data_type);

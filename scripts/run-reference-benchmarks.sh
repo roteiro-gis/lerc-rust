@@ -12,7 +12,7 @@ docker run --rm \
   -e RUSTFLAGS="${rustflags}" \
   -v "${repo_root}:/workspace" \
   -w /workspace \
-  "${image_name}" bash -lc '
+  "${image_name}" bash -c '
   helper="$(./scripts/build-reference-helper.sh)"
   LERC_READER_REFERENCE_HELPER="${helper}" cargo bench -p lerc-reader --bench reference_compare_bench -- --noplot
   cargo bench -p lerc-writer --bench encode_bench -- --noplot

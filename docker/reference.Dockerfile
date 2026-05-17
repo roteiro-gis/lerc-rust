@@ -1,4 +1,4 @@
-FROM rust:1.77-bookworm
+FROM rust:1-bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential cmake curl ca-certificates \

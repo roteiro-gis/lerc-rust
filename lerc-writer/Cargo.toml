@@ -13,11 +13,11 @@ keywords = ["lerc", "raster", "compression", "gis", "geospatial"]
 categories = ["compression", "science"]
 
 [dependencies]
-lerc-core = { version = "0.3.0", path = "../lerc-core" }
+lerc-core = { version = "0.4.0", path = "../lerc-core" }
 
 [dev-dependencies]
 criterion = "0.5"
-lerc-reader = { version = "0.3.0", path = "../lerc-reader" }
+lerc-reader = { version = "0.4.0", path = "../lerc-reader" }
 ndarray = { workspace = true }
 serde_json = "1"
 

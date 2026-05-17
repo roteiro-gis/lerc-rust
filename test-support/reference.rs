@@ -50,7 +50,8 @@ pub fn run_reference_json(helper: &Path, args: &[&str]) -> Value {
         .unwrap_or_else(|err| panic!("failed to run LERC reference helper: {err}"));
     assert!(
         output.status.success(),
-        "LERC reference helper failed: {}",
+        "LERC reference helper failed for {:?}: {}",
+        args,
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout)

@@ -229,7 +229,11 @@ fn decoded_pixels_and_masks_match_liblerc_hashes() {
                     byte_len,
                     reference_json["pixel_byte_len"].as_u64().unwrap() as usize
                 );
-                assert_eq!(hash, reference_json["pixel_hash"].as_str().unwrap());
+                assert_eq!(
+                    hash,
+                    reference_json["pixel_hash"].as_str().unwrap(),
+                    "{relative_path}"
+                );
                 assert_mask_hash(
                     relative_path,
                     lerc_reader::decode_mask_ndarray(&blob).unwrap(),
@@ -248,7 +252,11 @@ fn decoded_pixels_and_masks_match_liblerc_hashes() {
                     byte_len,
                     reference_json["pixel_byte_len"].as_u64().unwrap() as usize
                 );
-                assert_eq!(hash, reference_json["pixel_hash"].as_str().unwrap());
+                assert_eq!(
+                    hash,
+                    reference_json["pixel_hash"].as_str().unwrap(),
+                    "{relative_path}"
+                );
                 assert_mask_hash(
                     relative_path,
                     lerc_reader::decode_mask_ndarray(&blob).unwrap(),
@@ -319,7 +327,7 @@ fn synthetic_v6_no_data_blob_matches_liblerc_metadata_and_hashes() {
     );
     assert_eq!(info.no_data_value, Some(-9999.0));
 
-    let raster = lerc_reader::decode_ndarray_f64(&blob).unwrap();
+    let raster: ArrayD<f32> = lerc_reader::decode_ndarray(&blob).unwrap();
     let (byte_len, hash) = reference::array_hash(&raster);
     assert_eq!(
         raster.shape(),
