@@ -226,7 +226,9 @@ fn diff_tile_band_set_roundtrip(data: &[u8]) {
     let band_count = 2usize;
     let mut values = Vec::with_capacity(width * height * depth * band_count);
     for pixel in 0..(width * height) {
-        let base = u16::from(data.get(pixel % data.len().max(1)).copied().unwrap_or(pixel as u8));
+        let base = (pixel as u16)
+            .wrapping_mul(3)
+            .wrapping_add(u16::from(data[pixel % data.len()]));
         values.push(base);
         values.push(base);
         values.push(base.wrapping_add(3));
