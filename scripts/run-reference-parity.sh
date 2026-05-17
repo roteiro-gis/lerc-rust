@@ -9,10 +9,12 @@ rustflags="${RUSTFLAGS:--D warnings}"
 docker build -f "${repo_root}/docker/reference.Dockerfile" -t "${image_name}" "${repo_root}"
 docker run --rm \
   -e CARGO_TERM_COLOR="${cargo_term_color}" \
+  -e CARGO_TARGET_DIR=/tmp/lerc-target \
+  -e LERC_REFERENCE_BUILD_DIR=/tmp/lerc-reference \
   -e RUSTFLAGS="${rustflags}" \
   -v "${repo_root}:/workspace" \
   -w /workspace \
-  "${image_name}" bash -lc '
+  "${image_name}" bash -c '
   helper="$(./scripts/build-reference-helper.sh)"
   LERC_READER_REFERENCE_HELPER="${helper}" cargo test -p lerc-reader --test reference_parity
   LERC_READER_REFERENCE_HELPER="${helper}" cargo test -p lerc-writer --test reference_parity

@@ -373,8 +373,8 @@ fn read_offset_if_present(cursor: &mut Cursor<'_>, header_byte: u8) -> Result<Op
 fn read_offset(cursor: &mut Cursor<'_>, offset_type: u8) -> Result<f32> {
     match offset_type {
         0 => cursor.read_f32(),
-        1 => Ok(cursor.read_i16()? as f32),
-        2 => Ok(i8::from_le_bytes([cursor.read_u8()?]) as f32),
+        1 => Ok(read_u16(cursor.read_bytes(2)?)? as f32),
+        2 => Ok(cursor.read_u8()? as f32),
         _ => Err(Error::InvalidBlob(format!(
             "invalid Lerc1 block offset type {offset_type}"
         ))),

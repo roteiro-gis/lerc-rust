@@ -639,14 +639,14 @@ fn decode_pixels_typed<T: Sample>(
         _ => unreachable!("Lerc2 decode called with a non-Lerc2 blob"),
     };
 
-    if version > 1 && info.data_type.code() <= 1 && (info.max_z_error - 0.5).abs() < 1e-5 {
-        let encode_mode = cursor.read_u8()?;
-        if encode_mode > 2 || (version < 4 && encode_mode > 1) {
-            return Err(Error::InvalidBlob(format!(
-                "invalid Huffman flag {encode_mode}"
-            )));
-        }
+    if needs_encode_mode_flag(info, version) {
+        let encode_mode = read_encode_mode(cursor, version)?;
         if encode_mode != 0 {
+            if !supports_integer_huffman(info) {
+                return Err(Error::UnsupportedFeature(
+                    "Lerc2 floating-point Huffman decode",
+                ));
+            }
             return decode_huffman::<T>(cursor, info, mask, encode_mode == 1);
         }
     }
@@ -701,14 +701,14 @@ fn decode_pixels_into_typed<T: Sample, W: BandWriter<T>>(
         _ => unreachable!("Lerc2 decode called with a non-Lerc2 blob"),
     };
 
-    if version > 1 && info.data_type.code() <= 1 && (info.max_z_error - 0.5).abs() < 1e-5 {
-        let encode_mode = cursor.read_u8()?;
-        if encode_mode > 2 || (version < 4 && encode_mode > 1) {
-            return Err(Error::InvalidBlob(format!(
-                "invalid Huffman flag {encode_mode}"
-            )));
-        }
+    if needs_encode_mode_flag(info, version) {
+        let encode_mode = read_encode_mode(cursor, version)?;
         if encode_mode != 0 {
+            if !supports_integer_huffman(info) {
+                return Err(Error::UnsupportedFeature(
+                    "Lerc2 floating-point Huffman decode",
+                ));
+            }
             return decode_huffman_into(cursor, info, mask, encode_mode == 1, out);
         }
     }
@@ -719,6 +719,27 @@ fn decode_pixels_into_typed<T: Sample, W: BandWriter<T>>(
 enum ConstantValues<'a> {
     Single(f64),
     PerDepth(&'a [f64]),
+}
+
+fn needs_encode_mode_flag(info: &BlobInfo, version: u32) -> bool {
+    supports_integer_huffman(info)
+        || (version >= 6
+            && matches!(info.data_type, DataType::F32 | DataType::F64)
+            && info.max_z_error == 0.0)
+}
+
+fn supports_integer_huffman(info: &BlobInfo) -> bool {
+    matches!(info.data_type, DataType::I8 | DataType::U8) && (info.max_z_error - 0.5).abs() < 1e-5
+}
+
+fn read_encode_mode(cursor: &mut Cursor<'_>, version: u32) -> Result<u8> {
+    let encode_mode = cursor.read_u8()?;
+    if encode_mode > 3 || (version < 6 && encode_mode > 2) || (version < 4 && encode_mode > 1) {
+        return Err(Error::InvalidBlob(format!(
+            "invalid Lerc2 encode mode flag {encode_mode}"
+        )));
+    }
+    Ok(encode_mode)
 }
 
 fn constant_pixels<T: Sample>(

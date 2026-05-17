@@ -440,6 +440,39 @@ fn decodes_lerc1_masked_bitstuffed_block() {
 }
 
 #[test]
+fn decodes_lerc1_unsigned_byte_offsets() {
+    let quantized = [0, 1, 2, 3];
+    let payload = pack_msb_bits(&quantized, 2);
+    let pixel_section_len = 1 + 1 + 1 + 1 + payload.len();
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"CntZImage ");
+    blob.extend_from_slice(&11i32.to_le_bytes());
+    blob.extend_from_slice(&0i32.to_le_bytes());
+    blob.extend_from_slice(&2u32.to_le_bytes());
+    blob.extend_from_slice(&2u32.to_le_bytes());
+    blob.extend_from_slice(&0.1f64.to_le_bytes());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&1.0f32.to_le_bytes());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(pixel_section_len as u32).to_le_bytes());
+    blob.extend_from_slice(&200.6f32.to_le_bytes());
+    blob.push((2 << 6) | 1);
+    blob.push(200);
+    blob.push(2 | (2 << 6));
+    blob.push(4);
+    blob.extend_from_slice(&payload);
+
+    let decoded = decode(&blob).unwrap();
+    assert_eq!(
+        decoded.pixels,
+        PixelData::F32(vec![200.0, 200.2, 200.4, 200.6])
+    );
+}
+
+#[test]
 fn lerc1_with_mask_prefers_inline_masked_blob_over_caller_mask() {
     let blob = build_lerc1_blob(true, Some(&[1, 0, 1, 1]), &[1.0, 3.0, 4.0], 0.5, 4.0);
     let caller_mask = [1u8, 1, 1, 1];
