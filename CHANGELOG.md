@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.2 - 2026-05-17
+
+### Fixed
+
+- Rejected oversized Lerc2 mask bitsets, decoded masks, constant pixel buffers, one-sweep outputs, tile outputs, and Huffman outputs before allocating.
+- Rejected oversized Lerc1 block tables, decoded masks, pixel buffers, and block buffers before allocating.
+- Rejected oversized decoded band masks and band materializer buffers before allocating.
+
 ## 0.4.1 - 2026-05-17
 
 ### Fixed

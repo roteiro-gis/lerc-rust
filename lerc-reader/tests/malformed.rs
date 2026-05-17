@@ -4,7 +4,8 @@ use lerc_core::Error;
 mod lerc_test;
 
 use lerc_test::{
-    build_header_v2, encode_mask_rle, finalize_lerc2_with_checksum, pack_msb_bits, HeaderV2,
+    build_header_v2, build_header_v6, encode_mask_rle, finalize_lerc2_with_checksum, pack_msb_bits,
+    HeaderV2, HeaderV6,
 };
 
 fn build_lerc1_blob_with_stuffed_count(
@@ -121,10 +122,8 @@ fn rejects_mask_rle_with_trailing_bytes_after_sentinel() {
     blob.push(1);
     blob.extend_from_slice(&[1, 2, 3]);
 
-    assert!(matches!(
-        lerc_reader::decode(&blob),
-        Err(Error::InvalidBlob(_))
-    ));
+    let result = lerc_reader::decode(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
 }
 
 #[test]
@@ -189,10 +188,8 @@ fn rejects_no_data_flag_for_unit_depth_lerc2_header() {
 #[test]
 fn rejects_lerc1_stuffed_block_with_mismatched_valid_count() {
     let blob = build_lerc1_blob_with_stuffed_count(&[1, 0, 0, 0], &[1.0], 2);
-    assert!(matches!(
-        lerc_reader::decode(&blob),
-        Err(Error::InvalidBlob(_))
-    ));
+    let result = lerc_reader::decode(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
 }
 
 #[test]
@@ -204,10 +201,8 @@ fn rejects_invalid_huffman_table_header() {
     table_payload.extend_from_slice(&0i32.to_le_bytes());
     let blob = build_huffman_blob(&table_payload);
 
-    assert!(matches!(
-        lerc_reader::decode(&blob),
-        Err(Error::InvalidBlob(_))
-    ));
+    let result = lerc_reader::decode(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
 }
 
 #[test]
@@ -217,10 +212,8 @@ fn rejects_huffman_table_span_that_exceeds_symbol_count_without_allocating() {
         0x10,
     ]);
 
-    assert!(matches!(
-        lerc_reader::decode(&blob),
-        Err(Error::InvalidBlob(_))
-    ));
+    let result = lerc_reader::decode(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
 }
 
 #[test]
@@ -282,6 +275,55 @@ fn rejects_lerc2_checksum_range_shorter_than_header_prefix() {
             "blob size is smaller than checksum range"
         ))
     ));
+}
+
+#[test]
+fn rejects_huge_lerc2_mask_before_allocating() {
+    let mut blob = build_header_v2(HeaderV2 {
+        width: u32::MAX,
+        height: u32::MAX,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 0.0,
+        z_max: 1.0,
+        payload_len: 2,
+    });
+    blob.extend_from_slice(&2u32.to_le_bytes());
+    blob.extend_from_slice(&i16::MIN.to_le_bytes());
+
+    let result = lerc_reader::decode(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+}
+
+#[test]
+fn rejects_huge_lerc2_constant_output_before_allocating() {
+    let mut mask = Vec::new();
+    mask.extend_from_slice(&1i16.to_le_bytes());
+    mask.push(0x80);
+    mask.extend_from_slice(&(-32767i16).to_le_bytes());
+    mask.push(0);
+    mask.extend_from_slice(&i16::MIN.to_le_bytes());
+
+    let mut blob = build_header_v6(HeaderV6 {
+        width: 512,
+        height: 512,
+        depth: u32::MAX,
+        valid_pixel_count: 1,
+        image_type: 7,
+        max_z_error: 0.0,
+        z_min: 1.0,
+        z_max: 1.0,
+        internal_no_data_value: -9999.0,
+        original_no_data_value: -9999.0,
+        payload_len: mask.len(),
+    });
+    blob.extend_from_slice(&(mask.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&mask);
+    let blob = finalize_lerc2_with_checksum(blob);
+
+    let result = lerc_reader::decode(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
 }
 
 #[test]

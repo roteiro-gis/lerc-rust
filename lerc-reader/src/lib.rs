@@ -15,6 +15,7 @@
 //! - decode only the first promoted `f64` blob with [`decode_first_to_f64`]
 //! - decode directly into `ndarray::ArrayD` with [`decode_ndarray`]
 
+mod allocation;
 mod bitstuff;
 mod huffman;
 mod io;

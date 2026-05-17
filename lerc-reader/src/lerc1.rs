@@ -1,5 +1,6 @@
 use lerc_core::{BlobInfo, DataType, Error, MaskEncoding, PixelData, Result, Version};
 
+use crate::allocation::{checked_mul, default_vec, vec_with_capacity};
 use crate::bitstuff::{unstuff_v2, UnstuffOptions};
 use crate::io::Cursor;
 use crate::pixel::{count_valid_in_block, words_from_padded, Sample};
@@ -210,7 +211,12 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
         None => num_pixels as u32,
     };
 
-    let mut blocks = Vec::with_capacity(actual_num_blocks_x * actual_num_blocks_y);
+    let block_count = checked_mul(
+        actual_num_blocks_x,
+        actual_num_blocks_y,
+        "Lerc1 block count",
+    )?;
+    let mut blocks = vec_with_capacity(block_count, "Lerc1 block table")?;
     for block_y in 0..actual_num_blocks_y {
         let this_block_height = block_height(
             block_y,
@@ -400,12 +406,15 @@ fn read_mask(
         let bitset = crate::lerc2::decode_mask_rle(cursor.read_bytes(num_bytes)?, bitset_len)?;
         return Ok((
             MaskEncoding::Explicit,
-            Some(crate::lerc2::unpack_mask_bitset(&bitset, num_pixels)),
+            Some(crate::lerc2::unpack_mask_bitset(&bitset, num_pixels)?),
         ));
     }
 
     if num_blocks_y == 0 && num_blocks_x == 0 && max_value == 0.0 {
-        return Ok((MaskEncoding::ImplicitAllInvalid, Some(vec![0; num_pixels])));
+        return Ok((
+            MaskEncoding::ImplicitAllInvalid,
+            Some(default_vec(num_pixels, "Lerc1 implicit mask")?),
+        ));
     }
 
     Ok((MaskEncoding::None, None))
@@ -415,8 +424,14 @@ fn decode_pixels<T: Sample>(parsed: &Lerc1Blob) -> Result<TypedPixels<T>> {
     let width = parsed.info.width as usize;
     let height = parsed.info.height as usize;
     let mask = parsed.mask.as_deref();
-    let mut result = vec![T::default(); width * height];
-    let mut block_buffer = vec![0.0f64; parsed.base_block_width * parsed.base_block_height];
+    let pixel_count = checked_mul(width, height, "Lerc1 pixel count")?;
+    let mut result = default_vec(pixel_count, "Lerc1 pixel buffer")?;
+    let block_samples = checked_mul(
+        parsed.base_block_width,
+        parsed.base_block_height,
+        "Lerc1 base block sample count",
+    )?;
+    let mut block_buffer = default_vec(block_samples, "Lerc1 base block buffer")?;
     let mut block_index = 0usize;
     let mut min_value = f64::INFINITY;
     let mut max_value = f64::NEG_INFINITY;
@@ -538,7 +553,12 @@ fn decode_pixels_into<T: Sample, W: BandWriter<T>>(
     let width = parsed.info.width as usize;
     let height = parsed.info.height as usize;
     let mask = parsed.mask.as_deref();
-    let mut block_buffer = vec![0.0f64; parsed.base_block_width * parsed.base_block_height];
+    let block_samples = checked_mul(
+        parsed.base_block_width,
+        parsed.base_block_height,
+        "Lerc1 base block sample count",
+    )?;
+    let mut block_buffer = default_vec(block_samples, "Lerc1 base block buffer")?;
     let mut block_index = 0usize;
     let mut min_value = f64::INFINITY;
     let mut max_value = f64::NEG_INFINITY;
@@ -654,7 +674,12 @@ fn decode_pixels_into<T: Sample, W: BandWriter<T>>(
 fn scan_range(parsed: &Lerc1Blob) -> Result<(f64, f64)> {
     let mut min_value = f64::INFINITY;
     let mut max_value = f64::NEG_INFINITY;
-    let mut block_buffer = vec![0.0f64; parsed.base_block_width * parsed.base_block_height];
+    let block_samples = checked_mul(
+        parsed.base_block_width,
+        parsed.base_block_height,
+        "Lerc1 base block sample count",
+    )?;
+    let mut block_buffer = default_vec(block_samples, "Lerc1 base block buffer")?;
 
     for block in &parsed.blocks {
         if block.valid_pixel_count == 0 {

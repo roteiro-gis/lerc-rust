@@ -1,5 +1,6 @@
 use std::cmp;
 
+use crate::allocation::default_vec;
 use crate::bitstuff::decode_bits;
 use crate::io::Cursor;
 use crate::pixel::{output_value, sample_index, words_from_padded, Sample};
@@ -51,7 +52,7 @@ pub(crate) fn decode_huffman<T: Sample>(
     let height = info.height as usize;
     let depth = info.depth as usize;
     let sample_count = info.sample_count()?;
-    let mut result = vec![T::default(); sample_count];
+    let mut result: Vec<T> = default_vec(sample_count, "Lerc2 Huffman output")?;
 
     let huffman = read_huffman_tree(cursor, info)?;
     let mut stream = HuffmanStream {

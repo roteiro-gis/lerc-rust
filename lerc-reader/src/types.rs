@@ -6,6 +6,8 @@ use lerc_band_materialize::{
 use lerc_core::{BandLayout, BandSetInfo, BlobInfo, Error, PixelData, Result};
 use ndarray::{ArrayD, IxDyn};
 
+use crate::allocation::{checked_mul, default_vec, vec_with_capacity};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decoded {
     pub info: BlobInfo,
@@ -148,7 +150,8 @@ pub fn into_band_mask_ndarray(
             .into_iter()
             .next()
             .flatten()
-            .unwrap_or_else(|| vec![1; pixel_count]);
+            .map(Ok)
+            .unwrap_or_else(|| default_vec(pixel_count, "decoded band mask"))?;
         return ArrayD::from_shape_vec(IxDyn(&shape), mask)
             .map(Some)
             .map_err(|err| {
@@ -156,7 +159,8 @@ pub fn into_band_mask_ndarray(
             });
     }
 
-    let mut merged = Vec::with_capacity(pixel_count * band_count);
+    let merged_len = checked_mul(pixel_count, band_count, "decoded band mask length")?;
+    let mut merged = vec_with_capacity(merged_len, "decoded band mask")?;
     for pixel in 0..pixel_count {
         for band_mask in &band_masks {
             merged.push(band_mask.as_ref().map(|mask| mask[pixel]).unwrap_or(1));
