@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 - 2026-05-17
+
+### Fixed
+
+- Rejected malformed Lerc2 bit-stuffed payloads without panicking.
+- Rejected malformed Huffman table metadata before oversized allocation or invalid bit reads.
+- Fixed direct band materialization when tiled decode changes write-order hints after sparse/default-filled paths.
+
+### Added
+
+- Added malformed codec regression tests and a structured Lerc2 bitstuff fuzz target.
+
 ## 0.4.0 - 2026-05-16
 
 ### Added
