@@ -66,7 +66,7 @@ pub(crate) fn decode_bits(
                 offset,
                 2.0 * max_z_error,
                 max_value,
-            )
+            )?
         } else {
             unstuff_lut_v2(
                 &lut_words,
@@ -75,7 +75,7 @@ pub(crate) fn decode_bits(
                 offset,
                 2.0 * max_z_error,
                 max_value,
-            )
+            )?
         };
 
         if version >= 3 {
@@ -90,7 +90,7 @@ pub(crate) fn decode_bits(
                     scale: 0.0,
                     max_value,
                 },
-            );
+            )?;
         } else {
             unstuff_v2(
                 &stuffed_words,
@@ -103,7 +103,7 @@ pub(crate) fn decode_bits(
                     scale: 0.0,
                     max_value,
                 },
-            );
+            )?;
         }
         return Ok(num_elements);
     }
@@ -142,7 +142,7 @@ pub(crate) fn decode_bits(
             },
         ),
         (false, None) => original_unstuff_v2(&stuffed_words, &mut out[..num_elements], num_bits),
-    }
+    }?;
     Ok(num_elements)
 }
 
@@ -151,15 +151,25 @@ pub(crate) fn unstuff_v2(
     dest: &mut [f64],
     bits_per_pixel: u8,
     options: UnstuffOptions<'_>,
-) {
-    let bit_mask = if bits_per_pixel == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bits_per_pixel) - 1
-    };
+) -> Result<()> {
+    let bit_mask = bit_mask(bits_per_pixel)?;
+    let expected_bytes = packed_byte_len(bits_per_pixel, options.num_pixels)?;
+    let available_bytes = word_bytes(src)?;
+    if expected_bytes > available_bytes {
+        return Err(Error::Truncated {
+            offset: available_bytes,
+            needed: expected_bytes - available_bytes,
+            available: 0,
+        });
+    }
+
     let mut words = src.to_vec();
-    let num_invalid_tail_bytes =
-        words.len() * 4 - (usize::from(bits_per_pixel) * options.num_pixels).div_ceil(8);
+    let num_invalid_tail_bytes = available_bytes - expected_bytes;
+    if num_invalid_tail_bytes >= 4 {
+        return Err(Error::InvalidBlob(
+            "bit-stuffed payload has extra padded words".into(),
+        ));
+    }
     if let Some(last) = words.last_mut() {
         *last <<= 8 * num_invalid_tail_bytes;
     }
@@ -172,32 +182,29 @@ pub(crate) fn unstuff_v2(
         .map(|offset| quantized_nmax(offset, options.scale, options.max_value));
 
     for item in dest.iter_mut().take(options.num_pixels) {
-        if bits_left == 0 {
-            buffer = words[index];
-            index += 1;
-            bits_left = 32;
-        }
-        let n = if bits_left >= bits_per_pixel as usize {
-            let n = (buffer >> (bits_left - bits_per_pixel as usize)) & bit_mask;
-            bits_left -= bits_per_pixel as usize;
-            n
+        let n = if bits_per_pixel == 0 {
+            0
         } else {
-            let missing_bits = bits_per_pixel as usize - bits_left;
-            let mut n = ((buffer & bit_mask) << missing_bits) & bit_mask;
-            buffer = words[index];
-            index += 1;
-            bits_left = 32 - missing_bits;
-            n += buffer >> bits_left;
-            n
-        };
-        *item = match (options.lut_values, options.offset) {
-            (Some(lut_values), _) => lut_values[n as usize],
-            (None, Some(offset)) => {
-                quantized_value(offset, options.scale, options.max_value, n, nmax.unwrap())
+            if bits_left == 0 {
+                buffer = read_word(&words, &mut index)?;
+                bits_left = 32;
             }
-            (None, None) => n as f64,
+            if bits_left >= bits_per_pixel as usize {
+                let n = (buffer >> (bits_left - bits_per_pixel as usize)) & bit_mask;
+                bits_left -= bits_per_pixel as usize;
+                n
+            } else {
+                let missing_bits = bits_per_pixel as usize - bits_left;
+                let mut n = ((buffer & bit_mask) << missing_bits) & bit_mask;
+                buffer = read_word(&words, &mut index)?;
+                bits_left = 32 - missing_bits;
+                n += buffer >> bits_left;
+                n
+            }
         };
+        *item = unstuffed_value(n, &options, nmax)?;
     }
+    Ok(())
 }
 
 pub(crate) fn unstuff_v3(
@@ -205,12 +212,18 @@ pub(crate) fn unstuff_v3(
     dest: &mut [f64],
     bits_per_pixel: u8,
     options: UnstuffOptions<'_>,
-) {
-    let bit_mask = if bits_per_pixel == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bits_per_pixel) - 1
-    };
+) -> Result<()> {
+    let bit_mask = bit_mask(bits_per_pixel)?;
+    let expected_bytes = packed_byte_len(bits_per_pixel, options.num_pixels)?;
+    let available_bytes = word_bytes(src)?;
+    if expected_bytes > available_bytes {
+        return Err(Error::Truncated {
+            offset: available_bytes,
+            needed: expected_bytes - available_bytes,
+            available: 0,
+        });
+    }
+
     let mut index = 0usize;
     let mut bits_left = 0usize;
     let mut bit_pos = 0usize;
@@ -220,39 +233,36 @@ pub(crate) fn unstuff_v3(
         .map(|offset| quantized_nmax(offset, options.scale, options.max_value));
 
     for item in dest.iter_mut().take(options.num_pixels) {
-        if bits_left == 0 {
-            buffer = src[index];
-            index += 1;
-            bits_left = 32;
-            bit_pos = 0;
-        }
-        let n = if bits_left >= bits_per_pixel as usize {
-            let n = (buffer >> bit_pos) & bit_mask;
-            bits_left -= bits_per_pixel as usize;
-            bit_pos += bits_per_pixel as usize;
-            n
+        let n = if bits_per_pixel == 0 {
+            0
         } else {
-            let missing_bits = bits_per_pixel as usize - bits_left;
-            let mut n = (buffer >> bit_pos) & bit_mask;
-            buffer = src[index];
-            index += 1;
-            bits_left = 32 - missing_bits;
-            n |=
-                (buffer & ((1u32 << missing_bits) - 1)) << (bits_per_pixel as usize - missing_bits);
-            bit_pos = missing_bits;
-            n
-        };
-        *item = match (options.lut_values, options.offset) {
-            (Some(lut_values), _) => lut_values[n as usize],
-            (None, Some(offset)) => {
-                quantized_value(offset, options.scale, options.max_value, n, nmax.unwrap())
+            if bits_left == 0 {
+                buffer = read_word(src, &mut index)?;
+                bits_left = 32;
+                bit_pos = 0;
             }
-            (None, None) => n as f64,
+            if bits_left >= bits_per_pixel as usize {
+                let n = (buffer >> bit_pos) & bit_mask;
+                bits_left -= bits_per_pixel as usize;
+                bit_pos += bits_per_pixel as usize;
+                n
+            } else {
+                let missing_bits = bits_per_pixel as usize - bits_left;
+                let mut n = (buffer >> bit_pos) & bit_mask;
+                buffer = read_word(src, &mut index)?;
+                bits_left = 32 - missing_bits;
+                n |= (buffer & ((1u32 << missing_bits) - 1))
+                    << (bits_per_pixel as usize - missing_bits);
+                bit_pos = missing_bits;
+                n
+            }
         };
+        *item = unstuffed_value(n, &options, nmax)?;
     }
+    Ok(())
 }
 
-pub(crate) fn original_unstuff_v2(src: &[u32], dest: &mut [f64], bits_per_pixel: u8) {
+pub(crate) fn original_unstuff_v2(src: &[u32], dest: &mut [f64], bits_per_pixel: u8) -> Result<()> {
     unstuff_v2(
         src,
         dest,
@@ -264,10 +274,10 @@ pub(crate) fn original_unstuff_v2(src: &[u32], dest: &mut [f64], bits_per_pixel:
             scale: 0.0,
             max_value: 0.0,
         },
-    );
+    )
 }
 
-pub(crate) fn original_unstuff_v3(src: &[u32], dest: &mut [f64], bits_per_pixel: u8) {
+pub(crate) fn original_unstuff_v3(src: &[u32], dest: &mut [f64], bits_per_pixel: u8) -> Result<()> {
     unstuff_v3(
         src,
         dest,
@@ -279,7 +289,7 @@ pub(crate) fn original_unstuff_v3(src: &[u32], dest: &mut [f64], bits_per_pixel:
             scale: 0.0,
             max_value: 0.0,
         },
-    );
+    )
 }
 
 fn unstuff_lut_v2(
@@ -289,7 +299,7 @@ fn unstuff_lut_v2(
     offset: f64,
     scale: f64,
     max_value: f64,
-) -> Vec<f64> {
+) -> Result<Vec<f64>> {
     let mut values = vec![0.0; num_pixels];
     unstuff_v2(
         src,
@@ -302,11 +312,11 @@ fn unstuff_lut_v2(
             scale,
             max_value,
         },
-    );
+    )?;
     let mut out = Vec::with_capacity(values.len() + 1);
     out.push(offset);
     out.extend(values);
-    out
+    Ok(out)
 }
 
 fn unstuff_lut_v3(
@@ -316,7 +326,7 @@ fn unstuff_lut_v3(
     offset: f64,
     scale: f64,
     max_value: f64,
-) -> Vec<f64> {
+) -> Result<Vec<f64>> {
     let mut values = vec![0.0; num_pixels];
     unstuff_v3(
         src,
@@ -329,11 +339,67 @@ fn unstuff_lut_v3(
             scale,
             max_value,
         },
-    );
+    )?;
     let mut out = Vec::with_capacity(values.len() + 1);
     out.push(offset);
     out.extend(values);
-    out
+    Ok(out)
+}
+
+fn bit_mask(bits_per_pixel: u8) -> Result<u32> {
+    match bits_per_pixel {
+        0 => Ok(0),
+        1..=31 => Ok((1u32 << bits_per_pixel) - 1),
+        32 => Ok(u32::MAX),
+        _ => Err(Error::InvalidBlob(
+            "bit-stuffed block uses more than 32 bits per pixel".into(),
+        )),
+    }
+}
+
+fn packed_byte_len(bits_per_pixel: u8, num_pixels: usize) -> Result<usize> {
+    usize::from(bits_per_pixel)
+        .checked_mul(num_pixels)
+        .map(|bits| bits.div_ceil(8))
+        .ok_or_else(|| Error::InvalidBlob("bit-stuffed payload bit count overflows usize".into()))
+}
+
+fn word_bytes(words: &[u32]) -> Result<usize> {
+    words
+        .len()
+        .checked_mul(4)
+        .ok_or_else(|| Error::InvalidBlob("bit-stuffed word count overflows usize".into()))
+}
+
+fn read_word(words: &[u32], index: &mut usize) -> Result<u32> {
+    let word = words.get(*index).copied().ok_or_else(|| {
+        let offset = (*index).saturating_mul(4);
+        let total = words.len().saturating_mul(4);
+        Error::Truncated {
+            offset,
+            needed: 4,
+            available: total.saturating_sub(offset),
+        }
+    })?;
+    *index += 1;
+    Ok(word)
+}
+
+fn unstuffed_value(n: u32, options: &UnstuffOptions<'_>, nmax: Option<f64>) -> Result<f64> {
+    match (options.lut_values, options.offset) {
+        (Some(lut_values), _) => lut_values
+            .get(n as usize)
+            .copied()
+            .ok_or_else(|| Error::InvalidBlob("bit-stuffed LUT index is outside the LUT".into())),
+        (None, Some(offset)) => Ok(quantized_value(
+            offset,
+            options.scale,
+            options.max_value,
+            n,
+            nmax.unwrap(),
+        )),
+        (None, None) => Ok(n as f64),
+    }
 }
 
 fn quantized_nmax(offset: f64, scale: f64, max_value: f64) -> f64 {

@@ -223,3 +223,49 @@ fn rejects_non_lerc_trailing_segment_in_band_count() {
         Err(Error::InvalidMagic)
     ));
 }
+
+#[test]
+fn rejects_lerc2_checksum_range_shorter_than_header_prefix() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"Lerc2 ");
+    bytes.extend_from_slice(&3i32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&8i32.to_le_bytes());
+    bytes.extend_from_slice(&8i32.to_le_bytes());
+    bytes.extend_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+
+    assert!(matches!(
+        lerc_reader::get_blob_info(&bytes),
+        Err(Error::InvalidHeader(
+            "blob size is smaller than checksum range"
+        ))
+    ));
+}
+
+#[test]
+fn rejects_truncated_bit_stuffed_lerc2_block_without_panicking() {
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 2,
+        height: 1,
+        valid_pixel_count: 2,
+        image_type: 1,
+        max_z_error: 0.5,
+        z_min: 0.0,
+        z_max: 4.0,
+        payload_len: 4 + 1 + 1,
+    });
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.push(17);
+    blob.push(0xff);
+
+    assert!(matches!(
+        lerc_reader::decode(&blob),
+        Err(Error::Truncated { .. })
+    ));
+}
