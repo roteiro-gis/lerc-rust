@@ -47,6 +47,24 @@ fn build_lerc1_blob_with_stuffed_count(
     bytes
 }
 
+fn build_huffman_blob(table_payload: &[u8]) -> Vec<u8> {
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.5,
+        z_min: 0.0,
+        z_max: 255.0,
+        payload_len: 1 + 1 + table_payload.len(),
+    });
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.push(0);
+    blob.push(1);
+    blob.extend_from_slice(table_payload);
+    blob
+}
+
 #[test]
 fn strict_single_blob_api_rejects_concatenated_payload() {
     let mut blob1 = build_header_v2(HeaderV2 {
@@ -179,23 +197,41 @@ fn rejects_lerc1_stuffed_block_with_mismatched_valid_count() {
 
 #[test]
 fn rejects_invalid_huffman_table_header() {
-    let mut blob = build_header_v2(HeaderV2 {
-        width: 1,
-        height: 1,
-        valid_pixel_count: 1,
-        image_type: 1,
-        max_z_error: 0.5,
-        z_min: 0.0,
-        z_max: 255.0,
-        payload_len: 1 + 1 + 16,
-    });
-    blob.extend_from_slice(&0u32.to_le_bytes());
-    blob.push(0);
-    blob.push(1);
-    blob.extend_from_slice(&2i32.to_le_bytes());
-    blob.extend_from_slice(&0i32.to_le_bytes());
-    blob.extend_from_slice(&0i32.to_le_bytes());
-    blob.extend_from_slice(&0i32.to_le_bytes());
+    let mut table_payload = Vec::new();
+    table_payload.extend_from_slice(&2i32.to_le_bytes());
+    table_payload.extend_from_slice(&0i32.to_le_bytes());
+    table_payload.extend_from_slice(&0i32.to_le_bytes());
+    table_payload.extend_from_slice(&0i32.to_le_bytes());
+    let blob = build_huffman_blob(&table_payload);
+
+    assert!(matches!(
+        lerc_reader::decode(&blob),
+        Err(Error::InvalidBlob(_))
+    ));
+}
+
+#[test]
+fn rejects_huffman_table_span_that_exceeds_symbol_count_without_allocating() {
+    let blob = build_huffman_blob(&[
+        0x7b, 0x7b, 0x7b, 0x7a, 0x7b, 0x7b, 0x7b, 0x2b, 0x02, 0x00, 0x00, 0x00, 0x2b, 0x2b, 0x86,
+        0x10,
+    ]);
+
+    assert!(matches!(
+        lerc_reader::decode(&blob),
+        Err(Error::InvalidBlob(_))
+    ));
+}
+
+#[test]
+fn rejects_huffman_code_length_that_exceeds_bitstream_width() {
+    let mut table_payload = Vec::new();
+    table_payload.extend_from_slice(&2i32.to_le_bytes());
+    table_payload.extend_from_slice(&1i32.to_le_bytes());
+    table_payload.extend_from_slice(&0i32.to_le_bytes());
+    table_payload.extend_from_slice(&1i32.to_le_bytes());
+    table_payload.extend_from_slice(&[0x86, 0x01, 0x84]);
+    let blob = build_huffman_blob(&table_payload);
 
     assert!(matches!(
         lerc_reader::decode(&blob),
@@ -221,5 +257,51 @@ fn rejects_non_lerc_trailing_segment_in_band_count() {
     assert!(matches!(
         lerc_reader::get_band_count(&blob),
         Err(Error::InvalidMagic)
+    ));
+}
+
+#[test]
+fn rejects_lerc2_checksum_range_shorter_than_header_prefix() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"Lerc2 ");
+    bytes.extend_from_slice(&3i32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&8i32.to_le_bytes());
+    bytes.extend_from_slice(&8i32.to_le_bytes());
+    bytes.extend_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+
+    assert!(matches!(
+        lerc_reader::get_blob_info(&bytes),
+        Err(Error::InvalidHeader(
+            "blob size is smaller than checksum range"
+        ))
+    ));
+}
+
+#[test]
+fn rejects_truncated_bit_stuffed_lerc2_block_without_panicking() {
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 2,
+        height: 1,
+        valid_pixel_count: 2,
+        image_type: 1,
+        max_z_error: 0.5,
+        z_min: 0.0,
+        z_max: 4.0,
+        payload_len: 4 + 1 + 1,
+    });
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.push(17);
+    blob.push(0xff);
+
+    assert!(matches!(
+        lerc_reader::decode(&blob),
+        Err(Error::Truncated { .. })
     ));
 }

@@ -7,6 +7,8 @@ use lerc_band_materialize::{BandWriteOrder, BandWriter};
 use lerc_core::{BlobInfo, Error, PixelData, Result, Version};
 
 const HUFFMAN_LUT_BITS_MAX: u8 = 12;
+const HUFFMAN_SYMBOL_COUNT: usize = 256;
+const HUFFMAN_CODE_BITS_MAX: u8 = 32;
 
 #[derive(Debug, Clone)]
 struct HuffmanEntry {
@@ -205,12 +207,26 @@ fn read_huffman_tree(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<Huffman
         return Err(Error::InvalidBlob("invalid Huffman table header".into()));
     }
 
-    let mut code_lengths = vec![
-        0.0;
-        usize::try_from(i1 - i0).map_err(|_| {
-            Error::InvalidBlob("Huffman code length count does not fit in memory".into())
-        })?
-    ];
+    let size = usize::try_from(size)
+        .map_err(|_| Error::InvalidBlob("invalid Huffman table header".into()))?;
+    let i0 = usize::try_from(i0)
+        .map_err(|_| Error::InvalidBlob("invalid Huffman table header".into()))?;
+    let i1 = usize::try_from(i1)
+        .map_err(|_| Error::InvalidBlob("invalid Huffman table header".into()))?;
+    let code_length_count = i1
+        .checked_sub(i0)
+        .ok_or_else(|| Error::InvalidBlob("invalid Huffman table header".into()))?;
+
+    if size == 0
+        || size > HUFFMAN_SYMBOL_COUNT
+        || i0 >= size
+        || code_length_count == 0
+        || code_length_count > size
+    {
+        return Err(Error::InvalidBlob("invalid Huffman table header".into()));
+    }
+
+    let mut code_lengths = vec![0.0; code_length_count];
     let _ = decode_bits(
         cursor,
         match info.version {
@@ -223,13 +239,18 @@ fn read_huffman_tree(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<Huffman
         info.z_max,
     )?;
 
-    let size = size as usize;
-    let i0 = i0 as usize;
-    let i1 = i1 as usize;
     let mut code_table: Vec<Option<(u8, u32)>> = vec![None; size];
     for i in i0..i1 {
         let j = if i < size { i } else { i - size };
-        code_table[j] = Some((code_lengths[i - i0] as u8, 0));
+        let bit_len = code_lengths[i - i0];
+        if !bit_len.is_finite()
+            || bit_len.fract() != 0.0
+            || bit_len < 0.0
+            || bit_len > f64::from(HUFFMAN_CODE_BITS_MAX)
+        {
+            return Err(Error::InvalidBlob("invalid Huffman code length".into()));
+        }
+        code_table[j] = Some((bit_len as u8, 0));
     }
 
     let stuffed_data = words_from_padded(cursor.read_bytes(cursor.remaining())?);
@@ -355,6 +376,9 @@ impl<'a> HuffmanStream<'a> {
     fn peek_bits(&self, num_bits: usize) -> Result<u32> {
         if num_bits == 0 {
             return Ok(0);
+        }
+        if num_bits > usize::from(HUFFMAN_CODE_BITS_MAX) {
+            return Err(Error::InvalidBlob("Huffman bit width exceeds u32".into()));
         }
         if self.src_ptr >= self.words.len() {
             return Err(Error::Truncated {

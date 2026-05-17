@@ -507,9 +507,8 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
         match &active_band.progress {
             ActiveBandProgress::Prefix(written_values) => {
                 let ordered_index = match active_band.order {
-                    BandWriteOrder::PixelMajor => logical_index,
+                    BandWriteOrder::PixelMajor | BandWriteOrder::Arbitrary => logical_index,
                     BandWriteOrder::DimMajor => dim * self.materializer.shape.pixel_count + pixel,
-                    BandWriteOrder::Arbitrary => usize::MAX,
                 };
                 assert!(
                     ordered_index < *written_values,
@@ -532,9 +531,33 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
 
     fn set_write_order(&mut self, order: BandWriteOrder) {
         let active_band = self.materializer.active_band.as_mut().unwrap();
-        match &active_band.progress {
+        match &mut active_band.progress {
             ActiveBandProgress::Prefix(0) => active_band.order = order,
-            _ => debug_assert_eq!(active_band.order, order),
+            ActiveBandProgress::Prefix(written_values) => {
+                if active_band.order == order {
+                    return;
+                }
+
+                let mut initialized =
+                    vec![
+                        false;
+                        band_len(
+                            self.materializer.shape.pixel_count,
+                            self.materializer.shape.depth,
+                        )
+                        .expect("band length was validated when the materializer was created")
+                    ];
+                for step_index in 0..*written_values {
+                    initialized[logical_index_for_step(
+                        self.materializer.shape,
+                        active_band.order,
+                        step_index,
+                    )] = true;
+                }
+                active_band.progress = ActiveBandProgress::Sparse(initialized);
+                active_band.order = order;
+            }
+            ActiveBandProgress::Sparse(_) => active_band.order = order,
         }
     }
 }
@@ -686,14 +709,11 @@ fn band_value_index(
 
 fn logical_index_for_step(shape: BandShape, order: BandWriteOrder, step_index: usize) -> usize {
     match order {
-        BandWriteOrder::PixelMajor => step_index,
+        BandWriteOrder::PixelMajor | BandWriteOrder::Arbitrary => step_index,
         BandWriteOrder::DimMajor => {
             let pixel = step_index % shape.pixel_count;
             let dim = step_index / shape.pixel_count;
             pixel * shape.depth + dim
-        }
-        BandWriteOrder::Arbitrary => {
-            unreachable!("arbitrary-order writes cannot be represented as a prefix")
         }
     }
 }
@@ -886,5 +906,38 @@ mod tests {
             err.to_string(),
             "band 0 is still active; finalize it before starting another band"
         );
+    }
+
+    #[test]
+    fn allows_order_hint_changes_after_sparse_fallback() {
+        let mut materializer =
+            BandMaterializer::<u16>::new(2, 2, 1, BandLayout::Interleaved).unwrap();
+        let mut writer = materializer.band_writer(0).unwrap();
+
+        writer.set_write_order(BandWriteOrder::Arbitrary);
+        writer.write(1, 0, 10);
+        writer.set_write_order(BandWriteOrder::PixelMajor);
+        writer.write(0, 0, 1);
+        writer.write(0, 1, 2);
+        writer.write(1, 1, 11);
+        writer.finish().unwrap();
+
+        assert_eq!(materializer.finish().unwrap(), vec![1, 2, 10, 11]);
+    }
+
+    #[test]
+    fn allows_default_filled_arbitrary_prefix_to_be_reordered() {
+        let mut materializer =
+            BandMaterializer::<u16>::new(2, 2, 1, BandLayout::Interleaved).unwrap();
+        let mut writer = materializer.band_writer(0).unwrap();
+
+        writer.set_write_order(BandWriteOrder::Arbitrary);
+        writer.fill_default();
+        assert_eq!(writer.read(1, 1), 0);
+        writer.set_write_order(BandWriteOrder::PixelMajor);
+        writer.write(1, 1, 7);
+        writer.finish().unwrap();
+
+        assert_eq!(materializer.finish().unwrap(), vec![0, 0, 0, 7]);
     }
 }

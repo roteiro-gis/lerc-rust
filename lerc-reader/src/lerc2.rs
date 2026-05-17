@@ -213,6 +213,11 @@ pub(crate) fn parse(blob: &[u8]) -> Result<(ParsedLerc2, Cursor<'_>)> {
     }
 
     if let Some(expected) = checksum {
+        if blob_size < 14 {
+            return Err(Error::InvalidHeader(
+                "blob size is smaller than checksum range",
+            ));
+        }
         let actual = fletcher32(&blob[14..blob_size]);
         if actual != expected {
             return Err(Error::ChecksumMismatch { expected, actual });

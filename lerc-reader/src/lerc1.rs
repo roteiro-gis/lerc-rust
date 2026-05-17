@@ -475,7 +475,7 @@ fn decode_pixels<T: Sample>(parsed: &Lerc1Blob) -> Result<TypedPixels<T>> {
                             scale: 2.0 * parsed.info.max_z_error,
                             max_value: parsed.pixels.max_value as f64,
                         },
-                    );
+                    )?;
                     stuffed_values = Some(&block_buffer[..block.valid_pixel_count]);
                     (None, None)
                 }
@@ -597,7 +597,7 @@ fn decode_pixels_into<T: Sample, W: BandWriter<T>>(
                             scale: 2.0 * parsed.info.max_z_error,
                             max_value: parsed.pixels.max_value as f64,
                         },
-                    );
+                    )?;
                     stuffed_values = Some(&block_buffer[..block.valid_pixel_count]);
                     (None, None)
                 }
@@ -695,7 +695,7 @@ fn scan_range(parsed: &Lerc1Blob) -> Result<(f64, f64)> {
                         scale: 2.0 * parsed.info.max_z_error,
                         max_value: parsed.pixels.max_value as f64,
                     },
-                );
+                )?;
                 for &value in &block_buffer[..block.valid_pixel_count] {
                     min_value = min_value.min(value);
                     max_value = max_value.max(value);

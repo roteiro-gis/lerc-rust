@@ -42,6 +42,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "lerc2_bitstuff_blocks"
+path = "fuzz_targets/lerc2_bitstuff_blocks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "concatenated"
 path = "fuzz_targets/concatenated.rs"
 test = false

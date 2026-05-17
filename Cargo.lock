@@ -227,15 +227,15 @@ dependencies = [
 
 [[package]]
 name = "lerc-band-materialize"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "lerc-core"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "lerc-reader"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "criterion",
  "lerc-band-materialize",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "lerc-writer"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "criterion",
  "lerc-core",
