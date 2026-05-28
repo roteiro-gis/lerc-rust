@@ -52,8 +52,20 @@ let blob = encode(
 )?;
 ```
 
-Set `EncodeOptions::no_data_value` to emit Lerc2 v6 no-data metadata for
-depth rasters.
+### Version Support
+
+`lerc-reader` reads Lerc1 and Lerc2 blobs, including Lerc2 revisions through
+v6. An existing blob's version can be inspected with `get_blob_info(&blob)?.version`.
+
+`lerc-writer` writes Lerc2 only and does not expose a manual revision selector, instead it
+depends on the encoded byte stream:
+
+- v4 for ordinary output
+- v5 for depth rasters when slices compress better as per-tile differences
+  from the previous depth slice
+- v6 when `EncodeOptions::no_data_value` is set for a depth raster
+
+### Blob Entry Points
 
 Single-blob entry points are strict. If you intentionally want first-blob
 inspection or decode from a concatenated payload, use `inspect_first()` or
