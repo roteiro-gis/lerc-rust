@@ -18,16 +18,14 @@ env:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -36,7 +34,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
