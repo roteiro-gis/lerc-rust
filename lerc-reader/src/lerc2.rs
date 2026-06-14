@@ -72,6 +72,7 @@ pub(crate) fn decode(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<Decod
         depth_ranges.as_ref(),
         mask.as_deref(),
     )?;
+    ensure_pixel_payload_consumed(&cursor)?;
     remap_pixel_data_no_data(
         &mut pixels,
         &info,
@@ -99,6 +100,7 @@ pub(crate) fn decode_f64(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<D
         PixelData::F64(values) => values,
         _ => unreachable!("f64 decode must produce an f64 buffer"),
     };
+    ensure_pixel_payload_consumed(&cursor)?;
     remap_no_data_values(
         &mut pixels,
         &info,
@@ -131,8 +133,19 @@ pub(crate) fn decode_into<T: Sample, W: BandWriter<T>>(
         mask.as_deref(),
         out,
     )?;
+    ensure_pixel_payload_consumed(&cursor)?;
     remap_written_no_data(out, &info, mask.as_deref(), parsed.encoded_no_data_value);
     Ok((info, mask))
+}
+
+fn ensure_pixel_payload_consumed(cursor: &Cursor<'_>) -> Result<()> {
+    let remaining = cursor.remaining();
+    if remaining == 0 {
+        return Ok(());
+    }
+    Err(Error::InvalidBlob(format!(
+        "Lerc2 pixel payload contains {remaining} trailing bytes"
+    )))
 }
 
 pub(crate) fn parse(blob: &[u8]) -> Result<(ParsedLerc2, Cursor<'_>)> {
