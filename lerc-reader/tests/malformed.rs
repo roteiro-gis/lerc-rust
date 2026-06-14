@@ -66,6 +66,34 @@ fn build_huffman_blob(table_payload: &[u8]) -> Vec<u8> {
     blob
 }
 
+fn build_lerc2_v4_no_mask_blob(
+    width: u32,
+    height: u32,
+    depth: u32,
+    valid_pixel_count: u32,
+    z_min: f64,
+    z_max: f64,
+    pixel_payload: &[u8],
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"Lerc2 ");
+    bytes.extend_from_slice(&4i32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(&width.to_le_bytes());
+    bytes.extend_from_slice(&depth.to_le_bytes());
+    bytes.extend_from_slice(&valid_pixel_count.to_le_bytes());
+    bytes.extend_from_slice(&8i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&1i32.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&z_min.to_le_bytes());
+    bytes.extend_from_slice(&z_max.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(pixel_payload);
+    finalize_lerc2_with_checksum(bytes)
+}
+
 #[test]
 fn strict_single_blob_api_rejects_concatenated_payload() {
     let mut blob1 = build_header_v2(HeaderV2 {
@@ -101,6 +129,27 @@ fn strict_single_blob_api_rejects_concatenated_payload() {
         lerc_reader::get_blob_info(&merged),
         Err(Error::InvalidBlob(_))
     ));
+}
+
+#[test]
+fn rejects_lerc2_trailing_pixel_payload_in_constant_blob() {
+    let blob = build_lerc2_v4_no_mask_blob(1, 1, 1, 1, 7.0, 7.0, b"junk");
+    let result = lerc_reader::decode(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+
+    let result = lerc_reader::decode_to_f64(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+}
+
+#[test]
+fn rejects_lerc2_trailing_pixel_payload_in_all_invalid_blob() {
+    let blob = build_lerc2_v4_no_mask_blob(1, 1, 1, 0, 0.0, 1.0, b"junk");
+    let result = lerc_reader::decode_first(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+
+    let mut out = vec![0u8; 1];
+    let result = lerc_reader::decode_band_set_into(&blob, lerc_core::BandLayout::Bsq, &mut out);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
 }
 
 #[test]
