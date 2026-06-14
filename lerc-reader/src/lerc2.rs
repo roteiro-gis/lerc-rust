@@ -1035,9 +1035,11 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
         height % micro_block_size
     };
 
+    let max_block_width = width.min(micro_block_size);
+    let max_block_height = height.min(micro_block_size);
     let block_samples = checked_mul(
-        micro_block_size,
-        micro_block_size,
+        max_block_width,
+        max_block_height,
         "Lerc2 micro-block sample count",
     )?;
     let mut block_buffer = default_vec(block_samples, "Lerc2 micro-block buffer")?;

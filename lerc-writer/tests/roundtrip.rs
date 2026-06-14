@@ -187,6 +187,28 @@ fn roundtrips_bitstuffed_u8_tiles_exactly() {
 }
 
 #[test]
+fn roundtrips_bitstuffed_tile_with_oversized_micro_block() {
+    let pixels: Vec<u16> = (0..16).collect();
+    let raster = RasterView::new(4, 4, 1, &pixels).unwrap();
+    let options = EncodeOptions {
+        max_z_error: 0.5,
+        micro_block_size: 1_000_000,
+        ..EncodeOptions::default()
+    };
+
+    let blob = encode(raster, None, options).unwrap();
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+    let offset = body_offset(&blob, &info);
+
+    assert_eq!(info.micro_block_size, options.micro_block_size);
+    assert_eq!(blob[offset], 0);
+    assert_eq!(blob[offset + 1] & 3, 1);
+
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    assert_eq!(decoded.pixels, lerc_core::PixelData::U16(pixels));
+}
+
+#[test]
 fn direct_band_set_apis_materialize_zero_tiles_from_writer_output() {
     let width = 16usize;
     let height = 8usize;
