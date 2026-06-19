@@ -153,6 +153,22 @@ fn rejects_lerc2_trailing_pixel_payload_in_all_invalid_blob() {
 }
 
 #[test]
+fn rejects_lerc2_trailing_pixel_payload_in_zero_sized_band_set_vec() {
+    let blob = build_lerc2_v4_no_mask_blob(0, 1, 1, 0, 0.0, 0.0, b"junk");
+    let result = lerc_reader::decode(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+
+    let result = lerc_reader::decode_band_set_vec::<u8>(&blob, lerc_core::BandLayout::Bsq);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+
+    let result = lerc_reader::decode_band_set_ndarray::<u8>(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+
+    let result = lerc_reader::decode_band_set_ndarray_f64(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+}
+
+#[test]
 fn rejects_mask_rle_with_trailing_bytes_after_sentinel() {
     let mut mask = encode_mask_rle(&[1, 1, 1, 0]);
     mask.push(0xAA);

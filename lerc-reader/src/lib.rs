@@ -653,11 +653,6 @@ fn decode_band_set_owned_direct_impl<T: Sample + NdArrayElement + Copy + Default
     band_info: BandSetInfo,
     initial_lerc2_mask: Option<&[u8]>,
 ) -> Result<(BandSetInfo, Vec<T>)> {
-    let expected_len = band_info.value_count()?;
-    if expected_len == 0 {
-        return Ok((band_info, Vec::new()));
-    }
-
     let pixel_count = band_info.bands[0].pixel_count()?;
     let depth = band_info.depth() as usize;
     let band_count = band_info.band_count();
