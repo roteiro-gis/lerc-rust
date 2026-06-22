@@ -197,11 +197,33 @@ pub(crate) fn parse(blob: &[u8]) -> Result<(ParsedLerc2, Cursor<'_>)> {
         None
     };
 
-    if micro_block_size < 0 {
-        return Err(Error::InvalidHeader("negative micro block size"));
+    if width == 0 || height == 0 {
+        return Err(Error::InvalidHeader(
+            "width and height must be greater than zero",
+        ));
+    }
+    if micro_block_size <= 0 {
+        return Err(Error::InvalidHeader(
+            "micro block size must be greater than zero",
+        ));
     }
     if depth == 0 {
         return Err(Error::InvalidHeader("depth must be greater than zero"));
+    }
+    if !max_z_error.is_finite() || max_z_error < 0.0 {
+        return Err(Error::InvalidHeader(
+            "max_z_error must be finite and non-negative",
+        ));
+    }
+    if !raw_z_min.is_finite() || !raw_z_max.is_finite() {
+        return Err(Error::InvalidHeader("z range values must be finite"));
+    }
+    if encoded_no_data_value
+        .into_iter()
+        .chain(original_no_data_value)
+        .any(|value| !value.is_finite())
+    {
+        return Err(Error::InvalidHeader("no-data values must be finite"));
     }
     if n_blobs_more < 0 {
         return Err(Error::InvalidHeader("negative appended blob count"));

@@ -177,6 +177,17 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
     let width = cursor.read_u32()?;
     let max_z_error = cursor.read_f64()?;
 
+    if width == 0 || height == 0 {
+        return Err(Error::InvalidHeader(
+            "width and height must be greater than zero",
+        ));
+    }
+    if !max_z_error.is_finite() || max_z_error < 0.0 {
+        return Err(Error::InvalidHeader(
+            "max_z_error must be finite and non-negative",
+        ));
+    }
+
     let (mask_encoding, mask) = match mask_source {
         MaskSource::Inline => read_mask(&mut cursor, width, height)?,
         MaskSource::External(shared_mask) => {
@@ -193,9 +204,17 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
     if pixels_num_blocks_x == 0 || pixels_num_blocks_y == 0 {
         return Err(Error::InvalidHeader("Lerc1 block grid must be non-zero"));
     }
+    if !pixels_max_value.is_finite() {
+        return Err(Error::InvalidHeader("Lerc1 max pixel value must be finite"));
+    }
 
     let width_usize = width as usize;
     let height_usize = height as usize;
+    if pixels_num_blocks_x > width_usize || pixels_num_blocks_y > height_usize {
+        return Err(Error::InvalidHeader(
+            "Lerc1 block grid must not exceed raster dimensions",
+        ));
+    }
     let num_pixels = width_usize
         .checked_mul(height_usize)
         .ok_or_else(|| Error::InvalidBlob("pixel count overflows usize".into()))?;
