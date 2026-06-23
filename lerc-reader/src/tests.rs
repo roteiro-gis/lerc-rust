@@ -387,6 +387,49 @@ fn decodes_constant_surface_with_per_depth_ranges() {
 }
 
 #[test]
+fn direct_band_set_apis_return_lerc2_per_depth_ranges() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"Lerc2 ");
+    bytes.extend_from_slice(&4i32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&8i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&6i32.to_le_bytes());
+    bytes.extend_from_slice(&0.0f64.to_le_bytes());
+    bytes.extend_from_slice(&10.0f64.to_le_bytes());
+    bytes.extend_from_slice(&20.0f64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&10.0f32.to_le_bytes());
+    bytes.extend_from_slice(&20.0f32.to_le_bytes());
+    bytes.extend_from_slice(&10.0f32.to_le_bytes());
+    bytes.extend_from_slice(&20.0f32.to_le_bytes());
+
+    let blob = finalize_lerc2_with_checksum(bytes);
+    let decoded = decode_band_set(&blob).unwrap();
+    assert_eq!(
+        decoded.info.bands[0].min_values.as_deref(),
+        Some(&[10.0, 20.0][..])
+    );
+    assert_eq!(
+        decoded.info.bands[0].max_values.as_deref(),
+        Some(&[10.0, 20.0][..])
+    );
+
+    let (info, values) = decode_band_set_vec::<f32>(&blob, BandLayout::Bsq).unwrap();
+    assert_eq!(info, decoded.info);
+    assert_eq!(values, vec![10.0, 20.0, 10.0, 20.0]);
+
+    let mut out = vec![0.0f32; values.len()];
+    let info_into = decode_band_set_into(&blob, BandLayout::Bsq, &mut out).unwrap();
+    assert_eq!(info_into, decoded.info);
+    assert_eq!(out, values);
+}
+
+#[test]
 fn counts_concatenated_bands() {
     let mut blob1 = build_header_v2(HeaderV2 {
         width: 1,
@@ -519,6 +562,24 @@ fn counts_concatenated_lerc1_bands_with_shared_mask() {
     merged.extend_from_slice(&blob2);
 
     assert_eq!(get_band_count(&merged).unwrap(), 2);
+}
+
+#[test]
+fn direct_band_set_apis_return_decoded_lerc1_ranges() {
+    let blob = build_lerc1_blob(true, Some(&[1, 0, 1, 1]), &[1.0, 3.0, 4.0], 0.5, 99.0);
+
+    let decoded = decode_band_set(&blob).unwrap();
+    assert_eq!(decoded.info.bands[0].z_min, 1.0);
+    assert_eq!(decoded.info.bands[0].z_max, 4.0);
+
+    let (info, values) = decode_band_set_vec::<f32>(&blob, BandLayout::Bsq).unwrap();
+    assert_eq!(info, decoded.info);
+    assert_eq!(values, vec![1.0, 0.0, 3.0, 4.0]);
+
+    let mut out = vec![0.0f32; values.len()];
+    let info_into = decode_band_set_into(&blob, BandLayout::Bsq, &mut out).unwrap();
+    assert_eq!(info_into, decoded.info);
+    assert_eq!(out, values);
 }
 
 #[test]

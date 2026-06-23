@@ -469,8 +469,7 @@ fn decode_band_set_into_impl<T: Sample + NdArrayElement>(
     out: &mut [T],
 ) -> Result<BandSetInfo> {
     let band_info = scan_band_infos(blob)?;
-    decode_band_set_into_impl_with_info(blob, layout, initial_lerc2_mask, &band_info, out)?;
-    Ok(band_info)
+    decode_band_set_into_impl_with_info(blob, layout, initial_lerc2_mask, &band_info, out)
 }
 
 fn decode_band_set_into_impl_with_info<T: Sample + NdArrayElement>(
@@ -479,7 +478,7 @@ fn decode_band_set_into_impl_with_info<T: Sample + NdArrayElement>(
     initial_lerc2_mask: Option<&[u8]>,
     band_info: &BandSetInfo,
     out: &mut [T],
-) -> Result<()> {
+) -> Result<BandSetInfo> {
     let band_count = band_info.band_count();
     let expected_len = band_info.value_count()?;
     if out.len() != expected_len {
@@ -496,6 +495,7 @@ fn decode_band_set_into_impl_with_info<T: Sample + NdArrayElement>(
     let mut band_index = 0usize;
     let mut lerc1_mask: Option<Vec<u8>> = None;
     let mut lerc2_mask = initial_lerc2_mask.map(|mask| mask.to_vec());
+    let mut decoded_infos = Vec::with_capacity(band_count);
 
     while offset < blob.len() {
         let slice = &blob[offset..];
@@ -524,11 +524,13 @@ fn decode_band_set_into_impl_with_info<T: Sample + NdArrayElement>(
             lerc1_mask = None;
         }
 
-        offset = checked_next_offset(offset, info.blob_size, blob.len())?;
+        let blob_size = info.blob_size;
+        decoded_infos.push(info);
+        offset = checked_next_offset(offset, blob_size, blob.len())?;
         band_index += 1;
     }
 
-    Ok(())
+    BandSetInfo::new(decoded_infos)
 }
 
 fn decode_band_set_to_f64_info(
@@ -663,6 +665,7 @@ fn decode_band_set_owned_direct_impl<T: Sample + NdArrayElement + Copy + Default
     let mut band_index = 0usize;
     let mut lerc1_mask: Option<Vec<u8>> = None;
     let mut lerc2_mask = initial_lerc2_mask.map(|mask| mask.to_vec());
+    let mut decoded_infos = Vec::with_capacity(band_count);
 
     while offset < blob.len() {
         let slice = &blob[offset..];
@@ -690,11 +693,16 @@ fn decode_band_set_owned_direct_impl<T: Sample + NdArrayElement + Copy + Default
             lerc1_mask = None;
         }
 
-        offset = checked_next_offset(offset, info.blob_size, blob.len())?;
+        let blob_size = info.blob_size;
+        decoded_infos.push(info);
+        offset = checked_next_offset(offset, blob_size, blob.len())?;
         band_index += 1;
     }
 
-    Ok((band_info, materializer.finish().map_err(materialize_error)?))
+    Ok((
+        BandSetInfo::new(decoded_infos)?,
+        materializer.finish().map_err(materialize_error)?,
+    ))
 }
 
 fn cast_slice_mut<T, U>(slice: &mut [T]) -> &mut [U] {
