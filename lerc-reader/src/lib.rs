@@ -1,3 +1,5 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
 //! Pure-Rust LERC decoder.
 //!
 //! The public API distinguishes strict single-blob entry points from
@@ -706,6 +708,8 @@ fn decode_band_set_owned_direct_impl<T: Sample + NdArrayElement + Copy + Default
 }
 
 fn cast_slice_mut<T, U>(slice: &mut [T]) -> &mut [U] {
+    // SAFETY: callers only reach this helper through dispatch_band_element!, where
+    // T and U are the same concrete primitive type selected by BandElementKind.
     unsafe { &mut *(slice as *mut [T] as *mut [U]) }
 }
 
@@ -714,5 +718,8 @@ fn cast_vec<T, U>(values: Vec<U>) -> Vec<T> {
     let cap = values.capacity();
     let ptr = values.as_ptr() as *mut T;
     std::mem::forget(values);
+    // SAFETY: callers only reach this helper through dispatch_band_element!, where
+    // T and U are the same concrete primitive type. The allocation, length, and
+    // capacity therefore remain valid for Vec<T>.
     unsafe { Vec::from_raw_parts(ptr, len, cap) }
 }
