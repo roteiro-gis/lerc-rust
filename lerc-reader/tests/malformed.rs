@@ -94,6 +94,44 @@ fn build_lerc2_v4_no_mask_blob(
     finalize_lerc2_with_checksum(bytes)
 }
 
+fn build_lerc1_blob_with_block_grid(
+    width: u32,
+    height: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"CntZImage ");
+    bytes.extend_from_slice(&11i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(&width.to_le_bytes());
+    bytes.extend_from_slice(&0.5f64.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1.0f32.to_le_bytes());
+    bytes.extend_from_slice(&blocks_y.to_le_bytes());
+    bytes.extend_from_slice(&blocks_x.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1.0f32.to_le_bytes());
+    bytes
+}
+
+fn assert_metadata_invalid_header(blob: &[u8], expected: &'static str) {
+    let result = lerc_reader::get_blob_info(blob);
+    assert!(
+        matches!(result, Err(Error::InvalidHeader(actual)) if actual == expected),
+        "{result:?}"
+    );
+
+    let result = lerc_reader::get_band_count(blob);
+    assert!(
+        matches!(result, Err(Error::InvalidHeader(actual)) if actual == expected),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn strict_single_blob_api_rejects_concatenated_payload() {
     let mut blob1 = build_header_v2(HeaderV2 {
@@ -153,19 +191,51 @@ fn rejects_lerc2_trailing_pixel_payload_in_all_invalid_blob() {
 }
 
 #[test]
-fn rejects_lerc2_trailing_pixel_payload_in_zero_sized_band_set_vec() {
+fn rejects_zero_sized_lerc2_band_set_vec_before_payload_decode() {
     let blob = build_lerc2_v4_no_mask_blob(0, 1, 1, 0, 0.0, 0.0, b"junk");
     let result = lerc_reader::decode(&blob);
-    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidHeader(
+                "width and height must be greater than zero"
+            ))
+        ),
+        "{result:?}"
+    );
 
     let result = lerc_reader::decode_band_set_vec::<u8>(&blob, lerc_core::BandLayout::Bsq);
-    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidHeader(
+                "width and height must be greater than zero"
+            ))
+        ),
+        "{result:?}"
+    );
 
     let result = lerc_reader::decode_band_set_ndarray::<u8>(&blob);
-    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidHeader(
+                "width and height must be greater than zero"
+            ))
+        ),
+        "{result:?}"
+    );
 
     let result = lerc_reader::decode_band_set_ndarray_f64(&blob);
-    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidHeader(
+                "width and height must be greater than zero"
+            ))
+        ),
+        "{result:?}"
+    );
 }
 
 #[test]
@@ -189,6 +259,89 @@ fn rejects_mask_rle_with_trailing_bytes_after_sentinel() {
 
     let result = lerc_reader::decode(&blob);
     assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+}
+
+#[test]
+fn rejects_zero_sized_lerc2_dimensions_in_metadata_paths() {
+    for (width, height) in [(0, 1), (1, 0)] {
+        let mut blob = build_header_v2(HeaderV2 {
+            width,
+            height,
+            valid_pixel_count: 0,
+            image_type: 1,
+            max_z_error: 0.0,
+            z_min: 0.0,
+            z_max: 0.0,
+            payload_len: 0,
+        });
+        blob.extend_from_slice(&0u32.to_le_bytes());
+
+        assert_metadata_invalid_header(&blob, "width and height must be greater than zero");
+    }
+}
+
+#[test]
+fn rejects_zero_lerc2_micro_block_size_in_metadata_paths() {
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 7.0,
+        z_max: 7.0,
+        payload_len: 0,
+    });
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob[22..26].copy_from_slice(&0i32.to_le_bytes());
+
+    assert_metadata_invalid_header(&blob, "micro block size must be greater than zero");
+}
+
+#[test]
+fn rejects_non_finite_lerc2_numeric_fields_in_metadata_paths() {
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: f64::NAN,
+        z_min: 7.0,
+        z_max: 7.0,
+        payload_len: 0,
+    });
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    assert_metadata_invalid_header(&blob, "max_z_error must be finite and non-negative");
+
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: f64::INFINITY,
+        z_max: 7.0,
+        payload_len: 0,
+    });
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    assert_metadata_invalid_header(&blob, "z range values must be finite");
+
+    let mut blob = build_header_v6(HeaderV6 {
+        width: 1,
+        height: 1,
+        depth: 2,
+        valid_pixel_count: 1,
+        image_type: 6,
+        max_z_error: 0.0,
+        z_min: 1.0,
+        z_max: 1.0,
+        internal_no_data_value: f64::NAN,
+        original_no_data_value: -9999.0,
+        payload_len: 0,
+    });
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    let blob = finalize_lerc2_with_checksum(blob);
+    assert_metadata_invalid_header(&blob, "no-data values must be finite");
 }
 
 #[test]
@@ -248,6 +401,18 @@ fn rejects_no_data_flag_for_unit_depth_lerc2_header() {
             "no-data values require depth greater than one"
         ))
     ));
+}
+
+#[test]
+fn rejects_zero_sized_lerc1_dimensions_in_metadata_paths() {
+    let blob = build_lerc1_blob_with_block_grid(0, 1, 1, 1);
+    assert_metadata_invalid_header(&blob, "width and height must be greater than zero");
+}
+
+#[test]
+fn rejects_lerc1_block_grid_larger_than_dimensions_in_metadata_paths() {
+    let blob = build_lerc1_blob_with_block_grid(1, 1, 2, 1);
+    assert_metadata_invalid_header(&blob, "Lerc1 block grid must not exceed raster dimensions");
 }
 
 #[test]

@@ -1,3 +1,5 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use std::fmt;
 use std::mem;
 use std::mem::MaybeUninit;
@@ -215,6 +217,9 @@ impl<T> BandMaterializer<T> {
         check_allocation::<bool>(band_sample_count, "materialized sparse band progress")?;
         let mut out = Vec::with_capacity(sample_count);
         if sample_count != 0 {
+            // SAFETY: the element type is MaybeUninit<T>, which is valid in an
+            // uninitialized state. Initialization is tracked separately and
+            // enforced before conversion to Vec<T>.
             unsafe {
                 out.set_len(sample_count);
             }
@@ -288,6 +293,8 @@ impl<T> BandMaterializer<T> {
         let out = std::mem::take(&mut this.out);
         this.active_band = None;
         this.written_bands.fill(false);
+        // SAFETY: every band is marked written and any active band has already
+        // been validated as complete, so every MaybeUninit<T> slot was written.
         Ok(unsafe { assume_init_vec(out) })
     }
 
@@ -406,6 +413,8 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
                         value_index,
                     );
                     if value_index < *written_values {
+                        // SAFETY: Prefix progress guarantees all indices below
+                        // written_values were initialized earlier.
                         unsafe {
                             *self.materializer.out[out_index].assume_init_mut() = T::default();
                         }
@@ -426,6 +435,8 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
                         value_index,
                     );
                     if *is_initialized {
+                        // SAFETY: the sparse progress bitmap marks this logical
+                        // value as initialized.
                         unsafe {
                             *self.materializer.out[out_index].assume_init_mut() = T::default();
                         }
@@ -459,6 +470,8 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
                         BandWriteOrder::Arbitrary => usize::MAX,
                     };
                     if ordered_index < *written_values {
+                        // SAFETY: Prefix progress guarantees all ordered indices
+                        // below written_values were initialized earlier.
                         unsafe {
                             *self.materializer.out[out_index].assume_init_mut() = value;
                         }
@@ -490,6 +503,8 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
                 }
                 ActiveBandProgress::Sparse(initialized) => {
                     if initialized[logical_index] {
+                        // SAFETY: the sparse progress bitmap marks this logical
+                        // value as initialized.
                         unsafe {
                             *self.materializer.out[out_index].assume_init_mut() = value;
                         }
@@ -531,6 +546,8 @@ impl<T: Copy + Default> BandWriter<T> for MaterializerBandWriter<'_, T> {
                 );
             }
         }
+        // SAFETY: the progress checks above prove the addressed value was
+        // initialized before this read.
         unsafe { *self.materializer.out[out_index].assume_init_ref() }
     }
 
@@ -672,6 +689,7 @@ fn drop_band_prefix<T>(
 ) {
     for step_index in 0..written_values {
         let out_index = band_value_index_for_step(shape, band_index, layout, order, step_index);
+        // SAFETY: callers pass only the initialized prefix length for this band.
         unsafe {
             out[out_index].assume_init_drop();
         }
@@ -690,6 +708,8 @@ fn drop_sparse_band<T>(
             continue;
         }
         let out_index = band_value_index(shape, band_index, layout, value_index);
+        // SAFETY: the sparse progress bitmap marks this logical value as
+        // initialized.
         unsafe {
             out[out_index].assume_init_drop();
         }
@@ -791,7 +811,10 @@ unsafe fn assume_init_vec<T>(values: Vec<MaybeUninit<T>>) -> Vec<T> {
     let cap = values.capacity();
     let ptr = values.as_ptr() as *mut T;
     std::mem::forget(values);
-    Vec::from_raw_parts(ptr, len, cap)
+    // SAFETY: callers must guarantee every MaybeUninit<T> element is
+    // initialized. MaybeUninit<T> has the same layout and alignment as T, so the
+    // allocation can be reconstructed as Vec<T> with the same len/cap.
+    unsafe { Vec::from_raw_parts(ptr, len, cap) }
 }
 
 #[cfg(test)]

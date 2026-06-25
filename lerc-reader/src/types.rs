@@ -211,6 +211,9 @@ fn copy_typed_values_into_materializer<T: BandElement, U: SupportedElementValue>
     values: &[U],
 ) -> Result<()> {
     if T::KIND == U::KIND {
+        // SAFETY: equal BandElementKind values mean T and U are the same
+        // supported primitive type, so the slice layout and alignment are
+        // unchanged.
         let typed = unsafe { cast_slice::<U, T>(values) };
         return materializer
             .copy_band(band_index, typed)
@@ -219,6 +222,7 @@ fn copy_typed_values_into_materializer<T: BandElement, U: SupportedElementValue>
     if T::KIND == BandElementKind::F64 {
         return materializer
             .copy_band_with(band_index, |index| {
+                // SAFETY: this branch is only entered when T is f64.
                 unsafe_cast::<T, f64>(values[index].into_f64())
             })
             .map_err(materialize_error);
@@ -265,6 +269,9 @@ fn copy_typed_values_into_layout_slice<T: BandElement, U: SupportedElementValue>
     values: &[U],
 ) -> Result<()> {
     if T::KIND == U::KIND {
+        // SAFETY: equal BandElementKind values mean T and U are the same
+        // supported primitive type, so the slice layout and alignment are
+        // unchanged.
         let typed = unsafe { cast_slice::<U, T>(values) };
         return copy_band_values_into_slice(
             out,
@@ -299,6 +306,7 @@ fn copy_typed_values_into_layout_slice<T: BandElement, U: SupportedElementValue>
                 }
                 BandLayout::Bsq => band_index * band_len + value_index,
             };
+            // SAFETY: this branch is only entered when T is f64.
             out[out_index] = unsafe_cast::<T, f64>(value.into_f64());
         }
         return Ok(());
@@ -314,10 +322,13 @@ fn copy_typed_values_into_layout_slice<T: BandElement, U: SupportedElementValue>
 }
 
 unsafe fn cast_slice<U, T>(values: &[U]) -> &[T] {
-    &*(values as *const [U] as *const [T])
+    // SAFETY: callers must guarantee U and T are the same primitive element type.
+    unsafe { &*(values as *const [U] as *const [T]) }
 }
 
 fn unsafe_cast<T, U: Copy>(value: U) -> T {
+    // SAFETY: callers only use this helper for same-size primitive casts where
+    // T is known by branch guards to match the source value representation.
     unsafe { std::mem::transmute_copy(&value) }
 }
 

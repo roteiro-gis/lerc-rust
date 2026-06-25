@@ -38,3 +38,37 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --locked
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.77
+        run: rustup toolchain install 1.77.0 --profile minimal --no-self-update
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run locked workspace tests
+        run: cargo +1.77.0 test --workspace --locked
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly Miri
+        run: rustup toolchain install nightly --profile minimal --component miri,rust-src --no-self-update
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Miri tests
+        run: rustup run nightly cargo miri test -p lerc-band-materialize -p lerc-reader --lib --locked
