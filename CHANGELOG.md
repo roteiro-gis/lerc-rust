@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.3 - 2026-06-25
+
+- reject malformed Lerc1 and Lerc2 headers with zero dimensions, invalid block geometry, zero Lerc2 micro-block sizes, negative or non-finite error tolerances, and non-finite range/no-data values
+- fix direct band-set decode APIs so returned metadata includes decoded Lerc1 value ranges and Lerc2 per-depth ranges
+- validate zero-sized band-set decode payloads instead of returning before malformed payload checks
+- keep the locked dev-dependency graph compatible with Rust 1.77 and add CI coverage for MSRV, Miri, CodeQL, and libLerc parity on pull requests
+- document unsafe-code invariants for direct band materialization and typed band-set conversions
+
 ## 0.4.2 - 2026-05-17
 
 - reject oversized Lerc2 mask bitsets, decoded masks, constant pixel buffers, one-sweep outputs, tile outputs, and Huffman outputs before allocating

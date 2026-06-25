@@ -13,8 +13,8 @@ keywords = ["lerc", "raster", "compression", "gis", "geospatial"]
 categories = ["compression", "science"]
 
 [dependencies]
-lerc-band-materialize = { version = "0.4.2", path = "../lerc-band-materialize" }
-lerc-core = { version = "0.4.2", path = "../lerc-core" }
+lerc-band-materialize = { version = "0.4.3", path = "../lerc-band-materialize" }
+lerc-core = { version = "0.4.3", path = "../lerc-core" }
 ndarray = { workspace = true }
 
 [dev-dependencies]
