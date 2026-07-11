@@ -1,6 +1,6 @@
 # Benchmark Report
 
-Date: 2026-04-02
+Last methodology update: 2026-07-10
 
 This report summarizes the current Criterion comparison suite for
 `lerc-reader` against Esri's official native `libLerc` decoder and records the
@@ -26,6 +26,8 @@ The current suite measures:
 - masked single-band Lerc1 decode (`world.lerc1`)
 - masked single-band Lerc2 decode (`california_400_400_1_float.lerc2`)
 - concatenated multi-band Lerc2 decode (`bluemarble_256_256_3_byte.lerc2`)
+- serial and feature-gated Rayon band-set decode paths
+- writer analysis/planning/emission after cached mask, diff-plan, and bit-packer optimizations
 
 Each benchmark validates decoded byte-hash parity against `libLerc` before
 timing and then reports two Rust measurements for the same fixture:
@@ -67,6 +69,17 @@ Notes:
   report does not yet publish encode baseline numbers from a fixed host run.
 
 ## Current Results
+
+The figures below are the last recorded fixed-host baseline (2026-04-02).
+They remain historical comparison points; run the commands above to measure
+the 0.5.0 implementation on the current host.
+
+A 2026-07-10 local 0.5.0 writer smoke run on Apple Silicon recorded:
+
+| benchmark | time |
+| --- | ---: |
+| `encode/u8-bitstuff` | 1.460-1.481 ms |
+| `encode-plus-decode/f32` | 1.587-1.601 ms |
 
 The figures below summarize the `load-plus-decode` comparison, because that is
 the only group with a directly comparable `libLerc` number today.

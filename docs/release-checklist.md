@@ -11,9 +11,18 @@ Use this checklist for coordinated `lerc-rust` workspace releases.
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo check -p lerc-reader --no-default-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+rustup run 1.77.0 cargo test --workspace --locked
+cargo deny check
+cargo audit
+./scripts/run-reference-parity.sh
 ```
+
+Run each target under `fuzz/` for a short smoke interval before tagging; CI
+also runs a longer scheduled fuzz campaign.
 
 ## Package Validation
 
@@ -21,14 +30,13 @@ Verify the leaf crates locally before publishing:
 
 ```sh
 cargo package -p lerc-core --offline
-cargo package -p lerc-band-materialize --offline
 ```
 
 For `lerc-reader` and `lerc-writer`, `cargo package` / `cargo publish --dry-run`
 resolve their internal dependencies from crates.io once path dependencies are
 rewritten. That means full package preparation only succeeds after matching
-versions of `lerc-core` and `lerc-band-materialize` have already been
-published. Before that point, use `--list` for tarball contents sanity checks:
+versions of `lerc-core` are already published. Before that point, use
+`--list` for tarball contents sanity checks:
 
 ```sh
 cargo package -p lerc-reader --list
@@ -48,6 +56,5 @@ cargo publish --dry-run -p lerc-writer
 Publish in dependency order:
 
 1. `lerc-core`
-2. `lerc-band-materialize`
-3. `lerc-reader`
-4. `lerc-writer`
+2. `lerc-reader`
+3. `lerc-writer`

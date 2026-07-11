@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-07-10
+
+- fix Lerc1 remainder-tile decoding and inspection for legal grids whose final tile is larger than the base tile, and replace unchecked reader size arithmetic
+- align integer zero-error encoding and multidimensional no-data filtering/remapping with libLerc semantics; constrain micro-block sizes to 2 through 64
+- fix signed reduced offsets and absolute-range clamping for bit-stuffed v5 difference tiles
+- redesign the public error taxonomy to distinguish caller arguments, corrupt blobs, size overflow, checksum failure, internal invariants, and stream I/O
+- split the writer into analysis, headers, masks, tiles, bit-stuffing, Huffman, and options modules; remove the duplicate band-materialization crate and duplicate owned decode walks
+- cache mask payloads and tile decisions, eliminate cloned plans and rebuilt diff vectors, fuse Huffman histograms into analysis, and replace scalar bit packing with an accumulator
+- make `ndarray` optional, add complete layout-aware `f64` ndarray APIs and borrowing conversions, and add the optional deterministic `rayon` band decoder
+- add exact one-blob and EOF-terminated band-set decoding from `std::io::Read`, plus configurable Lerc1 range inspection
+- add encoded-byte snapshots, all-datatype property tests, expanded no-data/type fuzzing, workspace lints, public API documentation, and broader CI coverage
+- bump the coordinated workspace crates to 0.5.0; `EncodeOptions` and `Error` are now non-exhaustive and use forward-compatible builders/variants
+
 ## 0.4.3 - 2026-06-25
 
 - reject malformed Lerc1 and Lerc2 headers with zero dimensions, invalid block geometry, zero Lerc2 micro-block sizes, negative or non-finite error tolerances, and non-finite range/no-data values
