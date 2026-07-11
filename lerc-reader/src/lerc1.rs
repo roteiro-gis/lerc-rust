@@ -3,16 +3,16 @@ use lerc_core::{BlobInfo, DataType, Error, MaskEncoding, PixelData, Result, Vers
 use crate::allocation::{checked_mul, default_vec, vec_with_capacity};
 use crate::bitstuff::{unstuff_v2, UnstuffOptions};
 use crate::io::Cursor;
-use crate::pixel::{count_valid_in_block, words_from_padded, Sample};
+use crate::materialize::{BandWriter, PixelDataWriter};
+use crate::pixel::{
+    count_valid_in_block, words_from_padded, AllValid, MaskValidity, Sample, Validity,
+};
 use crate::{Decoded, DecodedF64};
-use lerc_band_materialize::BandWriter;
 
 const MAGIC_LERC1_PREFIX: &[u8; 9] = b"CntZImage";
 
 #[derive(Debug, Clone)]
 struct Lerc1PixelsHeader {
-    num_blocks_y: usize,
-    num_blocks_x: usize,
     max_value: f32,
 }
 
@@ -34,8 +34,98 @@ struct Lerc1Block {
     valid_pixel_count: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BlockPos {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockGrid {
+    width: usize,
+    height: usize,
+    nominal_blocks_x: usize,
+    nominal_blocks_y: usize,
+    actual_blocks_x: usize,
+    actual_blocks_y: usize,
+    base_width: usize,
+    base_height: usize,
+}
+
+impl BlockGrid {
+    fn new(width: usize, height: usize, nominal_blocks_x: usize, nominal_blocks_y: usize) -> Self {
+        let base_width = width / nominal_blocks_x;
+        let base_height = height / nominal_blocks_y;
+        Self {
+            width,
+            height,
+            nominal_blocks_x,
+            nominal_blocks_y,
+            actual_blocks_x: nominal_blocks_x + usize::from(width % nominal_blocks_x != 0),
+            actual_blocks_y: nominal_blocks_y + usize::from(height % nominal_blocks_y != 0),
+            base_width,
+            base_height,
+        }
+    }
+
+    fn block_count(self) -> Result<usize> {
+        checked_mul(
+            self.actual_blocks_x,
+            self.actual_blocks_y,
+            "Lerc1 block count",
+        )
+    }
+
+    fn max_block_samples(self) -> Result<usize> {
+        let remainder_width = self.width % self.nominal_blocks_x;
+        let remainder_height = self.height % self.nominal_blocks_y;
+        checked_mul(
+            self.base_width.max(remainder_width),
+            self.base_height.max(remainder_height),
+            "Lerc1 maximum block sample count",
+        )
+    }
+
+    fn for_each_block(self, mut visit: impl FnMut(BlockPos) -> Result<()>) -> Result<()> {
+        for block_y in 0..self.actual_blocks_y {
+            let height = if block_y + 1 == self.actual_blocks_y
+                && self.height % self.nominal_blocks_y != 0
+            {
+                self.height % self.nominal_blocks_y
+            } else {
+                self.base_height
+            };
+            if height == 0 {
+                continue;
+            }
+
+            for block_x in 0..self.actual_blocks_x {
+                let width = if block_x + 1 == self.actual_blocks_x
+                    && self.width % self.nominal_blocks_x != 0
+                {
+                    self.width % self.nominal_blocks_x
+                } else {
+                    self.base_width
+                };
+                if width == 0 {
+                    continue;
+                }
+
+                visit(BlockPos {
+                    x: block_x * self.base_width,
+                    y: block_y * self.base_height,
+                    width,
+                    height,
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
 type ValueRange = Option<(f64, f64)>;
-type TypedPixels<T> = (Vec<T>, ValueRange);
 
 #[derive(Debug, Clone, Copy)]
 enum MaskSource<'a> {
@@ -49,27 +139,20 @@ pub(crate) struct Lerc1Blob {
     pub(crate) mask: Option<Vec<u8>>,
     pixels: Lerc1PixelsHeader,
     blocks: Vec<Lerc1Block>,
-    actual_num_blocks_y: usize,
-    actual_num_blocks_x: usize,
-    base_block_height: usize,
-    base_block_width: usize,
+    grid: BlockGrid,
 }
 
 pub(crate) fn is_lerc1(blob: &[u8]) -> bool {
     blob.starts_with(MAGIC_LERC1_PREFIX)
 }
 
-pub(crate) fn inspect(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<BlobInfo> {
-    let (info, _) = inspect_with_mask(blob, shared_mask)?;
-    Ok(info)
-}
-
-pub(crate) fn inspect_with_mask(
+pub(crate) fn inspect_with_mask_options(
     blob: &[u8],
     shared_mask: Option<&[u8]>,
+    compute_value_range: bool,
 ) -> Result<(BlobInfo, Option<Vec<u8>>)> {
     let mut parsed = parse(blob, shared_mask)?;
-    if parsed.info.valid_pixel_count != 0 {
+    if compute_value_range && parsed.info.valid_pixel_count != 0 {
         let (z_min, z_max) = scan_range(&parsed)?;
         parsed.info.z_min = z_min;
         parsed.info.z_max = z_max;
@@ -86,37 +169,17 @@ pub(crate) fn inspect_mask(
 }
 
 pub(crate) fn decode(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Decoded> {
-    let mut parsed = parse(blob, shared_mask)?;
-    let (pixels, z_range) = decode_pixels::<f32>(&parsed)?;
-    if parsed.info.valid_pixel_count != 0 {
-        let (z_min, z_max) = z_range.ok_or_else(|| {
-            Error::InvalidBlob("Lerc1 decode produced pixels but not a value range".into())
-        })?;
-        parsed.info.z_min = z_min;
-        parsed.info.z_max = z_max;
-    }
+    let (info, pixels, mask) = decode_owned::<f32>(blob, shared_mask)?;
     Ok(Decoded {
-        info: parsed.info,
+        info,
         pixels: PixelData::F32(pixels),
-        mask: parsed.mask,
+        mask,
     })
 }
 
 pub(crate) fn decode_f64(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<DecodedF64> {
-    let mut parsed = parse(blob, shared_mask)?;
-    let (pixels, z_range) = decode_pixels::<f64>(&parsed)?;
-    if parsed.info.valid_pixel_count != 0 {
-        let (z_min, z_max) = z_range.ok_or_else(|| {
-            Error::InvalidBlob("Lerc1 decode produced pixels but not a value range".into())
-        })?;
-        parsed.info.z_min = z_min;
-        parsed.info.z_max = z_max;
-    }
-    Ok(DecodedF64 {
-        info: parsed.info,
-        pixels,
-        mask: parsed.mask,
-    })
+    let (info, pixels, mask) = decode_owned::<f64>(blob, shared_mask)?;
+    Ok(DecodedF64 { info, pixels, mask })
 }
 
 pub(crate) fn decode_into<T: Sample, W: BandWriter<T>>(
@@ -124,14 +187,32 @@ pub(crate) fn decode_into<T: Sample, W: BandWriter<T>>(
     shared_mask: Option<&[u8]>,
     out: &mut W,
 ) -> Result<(BlobInfo, Option<Vec<u8>>)> {
-    let mut parsed = parse(blob, shared_mask)?;
-    if parsed.info.valid_pixel_count != parsed.info.pixel_count()? as u32 {
+    let parsed = parse(blob, shared_mask)?;
+    decode_parsed_into(parsed, out)
+}
+
+fn decode_owned<T: Sample>(
+    blob: &[u8],
+    shared_mask: Option<&[u8]>,
+) -> Result<(BlobInfo, Vec<T>, Option<Vec<u8>>)> {
+    let parsed = parse(blob, shared_mask)?;
+    let mut pixels = default_vec(parsed.info.pixel_count()?, "Lerc1 pixel buffer")?;
+    let mut writer = PixelDataWriter::new(&mut pixels, 1);
+    let (info, mask) = decode_parsed_into(parsed, &mut writer)?;
+    Ok((info, pixels, mask))
+}
+
+fn decode_parsed_into<T: Sample, W: BandWriter<T>>(
+    mut parsed: Lerc1Blob,
+    out: &mut W,
+) -> Result<(BlobInfo, Option<Vec<u8>>)> {
+    if parsed.info.valid_pixel_count as usize != parsed.info.pixel_count()? {
         out.fill_default();
     }
     let z_range = decode_pixels_into(&parsed, out)?;
     if parsed.info.valid_pixel_count != 0 {
         let (z_min, z_max) = z_range.ok_or_else(|| {
-            Error::InvalidBlob("Lerc1 decode produced pixels but not a value range".into())
+            Error::invalid_blob("Lerc1 decode produced pixels but not a value range")
         })?;
         parsed.info.z_min = z_min;
         parsed.info.z_max = z_max;
@@ -144,19 +225,15 @@ pub(crate) fn parse(blob: &[u8], shared_mask: Option<&[u8]>) -> Result<Lerc1Blob
         return parse_with_mask_source(blob, MaskSource::Inline);
     };
 
-    let inline_result = parse_with_mask_source(blob, MaskSource::Inline);
-    if inline_result.is_ok() {
-        return inline_result;
-    }
-
-    let external_result = parse_with_mask_source(blob, MaskSource::External(shared_mask));
-    if external_result.is_ok() {
-        return external_result;
-    }
-
-    let inline_error = inline_result.err().unwrap();
-    let external_error = external_result.err().unwrap();
-    Err(Error::InvalidBlob(format!(
+    let inline_error = match parse_with_mask_source(blob, MaskSource::Inline) {
+        Ok(parsed) => return Ok(parsed),
+        Err(error) => error,
+    };
+    let external_error = match parse_with_mask_source(blob, MaskSource::External(shared_mask)) {
+        Ok(parsed) => return Ok(parsed),
+        Err(error) => error,
+    };
+    Err(Error::invalid_blob(format!(
         "failed to parse Lerc1 blob with either an inline mask ({inline_error}) or the supplied shared mask ({external_error})"
     )))
 }
@@ -217,125 +294,106 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
     }
     let num_pixels = width_usize
         .checked_mul(height_usize)
-        .ok_or_else(|| Error::InvalidBlob("pixel count overflows usize".into()))?;
-    let base_block_width = width_usize / pixels_num_blocks_x;
-    let base_block_height = height_usize / pixels_num_blocks_y;
-    let actual_num_blocks_x =
-        pixels_num_blocks_x + usize::from(width_usize % pixels_num_blocks_x != 0);
-    let actual_num_blocks_y =
-        pixels_num_blocks_y + usize::from(height_usize % pixels_num_blocks_y != 0);
+        .ok_or(Error::SizeOverflow("Lerc1 pixel count"))?;
+    let grid = BlockGrid::new(
+        width_usize,
+        height_usize,
+        pixels_num_blocks_x,
+        pixels_num_blocks_y,
+    );
 
     let valid_pixel_count = match mask.as_deref() {
         Some(mask) => mask.iter().map(|&value| u32::from(value != 0)).sum(),
-        None => num_pixels as u32,
+        None => u32::try_from(num_pixels)
+            .map_err(|_| Error::SizeOverflow("Lerc1 valid pixel count as u32"))?,
     };
 
-    let block_count = checked_mul(
-        actual_num_blocks_x,
-        actual_num_blocks_y,
-        "Lerc1 block count",
-    )?;
-    let mut blocks = vec_with_capacity(block_count, "Lerc1 block table")?;
-    for block_y in 0..actual_num_blocks_y {
-        let this_block_height = block_height(
-            block_y,
-            actual_num_blocks_y,
-            height_usize,
-            pixels_num_blocks_y,
-            base_block_height,
-        );
-        if this_block_height == 0 {
-            continue;
-        }
-        for block_x in 0..actual_num_blocks_x {
-            let this_block_width = block_width(
-                block_x,
-                actual_num_blocks_x,
+    let mut blocks = vec_with_capacity(grid.block_count()?, "Lerc1 block table")?;
+    grid.for_each_block(|block_pos| {
+        let block_valid_pixels = if let Some(mask) = mask.as_deref() {
+            count_valid_in_block(
+                mask,
                 width_usize,
-                pixels_num_blocks_x,
-                base_block_width,
-            );
-            if this_block_width == 0 {
-                continue;
-            }
+                block_pos.x,
+                block_pos.y,
+                block_pos.width,
+                block_pos.height,
+            )
+        } else {
+            checked_mul(
+                block_pos.width,
+                block_pos.height,
+                "Lerc1 block sample count",
+            )?
+        };
 
-            let block_valid_pixels = if let Some(mask) = mask.as_deref() {
-                count_valid_in_block(
-                    mask,
-                    width_usize,
-                    block_x * base_block_width,
-                    block_y * base_block_height,
-                    this_block_width,
-                    this_block_height,
-                )
-            } else {
-                this_block_width * this_block_height
-            };
-
-            let header_byte = cursor.read_u8()?;
-            let encoding = header_byte & 63;
-            if encoding > 3 {
-                return Err(Error::InvalidBlob(format!(
-                    "invalid Lerc1 block encoding {encoding}"
-                )));
-            }
-
-            let block_encoding = match encoding {
-                2 => Lerc1BlockEncoding::Zero,
-                3 => Lerc1BlockEncoding::Constant(
-                    read_offset_if_present(&mut cursor, header_byte)?.ok_or(Error::InvalidBlob(
-                        "Lerc1 constant block is missing its offset".into(),
-                    ))?,
-                ),
-                0 => {
-                    let byte_len = block_valid_pixels.checked_mul(4).ok_or_else(|| {
-                        Error::InvalidBlob("Lerc1 raw block byte count overflows usize".into())
-                    })?;
-                    let values = cursor
-                        .read_bytes(byte_len)?
-                        .chunks_exact(4)
-                        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                        .collect();
-                    Lerc1BlockEncoding::Raw(values)
-                }
-                1 => {
-                    let offset = read_offset_if_present(&mut cursor, header_byte)?.ok_or(
-                        Error::InvalidBlob("Lerc1 bit-stuffed block is missing its offset".into()),
-                    )?;
-                    let packed_header = cursor.read_u8()?;
-                    let bits_per_pixel = packed_header & 63;
-                    let num_valid_pixels = match packed_header >> 6 {
-                        0 => cursor.read_u32()? as usize,
-                        1 => read_u16(cursor.read_bytes(2)?)? as usize,
-                        2 => cursor.read_u8()? as usize,
-                        other => {
-                            return Err(Error::InvalidBlob(format!(
-                                "invalid Lerc1 valid pixel count type {other}"
-                            )))
-                        }
-                    };
-                    if num_valid_pixels != block_valid_pixels {
-                        return Err(Error::InvalidBlob(
-                            "Lerc1 stuffed block valid count does not match its mask".into(),
-                        ));
-                    }
-                    let data_bytes = (num_valid_pixels * usize::from(bits_per_pixel)).div_ceil(8);
-                    let stuffed_data = words_from_padded(cursor.read_bytes(data_bytes)?);
-                    Lerc1BlockEncoding::Stuffed {
-                        offset,
-                        bits_per_pixel,
-                        stuffed_data,
-                    }
-                }
-                _ => unreachable!(),
-            };
-
-            blocks.push(Lerc1Block {
-                encoding: block_encoding,
-                valid_pixel_count: block_valid_pixels,
-            });
+        let header_byte = cursor.read_u8()?;
+        let encoding = header_byte & 63;
+        if encoding > 3 {
+            return Err(Error::invalid_blob(format!(
+                "invalid Lerc1 block encoding {encoding}"
+            )));
         }
-    }
+
+        let block_encoding = match encoding {
+            2 => Lerc1BlockEncoding::Zero,
+            3 => Lerc1BlockEncoding::Constant(
+                read_offset_if_present(&mut cursor, header_byte)?.ok_or(Error::invalid_blob(
+                    "Lerc1 constant block is missing its offset",
+                ))?,
+            ),
+            0 => {
+                let byte_len = block_valid_pixels
+                    .checked_mul(4)
+                    .ok_or(Error::SizeOverflow("Lerc1 raw block byte count"))?;
+                let values = cursor
+                    .read_bytes(byte_len)?
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                Lerc1BlockEncoding::Raw(values)
+            }
+            1 => {
+                let offset = read_offset_if_present(&mut cursor, header_byte)?.ok_or(
+                    Error::invalid_blob("Lerc1 bit-stuffed block is missing its offset"),
+                )?;
+                let packed_header = cursor.read_u8()?;
+                let bits_per_pixel = packed_header & 63;
+                let num_valid_pixels = match packed_header >> 6 {
+                    0 => cursor.read_u32()? as usize,
+                    1 => read_u16(cursor.read_bytes(2)?)? as usize,
+                    2 => cursor.read_u8()? as usize,
+                    other => {
+                        return Err(Error::invalid_blob(format!(
+                            "invalid Lerc1 valid pixel count type {other}"
+                        )))
+                    }
+                };
+                if num_valid_pixels != block_valid_pixels {
+                    return Err(Error::invalid_blob(
+                        "Lerc1 stuffed block valid count does not match its mask",
+                    ));
+                }
+                let data_bytes = num_valid_pixels
+                    .checked_mul(usize::from(bits_per_pixel))
+                    .ok_or(Error::SizeOverflow("Lerc1 stuffed block bit count"))?
+                    .div_ceil(8);
+                let stuffed_data = words_from_padded(cursor.read_bytes(data_bytes)?);
+                Lerc1BlockEncoding::Stuffed {
+                    offset,
+                    bits_per_pixel,
+                    stuffed_data,
+                }
+            }
+            _ => return Err(Error::Internal("validated Lerc1 block encoding changed")),
+        };
+
+        blocks.push(Lerc1Block {
+            encoding: block_encoding,
+            valid_pixel_count: block_valid_pixels,
+        });
+        Ok(())
+    })?;
 
     let eof_offset = cursor.offset();
     let info = BlobInfo {
@@ -360,25 +418,20 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
         info,
         mask,
         pixels: Lerc1PixelsHeader {
-            num_blocks_y: pixels_num_blocks_y,
-            num_blocks_x: pixels_num_blocks_x,
             max_value: pixels_max_value,
         },
         blocks,
-        actual_num_blocks_y,
-        actual_num_blocks_x,
-        base_block_height,
-        base_block_width,
+        grid,
     })
 }
 
 fn validate_shared_mask(mask: &[u8], width: u32, height: u32) -> Result<()> {
     let num_pixels = (width as usize)
         .checked_mul(height as usize)
-        .ok_or_else(|| Error::InvalidBlob("pixel count overflows usize".into()))?;
+        .ok_or(Error::SizeOverflow("Lerc1 shared-mask pixel count"))?;
     if mask.len() != num_pixels {
-        return Err(Error::InvalidBlob(
-            "shared mask length does not match the current Lerc1 blob".into(),
+        return Err(Error::invalid_blob(
+            "shared mask length does not match the current Lerc1 blob",
         ));
     }
     Ok(())
@@ -400,7 +453,7 @@ fn read_offset(cursor: &mut Cursor<'_>, offset_type: u8) -> Result<f32> {
         0 => cursor.read_f32(),
         1 => Ok(read_u16(cursor.read_bytes(2)?)? as f32),
         2 => Ok(cursor.read_u8()? as f32),
-        _ => Err(Error::InvalidBlob(format!(
+        _ => Err(Error::invalid_blob(format!(
             "invalid Lerc1 block offset type {offset_type}"
         ))),
     }
@@ -418,7 +471,7 @@ fn read_mask(
 
     let num_pixels = (width as usize)
         .checked_mul(height as usize)
-        .ok_or_else(|| Error::InvalidBlob("pixel count overflows usize".into()))?;
+        .ok_or(Error::SizeOverflow("Lerc1 mask pixel count"))?;
     let bitset_len = num_pixels.div_ceil(8);
 
     if num_bytes > 0 {
@@ -439,249 +492,105 @@ fn read_mask(
     Ok((MaskEncoding::None, None))
 }
 
-fn decode_pixels<T: Sample>(parsed: &Lerc1Blob) -> Result<TypedPixels<T>> {
-    let width = parsed.info.width as usize;
-    let height = parsed.info.height as usize;
-    let mask = parsed.mask.as_deref();
-    let pixel_count = checked_mul(width, height, "Lerc1 pixel count")?;
-    let mut result = default_vec(pixel_count, "Lerc1 pixel buffer")?;
-    let block_samples = checked_mul(
-        parsed.base_block_width,
-        parsed.base_block_height,
-        "Lerc1 base block sample count",
-    )?;
-    let mut block_buffer = default_vec(block_samples, "Lerc1 base block buffer")?;
-    let mut block_index = 0usize;
-    let mut min_value = f64::INFINITY;
-    let mut max_value = f64::NEG_INFINITY;
-
-    for block_y in 0..parsed.actual_num_blocks_y {
-        let this_block_height = block_height(
-            block_y,
-            parsed.actual_num_blocks_y,
-            height,
-            parsed.pixels.num_blocks_y,
-            parsed.base_block_height,
-        );
-        if this_block_height == 0 {
-            continue;
-        }
-
-        for block_x in 0..parsed.actual_num_blocks_x {
-            let this_block_width = block_width(
-                block_x,
-                parsed.actual_num_blocks_x,
-                width,
-                parsed.pixels.num_blocks_x,
-                parsed.base_block_width,
-            );
-            if this_block_width == 0 {
-                continue;
-            }
-
-            let block = &parsed.blocks[block_index];
-            block_index += 1;
-
-            let mut stuffed_values: Option<&[f64]> = None;
-            let (raw_values, constant_value) = match &block.encoding {
-                Lerc1BlockEncoding::Zero => (None, Some(0.0f32)),
-                Lerc1BlockEncoding::Constant(value) => (None, Some(*value)),
-                Lerc1BlockEncoding::Raw(values) => (Some(values.as_slice()), None),
-                Lerc1BlockEncoding::Stuffed {
-                    offset,
-                    bits_per_pixel,
-                    stuffed_data,
-                } => {
-                    if block.valid_pixel_count > block_buffer.len() {
-                        return Err(Error::InvalidBlob(
-                            "Lerc1 stuffed block expands beyond its output buffer".into(),
-                        ));
-                    }
-                    block_buffer[..block.valid_pixel_count].fill(0.0);
-                    unstuff_v2(
-                        stuffed_data,
-                        &mut block_buffer[..block.valid_pixel_count],
-                        *bits_per_pixel,
-                        UnstuffOptions {
-                            num_pixels: block.valid_pixel_count,
-                            lut_values: None,
-                            offset: Some(*offset as f64),
-                            scale: 2.0 * parsed.info.max_z_error,
-                            max_value: parsed.pixels.max_value as f64,
-                        },
-                    )?;
-                    stuffed_values = Some(&block_buffer[..block.valid_pixel_count]);
-                    (None, None)
-                }
-            };
-
-            let mut value_index = 0usize;
-            for row in 0..this_block_height {
-                let pixel_row = block_y * parsed.base_block_height + row;
-                for col in 0..this_block_width {
-                    let pixel = pixel_row * width + block_x * parsed.base_block_width + col;
-                    if mask.map(|mask| mask[pixel] != 0).unwrap_or(true) {
-                        let value = if let Some(value) = constant_value {
-                            value
-                        } else if let Some(values) = raw_values {
-                            values.get(value_index).copied().ok_or_else(|| {
-                                Error::InvalidBlob("Lerc1 raw block payload ended early".into())
-                            })?
-                        } else if let Some(values) = stuffed_values {
-                            values.get(value_index).copied().ok_or_else(|| {
-                                Error::InvalidBlob("Lerc1 stuffed block payload ended early".into())
-                            })? as f32
-                        } else {
-                            unreachable!()
-                        };
-                        let value_f64 = f64::from(value);
-                        result[pixel] = T::from_f64(value_f64);
-                        min_value = min_value.min(value_f64);
-                        max_value = max_value.max(value_f64);
-                        value_index += 1;
-                    }
-                }
-            }
-
-            if block.valid_pixel_count != value_index
-                && !matches!(
-                    block.encoding,
-                    Lerc1BlockEncoding::Zero | Lerc1BlockEncoding::Constant(_)
-                )
-            {
-                return Err(Error::InvalidBlob(
-                    "Lerc1 block payload does not match the block mask".into(),
-                ));
-            }
-        }
-    }
-
-    let z_range = if min_value.is_finite() && max_value.is_finite() {
-        Some((min_value, max_value))
-    } else {
-        None
-    };
-
-    Ok((result, z_range))
-}
-
 fn decode_pixels_into<T: Sample, W: BandWriter<T>>(
     parsed: &Lerc1Blob,
     out: &mut W,
 ) -> Result<ValueRange> {
+    match parsed.mask.as_deref() {
+        Some(mask) => decode_pixels_into_with_validity(parsed, MaskValidity::new(mask), out),
+        None => decode_pixels_into_with_validity(parsed, AllValid, out),
+    }
+}
+
+fn decode_pixels_into_with_validity<T: Sample, W: BandWriter<T>, V: Validity>(
+    parsed: &Lerc1Blob,
+    validity: V,
+    out: &mut W,
+) -> Result<ValueRange> {
     let width = parsed.info.width as usize;
-    let height = parsed.info.height as usize;
-    let mask = parsed.mask.as_deref();
-    let block_samples = checked_mul(
-        parsed.base_block_width,
-        parsed.base_block_height,
-        "Lerc1 base block sample count",
-    )?;
+    let block_samples = parsed.grid.max_block_samples()?;
     let mut block_buffer = default_vec(block_samples, "Lerc1 base block buffer")?;
     let mut block_index = 0usize;
     let mut min_value = f64::INFINITY;
     let mut max_value = f64::NEG_INFINITY;
 
-    for block_y in 0..parsed.actual_num_blocks_y {
-        let this_block_height = block_height(
-            block_y,
-            parsed.actual_num_blocks_y,
-            height,
-            parsed.pixels.num_blocks_y,
-            parsed.base_block_height,
-        );
-        if this_block_height == 0 {
-            continue;
-        }
+    parsed.grid.for_each_block(|block_pos| {
+        let block = &parsed.blocks[block_index];
+        block_index += 1;
 
-        for block_x in 0..parsed.actual_num_blocks_x {
-            let this_block_width = block_width(
-                block_x,
-                parsed.actual_num_blocks_x,
-                width,
-                parsed.pixels.num_blocks_x,
-                parsed.base_block_width,
-            );
-            if this_block_width == 0 {
-                continue;
-            }
-
-            let block = &parsed.blocks[block_index];
-            block_index += 1;
-
-            let mut stuffed_values: Option<&[f64]> = None;
-            let (raw_values, constant_value) = match &block.encoding {
-                Lerc1BlockEncoding::Zero => (None, Some(0.0f32)),
-                Lerc1BlockEncoding::Constant(value) => (None, Some(*value)),
-                Lerc1BlockEncoding::Raw(values) => (Some(values.as_slice()), None),
-                Lerc1BlockEncoding::Stuffed {
-                    offset,
-                    bits_per_pixel,
+        let mut stuffed_values: Option<&[f64]> = None;
+        let (raw_values, constant_value) = match &block.encoding {
+            Lerc1BlockEncoding::Zero => (None, Some(0.0f32)),
+            Lerc1BlockEncoding::Constant(value) => (None, Some(*value)),
+            Lerc1BlockEncoding::Raw(values) => (Some(values.as_slice()), None),
+            Lerc1BlockEncoding::Stuffed {
+                offset,
+                bits_per_pixel,
+                stuffed_data,
+            } => {
+                if block.valid_pixel_count > block_buffer.len() {
+                    return Err(Error::invalid_blob(
+                        "Lerc1 stuffed block expands beyond its output buffer",
+                    ));
+                }
+                block_buffer[..block.valid_pixel_count].fill(0.0);
+                unstuff_v2(
                     stuffed_data,
-                } => {
-                    if block.valid_pixel_count > block_buffer.len() {
-                        return Err(Error::InvalidBlob(
-                            "Lerc1 stuffed block expands beyond its output buffer".into(),
-                        ));
-                    }
-                    block_buffer[..block.valid_pixel_count].fill(0.0);
-                    unstuff_v2(
-                        stuffed_data,
-                        &mut block_buffer[..block.valid_pixel_count],
-                        *bits_per_pixel,
-                        UnstuffOptions {
-                            num_pixels: block.valid_pixel_count,
-                            lut_values: None,
-                            offset: Some(*offset as f64),
-                            scale: 2.0 * parsed.info.max_z_error,
-                            max_value: parsed.pixels.max_value as f64,
-                        },
-                    )?;
-                    stuffed_values = Some(&block_buffer[..block.valid_pixel_count]);
-                    (None, None)
-                }
-            };
-
-            let mut value_index = 0usize;
-            for row in 0..this_block_height {
-                let pixel_row = block_y * parsed.base_block_height + row;
-                for col in 0..this_block_width {
-                    let pixel = pixel_row * width + block_x * parsed.base_block_width + col;
-                    if mask.map(|mask| mask[pixel] != 0).unwrap_or(true) {
-                        let value = if let Some(value) = constant_value {
-                            value
-                        } else if let Some(values) = raw_values {
-                            values.get(value_index).copied().ok_or_else(|| {
-                                Error::InvalidBlob("Lerc1 raw block payload ended early".into())
-                            })?
-                        } else if let Some(values) = stuffed_values {
-                            values.get(value_index).copied().ok_or_else(|| {
-                                Error::InvalidBlob("Lerc1 stuffed block payload ended early".into())
-                            })? as f32
-                        } else {
-                            unreachable!()
-                        };
-                        let value_f64 = f64::from(value);
-                        out.write(pixel, 0, T::from_f64(value_f64));
-                        min_value = min_value.min(value_f64);
-                        max_value = max_value.max(value_f64);
-                        value_index += 1;
-                    }
-                }
+                    &mut block_buffer[..block.valid_pixel_count],
+                    *bits_per_pixel,
+                    UnstuffOptions {
+                        num_pixels: block.valid_pixel_count,
+                        lut_values: None,
+                        offset: Some(*offset as f64),
+                        scale: 2.0 * parsed.info.max_z_error,
+                        max_value: parsed.pixels.max_value as f64,
+                    },
+                )?;
+                stuffed_values = Some(&block_buffer[..block.valid_pixel_count]);
+                (None, None)
             }
+        };
 
-            if block.valid_pixel_count != value_index
-                && !matches!(
-                    block.encoding,
-                    Lerc1BlockEncoding::Zero | Lerc1BlockEncoding::Constant(_)
-                )
-            {
-                return Err(Error::InvalidBlob(
-                    "Lerc1 block payload does not match the block mask".into(),
-                ));
+        let mut value_index = 0usize;
+        for row in 0..block_pos.height {
+            let pixel_row = block_pos.y + row;
+            for col in 0..block_pos.width {
+                let pixel = pixel_row * width + block_pos.x + col;
+                if validity.is_valid(pixel) {
+                    let value = if let Some(value) = constant_value {
+                        value
+                    } else if let Some(values) = raw_values {
+                        values.get(value_index).copied().ok_or_else(|| {
+                            Error::invalid_blob("Lerc1 raw block payload ended early")
+                        })?
+                    } else if let Some(values) = stuffed_values {
+                        values.get(value_index).copied().ok_or_else(|| {
+                            Error::invalid_blob("Lerc1 stuffed block payload ended early")
+                        })? as f32
+                    } else {
+                        return Err(Error::Internal("Lerc1 block has no value source"));
+                    };
+                    let value_f64 = f64::from(value);
+                    out.write(pixel, 0, T::from_f64(value_f64));
+                    min_value = min_value.min(value_f64);
+                    max_value = max_value.max(value_f64);
+                    value_index += 1;
+                }
             }
         }
-    }
+
+        if block.valid_pixel_count != value_index
+            && !matches!(
+                block.encoding,
+                Lerc1BlockEncoding::Zero | Lerc1BlockEncoding::Constant(_)
+            )
+        {
+            return Err(Error::invalid_blob(
+                "Lerc1 block payload does not match the block mask",
+            ));
+        }
+        Ok(())
+    })?;
 
     if min_value.is_finite() && max_value.is_finite() {
         Ok(Some((min_value, max_value)))
@@ -693,11 +602,7 @@ fn decode_pixels_into<T: Sample, W: BandWriter<T>>(
 fn scan_range(parsed: &Lerc1Blob) -> Result<(f64, f64)> {
     let mut min_value = f64::INFINITY;
     let mut max_value = f64::NEG_INFINITY;
-    let block_samples = checked_mul(
-        parsed.base_block_width,
-        parsed.base_block_height,
-        "Lerc1 base block sample count",
-    )?;
+    let block_samples = parsed.grid.max_block_samples()?;
     let mut block_buffer = default_vec(block_samples, "Lerc1 base block buffer")?;
 
     for block in &parsed.blocks {
@@ -727,6 +632,11 @@ fn scan_range(parsed: &Lerc1Blob) -> Result<(f64, f64)> {
                 bits_per_pixel,
                 stuffed_data,
             } => {
+                if block.valid_pixel_count > block_buffer.len() {
+                    return Err(Error::invalid_blob(
+                        "Lerc1 stuffed block expands beyond its output buffer",
+                    ));
+                }
                 block_buffer[..block.valid_pixel_count].fill(0.0);
                 unstuff_v2(
                     stuffed_data,
@@ -749,42 +659,16 @@ fn scan_range(parsed: &Lerc1Blob) -> Result<(f64, f64)> {
     }
 
     if !min_value.is_finite() || !max_value.is_finite() {
-        return Err(Error::InvalidBlob(
-            "cannot compute a value range for an empty LERC pixel buffer".into(),
+        return Err(Error::invalid_blob(
+            "cannot compute a value range for an empty LERC pixel buffer",
         ));
     }
 
     Ok((min_value, max_value))
 }
 
-fn block_width(
-    block_x: usize,
-    actual_num_blocks_x: usize,
-    width: usize,
-    num_blocks_x: usize,
-    base_block_width: usize,
-) -> usize {
-    if block_x + 1 == actual_num_blocks_x && width % num_blocks_x != 0 {
-        width % num_blocks_x
-    } else {
-        base_block_width
-    }
-}
-
-fn block_height(
-    block_y: usize,
-    actual_num_blocks_y: usize,
-    height: usize,
-    num_blocks_y: usize,
-    base_block_height: usize,
-) -> usize {
-    if block_y + 1 == actual_num_blocks_y && height % num_blocks_y != 0 {
-        height % num_blocks_y
-    } else {
-        base_block_height
-    }
-}
-
 fn read_u16(bytes: &[u8]) -> Result<u16> {
-    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+    let bytes = <[u8; 2]>::try_from(bytes)
+        .map_err(|_| Error::Internal("Lerc1 u16 field has the wrong width"))?;
+    Ok(u16::from_le_bytes(bytes))
 }

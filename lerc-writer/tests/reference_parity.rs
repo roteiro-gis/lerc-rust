@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use ndarray::ArrayD;
 
 #[path = "../../test-support/reference.rs"]
@@ -23,11 +25,9 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     let u8_blob = lerc_writer::encode(
         lerc_core::RasterView::new(4, 2, 1, &u8_pixels).unwrap(),
         None,
-        lerc_writer::EncodeOptions {
-            max_z_error: 0.5,
-            micro_block_size: 2,
-            ..lerc_writer::EncodeOptions::default()
-        },
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.5)
+            .with_micro_block_size(2),
     )
     .unwrap();
 
@@ -38,11 +38,9 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     let f32_blob = lerc_writer::encode(
         lerc_core::RasterView::new(3, 2, 2, &f32_pixels).unwrap(),
         Some(lerc_core::MaskView::new(3, 2, &f32_mask).unwrap()),
-        lerc_writer::EncodeOptions {
-            max_z_error: 0.25,
-            micro_block_size: 2,
-            ..lerc_writer::EncodeOptions::default()
-        },
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.25)
+            .with_micro_block_size(2),
     )
     .unwrap();
 
@@ -67,11 +65,9 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     let one_sweep_blob = lerc_writer::encode(
         lerc_core::RasterView::new(2, 2, 1, &one_sweep_pixels).unwrap(),
         None,
-        lerc_writer::EncodeOptions {
-            max_z_error: 0.0,
-            micro_block_size: 1,
-            ..lerc_writer::EncodeOptions::default()
-        },
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.0)
+            .with_micro_block_size(2),
     )
     .unwrap();
 
@@ -81,11 +77,9 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     let huffman_blob = lerc_writer::encode(
         lerc_core::RasterView::new(16, 16, 1, &huffman_pixels).unwrap(),
         None,
-        lerc_writer::EncodeOptions {
-            max_z_error: 0.5,
-            micro_block_size: 1,
-            ..lerc_writer::EncodeOptions::default()
-        },
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.5)
+            .with_micro_block_size(2),
     )
     .unwrap();
 
@@ -97,11 +91,9 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     let diff_blob = lerc_writer::encode(
         lerc_core::RasterView::new(4, 2, 2, &diff_pixels).unwrap(),
         None,
-        lerc_writer::EncodeOptions {
-            max_z_error: 0.5,
-            micro_block_size: 8,
-            ..lerc_writer::EncodeOptions::default()
-        },
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.5)
+            .with_micro_block_size(8),
     )
     .unwrap();
 
@@ -111,11 +103,9 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     let i8_huffman_blob = lerc_writer::encode(
         lerc_core::RasterView::new(16, 16, 1, &i8_huffman_pixels).unwrap(),
         None,
-        lerc_writer::EncodeOptions {
-            max_z_error: 0.5,
-            micro_block_size: 1,
-            ..lerc_writer::EncodeOptions::default()
-        },
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.5)
+            .with_micro_block_size(2),
     )
     .unwrap();
 
@@ -123,11 +113,9 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     let f64_blob = lerc_writer::encode(
         lerc_core::RasterView::new(3, 2, 1, &f64_pixels).unwrap(),
         None,
-        lerc_writer::EncodeOptions {
-            max_z_error: 0.0,
-            micro_block_size: 1,
-            ..lerc_writer::EncodeOptions::default()
-        },
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.0)
+            .with_micro_block_size(2),
     )
     .unwrap();
 
@@ -147,11 +135,40 @@ fn generated_blobs_match_liblerc_decode_hashes() {
     let no_data_blob = lerc_writer::encode(
         lerc_core::RasterView::new(16, 8, 2, &no_data_pixels).unwrap(),
         None,
-        lerc_writer::EncodeOptions {
-            max_z_error: 0.0,
-            micro_block_size: 8,
-            no_data_value: Some(f64::from(no_data)),
-        },
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.25)
+            .with_micro_block_size(8)
+            .with_no_data_value(f64::from(no_data)),
+    )
+    .unwrap();
+
+    let i32_no_data = -2_000_000_000i32;
+    let i32_diff_pixels = vec![
+        -117_000_351,
+        -91_000_273,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -74_000_222,
+        -110_000_330,
+        -98_000_294,
+        i32_no_data,
+        i32_no_data,
+    ];
+    let i32_diff_mask = vec![0, 1, 1, 1, 1, 1, 1, 1];
+    let i32_diff_blob = lerc_writer::encode(
+        lerc_core::RasterView::new(4, 2, 2, &i32_diff_pixels).unwrap(),
+        Some(lerc_core::MaskView::new(4, 2, &i32_diff_mask).unwrap()),
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.5)
+            .with_micro_block_size(9)
+            .with_no_data_value(f64::from(i32_no_data)),
     )
     .unwrap();
 
@@ -165,6 +182,7 @@ fn generated_blobs_match_liblerc_decode_hashes() {
         ("i8-huffman", i8_huffman_blob, 6u8),
         ("f64-lossless", f64_blob, 7u8),
         ("f32-v6-no-data", no_data_blob, 8u8),
+        ("i32-v5-positive-diff", i32_diff_blob, 9u8),
     ] {
         let path = reference::write_temp_bytes(&format!("lerc-writer-{name}"), "lerc2", &blob);
         let reference_json =
@@ -304,6 +322,22 @@ fn generated_blobs_match_liblerc_decode_hashes() {
                 );
                 assert_eq!(hash, reference_json["pixel_hash"].as_str().unwrap());
                 assert_eq!(reference_json["mask_hash"], serde_json::Value::Null);
+            }
+            9 => {
+                let raster: ArrayD<i32> = lerc_reader::decode_ndarray(&blob).unwrap();
+                let mask = lerc_reader::decode_mask_ndarray(&blob).unwrap().unwrap();
+                let (pixel_len, pixel_hash) = reference::array_hash(&raster);
+                let (mask_len, mask_hash) = reference::array_hash(&mask);
+                assert_eq!(
+                    pixel_len,
+                    reference_json["pixel_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(pixel_hash, reference_json["pixel_hash"].as_str().unwrap());
+                assert_eq!(
+                    mask_len,
+                    reference_json["mask_byte_len"].as_u64().unwrap() as usize
+                );
+                assert_eq!(mask_hash, reference_json["mask_hash"].as_str().unwrap());
             }
             _ => unreachable!(),
         }

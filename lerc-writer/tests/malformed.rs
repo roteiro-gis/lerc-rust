@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use lerc_core::{BandLayout, BandSetView, RasterView};
 use lerc_writer::{
     encode, encoded_band_set_len_upper_bound, encoded_len_upper_bound, EncodeOptions,
@@ -8,11 +10,9 @@ fn sample_blob() -> Vec<u8> {
     encode(
         RasterView::new(4, 2, 1, &pixels).unwrap(),
         None,
-        EncodeOptions {
-            max_z_error: 0.5,
-            micro_block_size: 2,
-            ..EncodeOptions::default()
-        },
+        EncodeOptions::new()
+            .with_max_z_error(0.5)
+            .with_micro_block_size(2),
     )
     .unwrap()
 }
@@ -57,7 +57,7 @@ fn rejects_blob_with_invalid_mask_length() {
 
     assert!(matches!(
         lerc_reader::decode(&blob),
-        Err(lerc_core::Error::InvalidBlob(_) | lerc_core::Error::Truncated { .. })
+        Err(lerc_core::Error::Truncated { .. })
     ));
 }
 
@@ -65,10 +65,7 @@ fn rejects_blob_with_invalid_mask_length() {
 fn rejects_no_data_for_unit_depth_rasters() {
     let pixels = vec![1.0f32, -9999.0, 3.0, 4.0];
     let raster = RasterView::new(2, 2, 1, &pixels).unwrap();
-    let options = EncodeOptions {
-        no_data_value: Some(-9999.0),
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new().with_no_data_value(-9999.0);
 
     assert!(matches!(
         encode(raster, None, options),
@@ -94,11 +91,34 @@ fn rejects_non_finite_no_data_value() {
         encode(
             RasterView::new(1, 2, 2, &pixels).unwrap(),
             None,
-            EncodeOptions {
-                no_data_value: Some(f64::NAN),
-                ..EncodeOptions::default()
-            },
+            EncodeOptions::new().with_no_data_value(f64::NAN),
         ),
         Err(lerc_core::Error::InvalidArgument(_))
     ));
+}
+
+#[test]
+fn rejects_micro_block_sizes_outside_the_supported_range() {
+    let pixels = vec![1u8, 2, 3, 4];
+    let raster = RasterView::new(2, 2, 1, &pixels).unwrap();
+
+    for micro_block_size in [0, 1, 65, u32::MAX] {
+        let result = encode(
+            raster,
+            None,
+            EncodeOptions::new().with_micro_block_size(micro_block_size),
+        );
+        assert!(
+            matches!(result, Err(lerc_core::Error::InvalidArgument(_))),
+            "micro_block_size={micro_block_size}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_no_data_outside_the_raster_type_range() {
+    let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    let raster = RasterView::new(2, 2, 2, &pixels).unwrap();
+    let result = encode(raster, None, EncodeOptions::new().with_no_data_value(256.0));
+    assert!(matches!(result, Err(lerc_core::Error::InvalidArgument(_))));
 }

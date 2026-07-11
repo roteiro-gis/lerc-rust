@@ -96,6 +96,21 @@ fn build_external_mask_lerc2_blob(values: &[u8]) -> Vec<u8> {
     finalize_lerc2_with_checksum(bytes)
 }
 
+fn build_constant_lerc2(value: u8) -> Vec<u8> {
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 2,
+        height: 2,
+        valid_pixel_count: 4,
+        image_type: 1,
+        max_z_error: 0.5,
+        z_min: f64::from(value),
+        z_max: f64::from(value),
+        payload_len: 0,
+    });
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob
+}
+
 #[test]
 fn reads_blob_info_for_constant_lerc2() {
     let mut blob = build_header_v2(HeaderV2 {
@@ -116,6 +131,77 @@ fn reads_blob_info_for_constant_lerc2() {
     assert_eq!(info.depth, 1);
     assert_eq!(info.data_type, DataType::U16);
     assert_eq!(info.blob_size, blob.len());
+}
+
+#[test]
+fn streaming_decode_reads_exactly_one_lerc2_blob() {
+    let first = build_constant_lerc2(3);
+    let second = build_constant_lerc2(7);
+    let mut bytes = first.clone();
+    bytes.extend_from_slice(&second);
+    let mut reader = std::io::Cursor::new(bytes);
+
+    let decoded_first = decode_from_reader(&mut reader).unwrap();
+    assert_eq!(decoded_first.pixels, PixelData::U8(vec![3; 4]));
+    assert_eq!(reader.position() as usize, first.len());
+
+    let decoded_second = decode_from_reader(&mut reader).unwrap();
+    assert_eq!(decoded_second.pixels, PixelData::U8(vec![7; 4]));
+    assert_eq!(reader.position() as usize, first.len() + second.len());
+}
+
+#[test]
+fn streaming_band_set_decode_reads_until_clean_eof() {
+    let mut bytes = build_constant_lerc2(3);
+    bytes.extend_from_slice(&build_constant_lerc2(7));
+    let decoded = decode_band_set_from_reader(&mut std::io::Cursor::new(bytes)).unwrap();
+
+    assert_eq!(decoded.info.band_count(), 2);
+    assert_eq!(
+        decoded.bands,
+        vec![PixelData::U8(vec![3; 4]), PixelData::U8(vec![7; 4])]
+    );
+}
+
+#[test]
+fn streaming_decode_supports_lerc1_section_lengths() {
+    let values = [1.0f32, 2.0, 3.0, 4.0];
+    let blob = build_lerc1_blob(true, None, &values, 0.5, 4.0);
+    let decoded = decode_from_reader(&mut std::io::Cursor::new(blob)).unwrap();
+    assert_eq!(decoded.pixels, PixelData::F32(values.to_vec()));
+}
+
+#[test]
+fn streaming_decode_reports_truncated_payloads() {
+    let mut blob = build_constant_lerc2(3);
+    blob.pop();
+    assert!(matches!(
+        decode_from_reader(&mut std::io::Cursor::new(blob)),
+        Err(Error::Truncated { .. })
+    ));
+}
+
+#[test]
+fn streaming_decode_preserves_io_error_kind() {
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "synthetic stream failure",
+            ))
+        }
+    }
+
+    let result = decode_from_reader(&mut FailingReader);
+    assert!(matches!(
+        result,
+        Err(Error::Io {
+            kind: std::io::ErrorKind::ConnectionReset,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -469,6 +555,20 @@ fn reads_blob_info_for_lerc1() {
     assert_eq!(info.height, 2);
     assert_eq!(info.depth, 1);
     assert_eq!(info.data_type, DataType::F32);
+}
+
+#[test]
+fn lerc1_inspection_can_skip_exact_value_range_decoding() {
+    let blob = build_lerc1_blob(true, None, &[1.0, 2.0, 3.0, 4.0], 0.5, 99.0);
+
+    let exact = inspect_first(&blob).unwrap();
+    let header_only =
+        inspect_first_with_options(&blob, InspectOptions::new().with_compute_value_range(false))
+            .unwrap();
+
+    assert_eq!((exact.z_min, exact.z_max), (1.0, 4.0));
+    assert_eq!((header_only.z_min, header_only.z_max), (0.0, 99.0));
+    assert_eq!(header_only.blob_size, exact.blob_size);
 }
 
 #[test]

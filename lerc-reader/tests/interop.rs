@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use lerc_core::{DataType, PixelData};
 use ndarray::IxDyn;
 
@@ -97,6 +99,18 @@ fn decodes_official_california_lerc2_fixture() {
 fn decodes_official_bluemarble_band_set_fixture() {
     let blob = load_binary_fixture("bluemarble_256_256_3_byte.lerc2");
 
+    let first = lerc_reader::inspect_first(&blob).unwrap();
+    assert_eq!(first.version, lerc_core::Version::Lerc2(3));
+    assert_eq!(first.data_type, DataType::U8);
+    assert_eq!(first.max_z_error, 0.5);
+    let mask_len = u32::from_le_bytes(blob[62..66].try_into().unwrap()) as usize;
+    let body_offset = 66 + mask_len;
+    assert_eq!(blob[body_offset], 0, "expected a compressed Lerc2 body");
+    assert_eq!(
+        blob[body_offset + 1],
+        1,
+        "official fixture must retain its Huffman encode mode"
+    );
     assert_eq!(lerc_reader::get_band_count(&blob).unwrap(), 3);
 
     let raster = lerc_reader::decode_band_set_ndarray::<u8>(&blob).unwrap();

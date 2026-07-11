@@ -1,10 +1,10 @@
 [workspace]
-members = ["lerc-band-materialize", "lerc-core", "lerc-reader", "lerc-writer"]
+members = ["lerc-core", "lerc-reader", "lerc-writer"]
 exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT OR Apache-2.0"
@@ -12,4 +12,13 @@ repository = "https://github.com/i-norden/lerc-rust"
 homepage = "https://github.com/i-norden/lerc-rust"
 
 [workspace.dependencies]
+clap = { version = "=4.5.50", default-features = false, features = ["std"] }
+half = "=2.4.1"
 ndarray = "0.17"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

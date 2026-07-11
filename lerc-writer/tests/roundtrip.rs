@@ -1,4 +1,6 @@
-use lerc_core::{BandLayout, BandSetView, Error, MaskView, RasterView};
+#![allow(missing_docs)]
+
+use lerc_core::{BandLayout, BandSetView, Error, MaskView, RasterView, Sample};
 use lerc_writer::{
     encode, encode_band_set, encode_band_set_into, encode_into, encoded_band_set_len_upper_bound,
     encoded_len_upper_bound, EncodeOptions,
@@ -18,6 +20,74 @@ fn body_offset(blob: &[u8], info: &lerc_core::BlobInfo) -> usize {
         .map(|_| info.depth as usize * 2 * info.data_type.byte_len())
         .unwrap_or(0);
     header_len + 4 + mask_num_bytes + range_len
+}
+
+fn snapshot_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+}
+
+fn read_f64(blob: &[u8], offset: usize) -> f64 {
+    f64::from_le_bytes(blob[offset..offset + 8].try_into().unwrap())
+}
+
+fn snapshot_type<T: Sample>(hash: &mut u64) {
+    let pixels: Vec<T> = (0..32)
+        .map(|index| T::from_f64(((index * 17 + index / 3) % 29) as f64))
+        .collect();
+    let mask_data: Vec<u8> = (0..32)
+        .map(|index| u8::from(index % 5 != 0 && index % 11 != 0))
+        .collect();
+    let raster = RasterView::new(8, 4, 1, &pixels).unwrap();
+    let mask = MaskView::new(8, 4, &mask_data).unwrap();
+    let errors = if T::IS_INTEGER {
+        [0.0, 1.0]
+    } else {
+        [0.0, 0.25]
+    };
+
+    for max_z_error in errors {
+        let options = EncodeOptions::new()
+            .with_max_z_error(max_z_error)
+            .with_micro_block_size(4);
+        snapshot_bytes(hash, &encode(raster, None, options).unwrap());
+        snapshot_bytes(hash, &encode(raster, Some(mask), options).unwrap());
+    }
+}
+
+#[test]
+fn encoded_bytes_snapshot_matrix() {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    snapshot_type::<i8>(&mut hash);
+    snapshot_type::<u8>(&mut hash);
+    snapshot_type::<i16>(&mut hash);
+    snapshot_type::<u16>(&mut hash);
+    snapshot_type::<i32>(&mut hash);
+    snapshot_type::<u32>(&mut hash);
+    snapshot_type::<f32>(&mut hash);
+    snapshot_type::<f64>(&mut hash);
+
+    let no_data = -9_999.0f32;
+    let pixels = vec![
+        10.0, 20.0, 30.0, no_data, no_data, no_data, 11.0, no_data, 31.0, 12.0, 22.0, 32.0,
+    ];
+    let raster = RasterView::new(2, 2, 3, &pixels).unwrap();
+    snapshot_bytes(
+        &mut hash,
+        &encode(
+            raster,
+            None,
+            EncodeOptions::new()
+                .with_max_z_error(0.25)
+                .with_micro_block_size(2)
+                .with_no_data_value(no_data as f64),
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(hash, 0xb77f_1b09_14c6_a196);
 }
 
 #[test]
@@ -41,13 +111,13 @@ fn roundtrips_constant_u16_raster() {
 
 #[test]
 fn selects_one_sweep_when_tile_headers_would_dominate() {
-    let pixels = vec![5u16, 9, 6, 10];
-    let raster = RasterView::new(2, 2, 1, &pixels).unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.0,
-        micro_block_size: 1,
-        ..EncodeOptions::default()
-    };
+    let pixels: Vec<u16> = (0..256)
+        .map(|index| if index % 2 == 0 { 0 } else { u16::MAX })
+        .collect();
+    let raster = RasterView::new(16, 16, 1, &pixels).unwrap();
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.0)
+        .with_micro_block_size(2);
 
     let blob = encode(raster, None, options).unwrap();
     let info = lerc_reader::get_blob_info(&blob).unwrap();
@@ -67,11 +137,9 @@ fn selects_huffman_for_repeated_lossless_u8_data() {
         .map(|index| if index % 64 < 48 { 7 } else { 9 })
         .collect();
     let raster = RasterView::new(16, 16, 1, &pixels).unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.5,
-        micro_block_size: 1,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.5)
+        .with_micro_block_size(2);
 
     let blob = encode(raster, None, options).unwrap();
     let info = lerc_reader::get_blob_info(&blob).unwrap();
@@ -92,11 +160,9 @@ fn roundtrips_signed_huffman_i8_data() {
         .map(|index| if index % 32 < 24 { -7 } else { 11 })
         .collect();
     let raster = RasterView::new(16, 16, 1, &pixels).unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.5,
-        micro_block_size: 1,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.5)
+        .with_micro_block_size(2);
 
     let blob = encode(raster, None, options).unwrap();
     let info = lerc_reader::get_blob_info(&blob).unwrap();
@@ -119,11 +185,9 @@ fn selects_v5_diff_tiles_for_lossless_depth_data() {
         pixels.push(value);
     }
     let raster = RasterView::new(4, 2, 2, &pixels).unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.5,
-        micro_block_size: 8,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.5)
+        .with_micro_block_size(8);
 
     let blob = encode(raster, None, options).unwrap();
     let info = lerc_reader::get_blob_info(&blob).unwrap();
@@ -145,11 +209,9 @@ fn roundtrips_lossless_f64_raster() {
     let blob = encode(
         raster,
         None,
-        EncodeOptions {
-            max_z_error: 0.0,
-            micro_block_size: 1,
-            ..EncodeOptions::default()
-        },
+        EncodeOptions::new()
+            .with_max_z_error(0.0)
+            .with_micro_block_size(2),
     )
     .unwrap();
 
@@ -172,11 +234,9 @@ fn encoded_len_upper_bound_is_conservative() {
 fn roundtrips_bitstuffed_u8_tiles_exactly() {
     let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
     let raster = RasterView::new(4, 2, 1, &pixels).unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.5,
-        micro_block_size: 2,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.5)
+        .with_micro_block_size(2);
 
     let upper_bound = encoded_len_upper_bound(raster, None, options).unwrap();
     let blob = encode(raster, None, options).unwrap();
@@ -187,14 +247,45 @@ fn roundtrips_bitstuffed_u8_tiles_exactly() {
 }
 
 #[test]
-fn roundtrips_bitstuffed_tile_with_oversized_micro_block() {
+fn zero_error_uses_canonical_lossless_integer_quantization_for_every_type() {
+    macro_rules! check {
+        ($type:ty, $variant:ident) => {{
+            let pixels: Vec<$type> = (0..256).map(|index| (index % 17) as $type).collect();
+            let raster = RasterView::new(16, 16, 1, &pixels).unwrap();
+            let blob = encode(
+                raster,
+                None,
+                EncodeOptions::new()
+                    .with_max_z_error(0.0)
+                    .with_micro_block_size(8),
+            )
+            .unwrap();
+            let info = lerc_reader::get_blob_info(&blob).unwrap();
+
+            assert_eq!(info.max_z_error, 0.5);
+            assert!(blob.len() < 70 + pixels.len() * std::mem::size_of::<$type>());
+            assert_eq!(
+                lerc_reader::decode(&blob).unwrap().pixels,
+                lerc_core::PixelData::$variant(pixels)
+            );
+        }};
+    }
+
+    check!(i8, I8);
+    check!(u8, U8);
+    check!(i16, I16);
+    check!(u16, U16);
+    check!(i32, I32);
+    check!(u32, U32);
+}
+
+#[test]
+fn roundtrips_bitstuffed_tile_with_maximum_micro_block() {
     let pixels: Vec<u16> = (0..16).collect();
     let raster = RasterView::new(4, 4, 1, &pixels).unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.5,
-        micro_block_size: 1_000_000,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.5)
+        .with_micro_block_size(64);
 
     let blob = encode(raster, None, options).unwrap();
     let info = lerc_reader::get_blob_info(&blob).unwrap();
@@ -220,18 +311,17 @@ fn direct_band_set_apis_materialize_zero_tiles_from_writer_output() {
     }
 
     let raster = RasterView::new(width as u32, height as u32, 1, &pixels).unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.0,
-        micro_block_size: 8,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.0)
+        .with_micro_block_size(8);
     let blob = encode(raster, None, options).unwrap();
     let info = lerc_reader::get_blob_info(&blob).unwrap();
     let offset = body_offset(&blob, &info);
 
     assert_eq!(blob[offset], 0);
-    assert_eq!(blob[offset + 1] & 3, 2);
-    assert_eq!(blob[offset + 2] & 3, 3);
+    assert_eq!(blob[offset + 1], 0);
+    assert_eq!(blob[offset + 2] & 3, 2);
+    assert_eq!(blob[offset + 3] & 3, 3);
 
     let (vec_info, decoded_vec) =
         lerc_reader::decode_band_set_vec::<u8>(&blob, BandLayout::Bsq).unwrap();
@@ -268,11 +358,10 @@ fn emits_v6_no_data_tiled_body_for_depth_rasters() {
     }
 
     let raster = RasterView::new(width as u32, height as u32, depth as u32, &pixels).unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.0,
-        micro_block_size: 8,
-        no_data_value: Some(f64::from(no_data)),
-    };
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.0)
+        .with_micro_block_size(8)
+        .with_no_data_value(f64::from(no_data));
     let blob = encode(raster, None, options).unwrap();
     let info = lerc_reader::get_blob_info(&blob).unwrap();
 
@@ -290,6 +379,268 @@ fn emits_v6_no_data_tiled_body_for_depth_rasters() {
 
     let decoded = lerc_reader::decode(&blob).unwrap();
     assert_eq!(decoded.pixels, lerc_core::PixelData::F32(pixels));
+}
+
+#[test]
+fn all_depth_no_data_pixels_are_moved_into_the_mask() {
+    let no_data = -9999.0f32;
+    let pixels = vec![no_data, no_data, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let raster = RasterView::new(2, 2, 2, &pixels).unwrap();
+    let blob = encode(
+        raster,
+        None,
+        EncodeOptions::new()
+            .with_max_z_error(0.25)
+            .with_no_data_value(f64::from(no_data)),
+    )
+    .unwrap();
+
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    assert_eq!(decoded.info.valid_pixel_count, 3);
+    assert_eq!(decoded.info.no_data_value, None);
+    assert_eq!(decoded.mask, Some(vec![0, 1, 1, 1]));
+    assert_eq!(
+        decoded.pixels,
+        lerc_core::PixelData::F32(vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    );
+}
+
+#[test]
+fn roundtrips_implicit_all_invalid_mask() {
+    let pixels = vec![10u16, 20, 30, 40];
+    let mask_data = vec![0u8; 4];
+    let raster = RasterView::new(2, 2, 1, &pixels).unwrap();
+    let mask = MaskView::new(2, 2, &mask_data).unwrap();
+    let blob = encode(raster, Some(mask), EncodeOptions::new()).unwrap();
+
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    assert_eq!(
+        decoded.info.mask_encoding,
+        lerc_core::MaskEncoding::ImplicitAllInvalid
+    );
+    assert_eq!(decoded.info.valid_pixel_count, 0);
+    assert_eq!(decoded.mask, Some(mask_data));
+    assert_eq!(decoded.pixels, lerc_core::PixelData::U16(vec![0; 4]));
+}
+
+#[test]
+fn mixed_no_data_is_exact_with_lossy_valid_samples() {
+    let no_data = -9999.0f32;
+    let pixels = vec![10.25f32, no_data, 11.75, 20.25, 13.25, 22.75, 15.0, 24.0];
+    let raster = RasterView::new(2, 2, 2, &pixels).unwrap();
+    let blob = encode(
+        raster,
+        None,
+        EncodeOptions::new()
+            .with_max_z_error(0.5)
+            .with_no_data_value(f64::from(no_data)),
+    )
+    .unwrap();
+
+    let encoded_no_data = read_f64(&blob, 74);
+    let original_no_data = read_f64(&blob, 82);
+    assert_ne!(encoded_no_data, f64::from(no_data));
+    assert!(encoded_no_data < f64::from(10.25f32 - 1.0));
+    assert_eq!(original_no_data, f64::from(no_data));
+
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    let lerc_core::PixelData::F32(values) = decoded.pixels else {
+        panic!("expected f32 output");
+    };
+    assert_eq!(values[1], no_data);
+    for (index, (&actual, &expected)) in values.iter().zip(&pixels).enumerate() {
+        if index == 1 {
+            continue;
+        }
+        assert!((actual - expected).abs() <= 0.5);
+    }
+}
+
+#[test]
+fn no_data_inside_valid_range_forces_float_lossless() {
+    let no_data = 10.0f32;
+    let pixels = vec![9.0f32, no_data, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
+    let raster = RasterView::new(2, 2, 2, &pixels).unwrap();
+    let blob = encode(
+        raster,
+        None,
+        EncodeOptions::new()
+            .with_max_z_error(2.0)
+            .with_no_data_value(f64::from(no_data)),
+    )
+    .unwrap();
+
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+    assert_eq!(info.max_z_error, 0.0);
+    assert_eq!(
+        lerc_reader::decode(&blob).unwrap().pixels,
+        lerc_core::PixelData::F32(pixels)
+    );
+}
+
+#[test]
+fn no_data_within_two_errors_of_float_range_forces_lossless() {
+    let no_data = 7.0f32;
+    let pixels = vec![10.0f32, no_data, 12.0, 20.0, 14.0, 22.0, 16.0, 24.0];
+    let raster = RasterView::new(2, 2, 2, &pixels).unwrap();
+    let blob = encode(
+        raster,
+        None,
+        EncodeOptions::new()
+            .with_max_z_error(2.0)
+            .with_no_data_value(f64::from(no_data)),
+    )
+    .unwrap();
+
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+    assert_eq!(info.max_z_error, 0.0);
+    assert_eq!(
+        lerc_reader::decode(&blob).unwrap().pixels,
+        lerc_core::PixelData::F32(pixels)
+    );
+}
+
+#[test]
+fn integer_no_data_remaps_above_range_at_type_minimum() {
+    let no_data = i8::MAX;
+    let pixels = vec![i8::MIN, no_data, -100, 50];
+    let raster = RasterView::new(2, 1, 2, &pixels).unwrap();
+    let blob = encode(
+        raster,
+        None,
+        EncodeOptions::new()
+            .with_max_z_error(0.0)
+            .with_no_data_value(f64::from(no_data)),
+    )
+    .unwrap();
+
+    assert_eq!(read_f64(&blob, 74), 51.0);
+    assert_eq!(read_f64(&blob, 82), f64::from(no_data));
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    assert_eq!(decoded.info.max_z_error, 0.5);
+    assert_eq!(decoded.pixels, lerc_core::PixelData::I8(pixels));
+}
+
+#[test]
+fn integer_no_data_remap_respects_derived_and_external_masks() {
+    let no_data = 65_000u16;
+    let pixels = vec![
+        no_data, no_data, 60_909, 60_909, 60_909, 60_909, 60_909, 60_909, 60_909, 60_909, 13_878,
+        no_data,
+    ];
+    let mask_data = vec![1, 1, 1, 1, 0, 1];
+    let raster = RasterView::new(2, 3, 2, &pixels).unwrap();
+    let mask = MaskView::new(2, 3, &mask_data).unwrap();
+    let blob = encode(
+        raster,
+        Some(mask),
+        EncodeOptions::new()
+            .with_max_z_error(0.5)
+            .with_micro_block_size(5)
+            .with_no_data_value(f64::from(no_data)),
+    )
+    .unwrap();
+
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    assert_eq!(decoded.mask, Some(vec![0, 1, 1, 1, 0, 1]));
+    assert_eq!(
+        decoded.pixels,
+        lerc_core::PixelData::U16(vec![
+            0, 0, 60_909, 60_909, 60_909, 60_909, 60_909, 60_909, 0, 0, 13_878, no_data,
+        ])
+    );
+}
+
+#[test]
+fn bitstuffed_positive_i32_differences_roundtrip() {
+    let no_data = -2_000_000_000i32;
+    let pixels = vec![
+        -117_000_351,
+        -91_000_273,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -87_000_261,
+        -74_000_222,
+        -110_000_330,
+        -98_000_294,
+        no_data,
+        no_data,
+    ];
+    let mask_data = vec![0, 1, 1, 1, 1, 1, 1, 1];
+    let raster = RasterView::new(4, 2, 2, &pixels).unwrap();
+    let mask = MaskView::new(4, 2, &mask_data).unwrap();
+    let blob = encode(
+        raster,
+        Some(mask),
+        EncodeOptions::new()
+            .with_max_z_error(0.5)
+            .with_micro_block_size(9)
+            .with_no_data_value(f64::from(no_data)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        lerc_reader::inspect_first(&blob).unwrap().version,
+        lerc_core::Version::Lerc2(5)
+    );
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    assert_eq!(decoded.mask, Some(vec![0, 1, 1, 1, 1, 1, 1, 0]));
+    assert_eq!(
+        decoded.pixels,
+        lerc_core::PixelData::I32(vec![
+            0,
+            0,
+            -87_000_261,
+            -87_000_261,
+            -87_000_261,
+            -87_000_261,
+            -87_000_261,
+            -87_000_261,
+            -87_000_261,
+            -87_000_261,
+            -87_000_261,
+            -74_000_222,
+            -110_000_330,
+            -98_000_294,
+            0,
+            0,
+        ])
+    );
+}
+
+#[test]
+fn derived_no_data_masks_are_stored_per_band() {
+    let no_data = -9999i16;
+    let pixels = vec![no_data, no_data, 1, 2, 3, 4, no_data, no_data];
+    let band_set = BandSetView::new(2, 1, 2, 2, BandLayout::Bsq, &pixels).unwrap();
+    let blob = encode_band_set(
+        band_set,
+        None,
+        EncodeOptions::new().with_no_data_value(f64::from(no_data)),
+    )
+    .unwrap();
+
+    let first = lerc_reader::inspect_first(&blob).unwrap();
+    let second = lerc_reader::get_blob_info(&blob[first.blob_size..]).unwrap();
+    assert_eq!(first.mask_encoding, lerc_core::MaskEncoding::Explicit);
+    assert_eq!(second.mask_encoding, lerc_core::MaskEncoding::Explicit);
+
+    let decoded = lerc_reader::decode_band_set(&blob).unwrap();
+    assert_eq!(decoded.info.mask_count(), 2);
+    assert_eq!(decoded.band_masks, vec![Some(vec![0, 1]), Some(vec![1, 0])]);
+    assert_eq!(
+        decoded.bands,
+        vec![
+            lerc_core::PixelData::I16(vec![0, 0, 1, 2]),
+            lerc_core::PixelData::I16(vec![3, 4, 0, 0]),
+        ]
+    );
 }
 
 #[test]
@@ -312,11 +663,10 @@ fn upper_bound_covers_v6_no_data_output() {
     }
 
     let raster = RasterView::new(width as u32, height as u32, depth as u32, &pixels).unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.0,
-        micro_block_size: 8,
-        no_data_value: Some(f64::from(no_data)),
-    };
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.0)
+        .with_micro_block_size(8)
+        .with_no_data_value(f64::from(no_data));
     let upper_bound = encoded_len_upper_bound(raster, None, options).unwrap();
     let blob = encode(raster, None, options).unwrap();
     assert!(upper_bound >= blob.len());
@@ -358,11 +708,10 @@ fn band_set_upper_bound_covers_v6_no_data_output() {
         &pixels,
     )
     .unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.0,
-        micro_block_size: 8,
-        no_data_value: Some(f64::from(no_data)),
-    };
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.0)
+        .with_micro_block_size(8)
+        .with_no_data_value(f64::from(no_data));
     let upper_bound = encoded_band_set_len_upper_bound(band_set, None, options).unwrap();
     let blob = encode_band_set(band_set, None, options).unwrap();
     assert!(upper_bound >= blob.len());
@@ -381,11 +730,9 @@ fn roundtrips_masked_f32_raster_with_depth() {
     let mask = vec![1u8, 0, 1, 1, 0, 1];
     let raster = RasterView::new(3, 2, 2, &pixels).unwrap();
     let mask = MaskView::new(3, 2, &mask).unwrap();
-    let options = EncodeOptions {
-        max_z_error: 0.25,
-        micro_block_size: 2,
-        ..EncodeOptions::default()
-    };
+    let options = EncodeOptions::new()
+        .with_max_z_error(0.25)
+        .with_micro_block_size(2);
 
     let blob = encode(raster, Some(mask), options).unwrap();
     let decoded = lerc_reader::decode(&blob).unwrap();

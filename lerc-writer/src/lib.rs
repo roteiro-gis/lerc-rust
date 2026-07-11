@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 //! Pure-Rust Lerc2 writer for single-blob rasters and concatenated band sets.
 
 mod lerc2;

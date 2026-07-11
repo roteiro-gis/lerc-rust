@@ -12,12 +12,22 @@ documentation = "https://docs.rs/lerc-reader"
 keywords = ["lerc", "raster", "compression", "gis", "geospatial"]
 categories = ["compression", "science"]
 
+[lints]
+workspace = true
+
+[features]
+default = ["ndarray"]
+ndarray = ["dep:half", "dep:ndarray"]
+rayon = ["dep:rayon"]
+
 [dependencies]
-lerc-band-materialize = { version = "0.4.3", path = "../lerc-band-materialize" }
-lerc-core = { version = "0.4.3", path = "../lerc-core" }
-ndarray = { workspace = true }
+lerc-core = { version = "0.5.0", path = "../lerc-core" }
+half = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+rayon = { version = "=1.10.0", optional = true }
 
 [dev-dependencies]
+clap.workspace = true # Criterion transitive MSRV anchor.
 criterion = "0.5"
 serde_json = "1"
 
