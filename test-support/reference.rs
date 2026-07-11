@@ -34,13 +34,19 @@ pub fn write_temp_bytes(prefix: &str, extension: &str, bytes: &[u8]) -> PathBuf 
 
 pub fn helper_path() -> Option<PathBuf> {
     static HELPER: OnceLock<Option<PathBuf>> = OnceLock::new();
-    HELPER
+    let helper = HELPER
         .get_or_init(|| {
             std::env::var_os("LERC_READER_REFERENCE_HELPER")
                 .map(PathBuf::from)
                 .filter(|path| path.is_file())
         })
-        .clone()
+        .clone();
+    if helper.is_none() && std::env::var_os("LERC_PARITY_REQUIRED").is_some() {
+        panic!(
+            "LERC_PARITY_REQUIRED is set but LERC_READER_REFERENCE_HELPER is missing or invalid"
+        );
+    }
+    helper
 }
 
 pub fn run_reference_json(helper: &Path, args: &[&str]) -> Value {

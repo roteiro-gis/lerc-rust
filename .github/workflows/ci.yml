@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  schedule:
+    - cron: "17 3 * * 0"
 
 permissions:
   contents: read
@@ -34,10 +36,18 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-features --locked
+
+      - name: Check minimal reader features
+        run: cargo check -p lerc-reader --no-default-features --locked
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
 
   msrv:
     name: MSRV
@@ -56,6 +66,11 @@ jobs:
       - name: Run locked workspace tests
         run: cargo +1.77.0 test --workspace --locked
 
+      - name: Guard dependency MSRV drift
+        run: |
+          cargo update
+          cargo +1.77.0 check --workspace --all-targets
+
   miri:
     name: Miri
     runs-on: ubuntu-24.04
@@ -72,3 +87,87 @@ jobs:
 
       - name: Run Miri tests
         run: rustup run nightly cargo miri test -p lerc-reader --lib --locked
+
+  platforms:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      - name: Test all features
+        run: cargo test --workspace --all-features --locked
+
+  big-endian:
+    name: Big-endian s390x
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --no-self-update
+      - uses: taiki-e/install-action@cross
+      - uses: Swatinem/rust-cache@v2
+      - name: Test under s390x emulation
+        run: cross test --workspace --target s390x-unknown-linux-gnu --locked
+
+  security:
+    name: Dependencies
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust with LLVM tools
+        run: rustup toolchain install 1.91.0 --profile minimal --component llvm-tools-preview --no-self-update
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate LCOV
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '60' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - headers
+          - mask_rle
+          - huffman_tables
+          - bitstuff_blocks
+          - lerc2_bitstuff_blocks
+          - concatenated
+          - encode_roundtrip
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+      - name: Run smoke fuzzing
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${FUZZ_SECONDS} -dict=fuzz/dictionaries/lerc.dict
