@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use ndarray::ArrayD;
 
 #[path = "../../test-support/lerc_test.rs"]

@@ -1,15 +1,15 @@
-use lerc_core::{BlobInfo, DataType, Error, MaskEncoding, PixelData, Result, Version};
+use lerc_core::{BlobInfo, DataType, Error, MaskEncoding, Result, Version};
 
 use crate::allocation::{check_allocation, checked_mul, default_vec};
 use crate::bitstuff::{data_type_used, decode_bits, read_typed_scalar};
-use crate::huffman::{decode_huffman, decode_huffman_into};
+use crate::huffman::decode_huffman_into;
 use crate::io::Cursor;
+use crate::materialize::{BandWriteOrder, BandWriter, PixelDataWriter};
 use crate::pixel::{
-    count_valid_in_block, fletcher32, output_value, read_typed_values, read_values_as,
-    sample_index, Sample,
+    fletcher32, output_value, read_typed_values, read_values_as, AllValid, MaskValidity, Sample,
+    Validity,
 };
 use crate::{Decoded, DecodedF64};
-use lerc_band_materialize::{BandWriteOrder, BandWriter};
 
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
 
@@ -59,54 +59,22 @@ pub(crate) fn inspect_with_mask(
 }
 
 pub(crate) fn decode(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<Decoded> {
-    let (parsed, mut cursor) = parse(blob)?;
-    let mut info = parsed.info.clone();
-    let mask = read_mask(&mut cursor, &parsed, inherited_mask)?;
-    let depth_ranges = read_public_depth_ranges(&mut cursor, &parsed, &mut info)?;
-    let mut decode_info = info.clone();
-    decode_info.z_min = parsed.raw_z_min;
-    decode_info.z_max = parsed.raw_z_max;
-    let mut pixels = decode_pixels(
-        &mut cursor,
-        &decode_info,
-        depth_ranges.as_ref(),
-        mask.as_deref(),
-    )?;
-    ensure_pixel_payload_consumed(&cursor)?;
-    remap_pixel_data_no_data(
-        &mut pixels,
-        &info,
-        mask.as_deref(),
-        parsed.encoded_no_data_value,
-    );
-    Ok(Decoded { info, pixels, mask })
+    let (parsed, cursor) = parse(blob)?;
+    let data_type = parsed.info.data_type;
+    lerc_core::dispatch_data_type!(data_type, Pixel => {
+        let (info, pixels, mask) =
+            decode_owned_from_parsed::<Pixel>(parsed, cursor, inherited_mask)?;
+        Ok(Decoded {
+            info,
+            pixels: Pixel::into_pixel_data(pixels),
+            mask,
+        })
+    })
 }
 
 pub(crate) fn decode_f64(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<DecodedF64> {
-    let (parsed, mut cursor) = parse(blob)?;
-    let mut info = parsed.info.clone();
-    let mask = read_mask(&mut cursor, &parsed, inherited_mask)?;
-    let depth_ranges = read_public_depth_ranges(&mut cursor, &parsed, &mut info)?;
-    let mut decode_info = info.clone();
-    decode_info.z_min = parsed.raw_z_min;
-    decode_info.z_max = parsed.raw_z_max;
-
-    let mut pixels = match decode_pixels_typed::<f64>(
-        &mut cursor,
-        &decode_info,
-        depth_ranges.as_ref(),
-        mask.as_deref(),
-    )? {
-        PixelData::F64(values) => values,
-        _ => unreachable!("f64 decode must produce an f64 buffer"),
-    };
-    ensure_pixel_payload_consumed(&cursor)?;
-    remap_no_data_values(
-        &mut pixels,
-        &info,
-        mask.as_deref(),
-        parsed.encoded_no_data_value,
-    );
+    let (parsed, cursor) = parse(blob)?;
+    let (info, pixels, mask) = decode_owned_from_parsed::<f64>(parsed, cursor, inherited_mask)?;
     Ok(DecodedF64 { info, pixels, mask })
 }
 
@@ -115,7 +83,28 @@ pub(crate) fn decode_into<T: Sample, W: BandWriter<T>>(
     inherited_mask: Option<&[u8]>,
     out: &mut W,
 ) -> Result<(BlobInfo, Option<Vec<u8>>)> {
-    let (parsed, mut cursor) = parse(blob)?;
+    let (parsed, cursor) = parse(blob)?;
+    decode_parsed_into(parsed, cursor, inherited_mask, out)
+}
+
+fn decode_owned_from_parsed<T: Sample>(
+    parsed: ParsedLerc2,
+    cursor: Cursor<'_>,
+    inherited_mask: Option<&[u8]>,
+) -> Result<(BlobInfo, Vec<T>, Option<Vec<u8>>)> {
+    let depth = parsed.info.depth as usize;
+    let mut pixels = default_vec(parsed.info.sample_count()?, "Lerc2 pixel output")?;
+    let mut writer = PixelDataWriter::new(&mut pixels, depth);
+    let (info, mask) = decode_parsed_into(parsed, cursor, inherited_mask, &mut writer)?;
+    Ok((info, pixels, mask))
+}
+
+fn decode_parsed_into<T: Sample, W: BandWriter<T>>(
+    parsed: ParsedLerc2,
+    mut cursor: Cursor<'_>,
+    inherited_mask: Option<&[u8]>,
+    out: &mut W,
+) -> Result<(BlobInfo, Option<Vec<u8>>)> {
     let mut info = parsed.info.clone();
     let mask = read_mask(&mut cursor, &parsed, inherited_mask)?;
     let depth_ranges = read_public_depth_ranges(&mut cursor, &parsed, &mut info)?;
@@ -123,7 +112,7 @@ pub(crate) fn decode_into<T: Sample, W: BandWriter<T>>(
     decode_info.z_min = parsed.raw_z_min;
     decode_info.z_max = parsed.raw_z_max;
 
-    if info.valid_pixel_count != info.pixel_count()? as u32 {
+    if info.valid_pixel_count as usize != info.pixel_count()? {
         out.fill_default();
     }
     decode_pixels_into_typed(
@@ -134,7 +123,7 @@ pub(crate) fn decode_into<T: Sample, W: BandWriter<T>>(
         out,
     )?;
     ensure_pixel_payload_consumed(&cursor)?;
-    remap_written_no_data(out, &info, mask.as_deref(), parsed.encoded_no_data_value);
+    remap_written_no_data(out, &info, mask.as_deref(), parsed.encoded_no_data_value)?;
     Ok((info, mask))
 }
 
@@ -143,7 +132,7 @@ fn ensure_pixel_payload_consumed(cursor: &Cursor<'_>) -> Result<()> {
     if remaining == 0 {
         return Ok(());
     }
-    Err(Error::InvalidBlob(format!(
+    Err(Error::invalid_blob(format!(
         "Lerc2 pixel payload contains {remaining} trailing bytes"
     )))
 }
@@ -267,10 +256,10 @@ pub(crate) fn parse(blob: &[u8]) -> Result<(ParsedLerc2, Cursor<'_>)> {
                 .ok()
                 .and_then(|height| width.checked_mul(height))
         })
-        .ok_or_else(|| Error::InvalidBlob("pixel count overflows usize".into()))?;
+        .ok_or(Error::SizeOverflow("Lerc2 pixel count"))?;
     let num_valid = valid_pixel_count as usize;
     if num_valid > pixel_count {
-        return Err(Error::InvalidBlob(format!(
+        return Err(Error::invalid_blob(format!(
             "valid pixel count {} exceeds pixel count {}",
             num_valid, pixel_count
         )));
@@ -337,8 +326,8 @@ fn infer_mask_encoding(
     let num_valid = valid_pixel_count as usize;
     if num_valid == pixel_count {
         if mask_num_bytes != 0 {
-            return Err(Error::InvalidBlob(
-                "full-valid LERC blob unexpectedly contains mask bytes".into(),
+            return Err(Error::invalid_blob(
+                "full-valid LERC blob unexpectedly contains mask bytes",
             ));
         }
         return Ok(MaskEncoding::None);
@@ -389,15 +378,15 @@ fn skip_mask(cursor: &mut Cursor<'_>, parsed: &ParsedLerc2) -> Result<()> {
 fn validate_external_mask(info: &BlobInfo, mask: &[u8]) -> Result<()> {
     let num_pixels = info.pixel_count()?;
     if mask.len() != num_pixels {
-        return Err(Error::InvalidBlob(
-            "inherited mask length does not match the current LERC blob".into(),
+        return Err(Error::invalid_blob(
+            "inherited mask length does not match the current LERC blob",
         ));
     }
 
     let inherited_valid = mask.iter().filter(|&&value| value != 0).count();
     if inherited_valid != info.valid_pixel_count as usize {
-        return Err(Error::InvalidBlob(
-            "inherited mask valid count does not match the current LERC blob".into(),
+        return Err(Error::invalid_blob(
+            "inherited mask valid count does not match the current LERC blob",
         ));
     }
 
@@ -449,12 +438,10 @@ pub(crate) fn decode_mask_rle(encoded: &[u8], bitset_len: usize) -> Result<Vec<u
             let run = inner.read_bytes(count)?;
             if out
                 .checked_add(count)
-                .ok_or_else(|| Error::InvalidBlob("mask RLE overflow".into()))?
+                .ok_or(Error::SizeOverflow("Lerc2 mask RLE run end"))?
                 > bitset.len()
             {
-                return Err(Error::InvalidBlob(
-                    "mask RLE expands past bitset length".into(),
-                ));
+                return Err(Error::invalid_blob("mask RLE expands past bitset length"));
             }
             bitset[out..out + count].copy_from_slice(run);
             out += count;
@@ -463,12 +450,10 @@ pub(crate) fn decode_mask_rle(encoded: &[u8], bitset_len: usize) -> Result<Vec<u
             let value = inner.read_u8()?;
             if out
                 .checked_add(count)
-                .ok_or_else(|| Error::InvalidBlob("mask RLE overflow".into()))?
+                .ok_or(Error::SizeOverflow("Lerc2 mask RLE run end"))?
                 > bitset.len()
             {
-                return Err(Error::InvalidBlob(
-                    "mask RLE expands past bitset length".into(),
-                ));
+                return Err(Error::invalid_blob("mask RLE expands past bitset length"));
             }
             bitset[out..out + count].fill(value);
             out += count;
@@ -476,13 +461,11 @@ pub(crate) fn decode_mask_rle(encoded: &[u8], bitset_len: usize) -> Result<Vec<u
     }
 
     if out != bitset.len() {
-        return Err(Error::InvalidBlob(
-            "mask RLE ended before filling bitset".into(),
-        ));
+        return Err(Error::invalid_blob("mask RLE ended before filling bitset"));
     }
     if inner.offset() != encoded.len() {
-        return Err(Error::InvalidBlob(
-            "mask RLE contains trailing bytes after sentinel".into(),
+        return Err(Error::invalid_blob(
+            "mask RLE contains trailing bytes after sentinel",
         ));
     }
 
@@ -503,7 +486,7 @@ fn read_depth_ranges(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<DepthRa
     let depth = info.depth as usize;
     let range_bytes = depth
         .checked_mul(info.data_type.byte_len())
-        .ok_or_else(|| Error::InvalidBlob("range byte length overflows usize".into()))?;
+        .ok_or(Error::SizeOverflow("Lerc2 depth-range byte count"))?;
     let min_values = read_typed_values(cursor.read_bytes(range_bytes)?, info.data_type)?;
     let max_values = read_typed_values(cursor.read_bytes(range_bytes)?, info.data_type)?;
     Ok(DepthRanges {
@@ -527,71 +510,18 @@ fn typed_no_data_mapping<T: Sample>(
     }
 }
 
-fn remap_no_data_values<T: Sample>(
-    values: &mut [T],
-    info: &BlobInfo,
-    mask: Option<&[u8]>,
-    encoded_no_data_value: Option<f64>,
-) {
-    let Some((encoded, original)) = typed_no_data_mapping::<T>(info, encoded_no_data_value) else {
-        return;
-    };
-
-    let depth = info.depth as usize;
-    match mask {
-        Some(mask) => {
-            for (pixel, &is_valid) in mask.iter().enumerate() {
-                if is_valid == 0 {
-                    continue;
-                }
-                for dim in 0..depth {
-                    let index = sample_index(pixel, depth, dim);
-                    if values[index].to_f64() == encoded.to_f64() {
-                        values[index] = original;
-                    }
-                }
-            }
-        }
-        None => {
-            for value in values {
-                if value.to_f64() == encoded.to_f64() {
-                    *value = original;
-                }
-            }
-        }
-    }
-}
-
-fn remap_pixel_data_no_data(
-    pixels: &mut PixelData,
-    info: &BlobInfo,
-    mask: Option<&[u8]>,
-    encoded_no_data_value: Option<f64>,
-) {
-    match pixels {
-        PixelData::I8(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
-        PixelData::U8(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
-        PixelData::I16(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
-        PixelData::U16(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
-        PixelData::I32(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
-        PixelData::U32(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
-        PixelData::F32(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
-        PixelData::F64(values) => remap_no_data_values(values, info, mask, encoded_no_data_value),
-    }
-}
-
 fn remap_written_no_data<T: Sample, W: BandWriter<T>>(
     out: &mut W,
     info: &BlobInfo,
     mask: Option<&[u8]>,
     encoded_no_data_value: Option<f64>,
-) {
+) -> Result<()> {
     let Some((encoded, original)) = typed_no_data_mapping::<T>(info, encoded_no_data_value) else {
-        return;
+        return Ok(());
     };
 
     let depth = info.depth as usize;
-    let num_pixels = info.width as usize * info.height as usize;
+    let num_pixels = info.pixel_count()?;
     match mask {
         Some(mask) => {
             for (pixel, &is_valid) in mask.iter().enumerate() {
@@ -615,87 +545,7 @@ fn remap_written_no_data<T: Sample, W: BandWriter<T>>(
             }
         }
     }
-}
-
-fn decode_pixels(
-    cursor: &mut Cursor<'_>,
-    info: &BlobInfo,
-    depth_ranges: Option<&DepthRanges>,
-    mask: Option<&[u8]>,
-) -> Result<PixelData> {
-    match info.data_type {
-        DataType::I8 => decode_pixels_typed::<i8>(cursor, info, depth_ranges, mask),
-        DataType::U8 => decode_pixels_typed::<u8>(cursor, info, depth_ranges, mask),
-        DataType::I16 => decode_pixels_typed::<i16>(cursor, info, depth_ranges, mask),
-        DataType::U16 => decode_pixels_typed::<u16>(cursor, info, depth_ranges, mask),
-        DataType::I32 => decode_pixels_typed::<i32>(cursor, info, depth_ranges, mask),
-        DataType::U32 => decode_pixels_typed::<u32>(cursor, info, depth_ranges, mask),
-        DataType::F32 => decode_pixels_typed::<f32>(cursor, info, depth_ranges, mask),
-        DataType::F64 => decode_pixels_typed::<f64>(cursor, info, depth_ranges, mask),
-    }
-}
-
-fn decode_pixels_typed<T: Sample>(
-    cursor: &mut Cursor<'_>,
-    info: &BlobInfo,
-    depth_ranges: Option<&DepthRanges>,
-    mask: Option<&[u8]>,
-) -> Result<PixelData> {
-    let num_pixels = info.pixel_count()?;
-    let sample_count = info.sample_count()?;
-
-    if info.valid_pixel_count == 0 {
-        return Ok(T::into_pixel_data(default_vec(
-            sample_count,
-            "Lerc2 empty pixel buffer",
-        )?));
-    }
-
-    if info.z_min == info.z_max {
-        return Ok(T::into_pixel_data(constant_pixels::<T>(
-            info.data_type,
-            num_pixels,
-            info.depth as usize,
-            mask,
-            ConstantValues::Single(info.z_max),
-        )?));
-    }
-
-    if let Some(ranges) = depth_ranges {
-        if ranges.min_values == ranges.max_values {
-            return Ok(T::into_pixel_data(constant_pixels::<T>(
-                info.data_type,
-                num_pixels,
-                info.depth as usize,
-                mask,
-                ConstantValues::PerDepth(&ranges.max_values),
-            )?));
-        }
-    }
-
-    let one_sweep = cursor.read_u8()? != 0;
-    if one_sweep {
-        return decode_one_sweep::<T>(cursor, info, mask);
-    }
-
-    let version = match info.version {
-        Version::Lerc2(version) => version,
-        _ => unreachable!("Lerc2 decode called with a non-Lerc2 blob"),
-    };
-
-    if needs_encode_mode_flag(info, version) {
-        let encode_mode = read_encode_mode(cursor, version)?;
-        if encode_mode != 0 {
-            if !supports_integer_huffman(info) {
-                return Err(Error::UnsupportedFeature(
-                    "Lerc2 floating-point Huffman decode",
-                ));
-            }
-            return decode_huffman::<T>(cursor, info, mask, encode_mode == 1);
-        }
-    }
-
-    decode_tiles::<T>(cursor, info, depth_ranges, mask)
+    Ok(())
 }
 
 fn decode_pixels_into_typed<T: Sample, W: BandWriter<T>>(
@@ -742,7 +592,11 @@ fn decode_pixels_into_typed<T: Sample, W: BandWriter<T>>(
 
     let version = match info.version {
         Version::Lerc2(version) => version,
-        _ => unreachable!("Lerc2 decode called with a non-Lerc2 blob"),
+        Version::Lerc1(_) => {
+            return Err(Error::Internal(
+                "Lerc2 decoder received metadata for a different format",
+            ))
+        }
     };
 
     if needs_encode_mode_flag(info, version) {
@@ -779,57 +633,11 @@ fn supports_integer_huffman(info: &BlobInfo) -> bool {
 fn read_encode_mode(cursor: &mut Cursor<'_>, version: u32) -> Result<u8> {
     let encode_mode = cursor.read_u8()?;
     if encode_mode > 3 || (version < 6 && encode_mode > 2) || (version < 4 && encode_mode > 1) {
-        return Err(Error::InvalidBlob(format!(
+        return Err(Error::invalid_blob(format!(
             "invalid Lerc2 encode mode flag {encode_mode}"
         )));
     }
     Ok(encode_mode)
-}
-
-fn constant_pixels<T: Sample>(
-    data_type: DataType,
-    num_pixels: usize,
-    depth: usize,
-    mask: Option<&[u8]>,
-    values: ConstantValues<'_>,
-) -> Result<Vec<T>> {
-    let sample_count = checked_mul(num_pixels, depth, "Lerc2 sample count")?;
-    let mut out = default_vec(sample_count, "Lerc2 constant pixel buffer")?;
-    match values {
-        ConstantValues::Single(value) => {
-            let value = output_value::<T>(value, data_type);
-            if let Some(mask) = mask {
-                for (pixel, &mask_value) in mask.iter().enumerate().take(num_pixels) {
-                    if mask_value != 0 {
-                        let base = pixel * depth;
-                        out[base..base + depth].fill(value);
-                    }
-                }
-            } else {
-                out.fill(value);
-            }
-        }
-        ConstantValues::PerDepth(values) => {
-            if let Some(mask) = mask {
-                for (pixel, &mask_value) in mask.iter().enumerate().take(num_pixels) {
-                    if mask_value != 0 {
-                        let base = pixel * depth;
-                        for (offset, &value) in values.iter().enumerate() {
-                            out[base + offset] = output_value::<T>(value, data_type);
-                        }
-                    }
-                }
-            } else {
-                for pixel in 0..num_pixels {
-                    let base = pixel * depth;
-                    for (offset, &value) in values.iter().enumerate() {
-                        out[base + offset] = output_value::<T>(value, data_type);
-                    }
-                }
-            }
-        }
-    }
-    Ok(out)
 }
 
 fn write_constant_pixels<T: Sample, W: BandWriter<T>>(
@@ -879,57 +687,6 @@ fn write_constant_pixels<T: Sample, W: BandWriter<T>>(
     }
 }
 
-fn decode_one_sweep<T: Sample>(
-    cursor: &mut Cursor<'_>,
-    info: &BlobInfo,
-    mask: Option<&[u8]>,
-) -> Result<PixelData> {
-    let num_pixels = info.pixel_count()?;
-    let num_valid = info.valid_pixel_count as usize;
-    let depth = info.depth as usize;
-    let sample_len = info
-        .data_type
-        .byte_len()
-        .checked_mul(num_valid)
-        .and_then(|v| v.checked_mul(depth))
-        .ok_or_else(|| Error::InvalidBlob("one-sweep byte count overflows usize".into()))?;
-    check_allocation::<T>(
-        checked_mul(num_valid, depth, "Lerc2 one-sweep sample count")?,
-        "Lerc2 one-sweep raw values",
-    )?;
-    let raw = read_values_as::<T>(cursor.read_bytes(sample_len)?, info.data_type)?;
-
-    if num_valid == num_pixels {
-        return Ok(T::into_pixel_data(raw));
-    }
-
-    let mask = mask.ok_or(Error::InvalidBlob(
-        "partial-valid one-sweep block is missing its decoded mask".into(),
-    ))?;
-    let mut out = default_vec(info.sample_count()?, "Lerc2 one-sweep output")?;
-    let mut src = 0usize;
-    for (pixel, &is_valid) in mask.iter().enumerate() {
-        if is_valid == 0 {
-            continue;
-        }
-        let base = pixel * depth;
-        let src_end = src + depth;
-        if src_end > raw.len() {
-            return Err(Error::InvalidBlob(
-                "one-sweep valid sample payload is too short".into(),
-            ));
-        }
-        out[base..base + depth].copy_from_slice(&raw[src..src_end]);
-        src = src_end;
-    }
-    if src != raw.len() {
-        return Err(Error::InvalidBlob(
-            "one-sweep valid sample payload contains trailing values".into(),
-        ));
-    }
-    Ok(T::into_pixel_data(out))
-}
-
 fn decode_one_sweep_into<T: Sample, W: BandWriter<T>>(
     cursor: &mut Cursor<'_>,
     info: &BlobInfo,
@@ -944,7 +701,7 @@ fn decode_one_sweep_into<T: Sample, W: BandWriter<T>>(
         .byte_len()
         .checked_mul(num_valid)
         .and_then(|v| v.checked_mul(depth))
-        .ok_or_else(|| Error::InvalidBlob("one-sweep byte count overflows usize".into()))?;
+        .ok_or(Error::SizeOverflow("Lerc2 one-sweep byte count"))?;
     check_allocation::<T>(
         checked_mul(num_valid, depth, "Lerc2 one-sweep sample count")?,
         "Lerc2 one-sweep raw values",
@@ -962,8 +719,8 @@ fn decode_one_sweep_into<T: Sample, W: BandWriter<T>>(
         return Ok(());
     }
 
-    let mask = mask.ok_or(Error::InvalidBlob(
-        "partial-valid one-sweep block is missing its decoded mask".into(),
+    let mask = mask.ok_or(Error::invalid_blob(
+        "partial-valid one-sweep block is missing its decoded mask",
     ))?;
     let mut src = 0usize;
     for (pixel, &is_valid) in mask.iter().enumerate() {
@@ -972,8 +729,8 @@ fn decode_one_sweep_into<T: Sample, W: BandWriter<T>>(
         }
         for dim in 0..depth {
             if src >= raw.len() {
-                return Err(Error::InvalidBlob(
-                    "one-sweep valid sample payload is too short".into(),
+                return Err(Error::invalid_blob(
+                    "one-sweep valid sample payload is too short",
                 ));
             }
             out.write(pixel, dim, raw[src]);
@@ -981,62 +738,11 @@ fn decode_one_sweep_into<T: Sample, W: BandWriter<T>>(
         }
     }
     if src != raw.len() {
-        return Err(Error::InvalidBlob(
-            "one-sweep valid sample payload contains trailing values".into(),
+        return Err(Error::invalid_blob(
+            "one-sweep valid sample payload contains trailing values",
         ));
     }
     Ok(())
-}
-
-struct PixelDataWriter<'a, T> {
-    values: &'a mut [T],
-    depth: usize,
-}
-
-impl<T: Copy> PixelDataWriter<'_, T> {
-    fn index(&self, pixel: usize, dim: usize) -> usize {
-        pixel * self.depth + dim
-    }
-}
-
-impl<T: Sample> BandWriter<T> for PixelDataWriter<'_, T> {
-    fn fill_default(&mut self) {
-        self.values.fill(T::default());
-    }
-
-    fn write(&mut self, pixel: usize, dim: usize, value: T) {
-        let index = self.index(pixel, dim);
-        self.values[index] = value;
-    }
-
-    fn read(&self, pixel: usize, dim: usize) -> T {
-        self.values[self.index(pixel, dim)]
-    }
-
-    fn depth(&self) -> usize {
-        self.depth
-    }
-}
-
-fn decode_tiles<T: Sample>(
-    cursor: &mut Cursor<'_>,
-    info: &BlobInfo,
-    depth_ranges: Option<&DepthRanges>,
-    mask: Option<&[u8]>,
-) -> Result<PixelData> {
-    if info.micro_block_size == 0 {
-        return Err(Error::InvalidBlob(
-            "micro block size must be greater than zero".into(),
-        ));
-    }
-    let mut result = default_vec(info.sample_count()?, "Lerc2 tile output")?;
-    let depth = info.depth as usize;
-    let mut writer = PixelDataWriter {
-        values: &mut result,
-        depth,
-    };
-    decode_tiles_into(cursor, info, depth_ranges, mask, &mut writer)?;
-    Ok(T::into_pixel_data(result))
 }
 
 fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
@@ -1046,14 +752,33 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
     mask: Option<&[u8]>,
     out: &mut W,
 ) -> Result<()> {
+    match mask {
+        Some(mask) => decode_tiles_into_with_validity(
+            cursor,
+            info,
+            depth_ranges,
+            MaskValidity::new(mask),
+            out,
+        ),
+        None => decode_tiles_into_with_validity(cursor, info, depth_ranges, AllValid, out),
+    }
+}
+
+fn decode_tiles_into_with_validity<T: Sample, W: BandWriter<T>, V: Validity>(
+    cursor: &mut Cursor<'_>,
+    info: &BlobInfo,
+    depth_ranges: Option<&DepthRanges>,
+    validity: V,
+    out: &mut W,
+) -> Result<()> {
     out.set_write_order(BandWriteOrder::Arbitrary);
     let width = info.width as usize;
     let height = info.height as usize;
     let depth = info.depth as usize;
     let micro_block_size = info.micro_block_size as usize;
     if micro_block_size == 0 {
-        return Err(Error::InvalidBlob(
-            "micro block size must be greater than zero".into(),
+        return Err(Error::invalid_blob(
+            "micro block size must be greater than zero",
         ));
     }
 
@@ -1080,7 +805,11 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
     let mut block_buffer = default_vec(block_samples, "Lerc2 micro-block buffer")?;
     let version = match info.version {
         Version::Lerc2(version) => version,
-        _ => unreachable!("Lerc2 tile decode called with a non-Lerc2 blob"),
+        Version::Lerc1(_) => {
+            return Err(Error::Internal(
+                "Lerc2 tile decoder received metadata for a different format",
+            ))
+        }
     };
     let file_version_check_num = if version >= 5 { 14u8 } else { 15u8 };
 
@@ -1105,13 +834,11 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
                 let expected_code =
                     (((block_x * micro_block_size) >> 3) as u8) & file_version_check_num;
                 if test_code != expected_code {
-                    return Err(Error::InvalidBlob(
-                        "tile block integrity check failed".into(),
-                    ));
+                    return Err(Error::invalid_blob("tile block integrity check failed"));
                 }
                 if is_diff_encoding && dim == 0 {
-                    return Err(Error::InvalidBlob(
-                        "diff-encoded tile block encountered in first dimension".into(),
+                    return Err(Error::invalid_blob(
+                        "diff-encoded tile block encountered in first dimension",
                     ));
                 }
 
@@ -1127,7 +854,7 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
                             let pixel_row = block_y * micro_block_size + row;
                             for col in 0..this_block_width {
                                 let pixel = pixel_row * width + block_x * micro_block_size + col;
-                                if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
+                                if validity.is_valid(pixel) {
                                     let value = if is_diff_encoding {
                                         out.read(pixel, dim - 1)
                                     } else {
@@ -1140,29 +867,20 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
                     }
                     0 => {
                         if is_diff_encoding {
-                            return Err(Error::InvalidBlob(
-                                "uncompressed diff-encoded tile block is invalid".into(),
+                            return Err(Error::invalid_blob(
+                                "uncompressed diff-encoded tile block is invalid",
                             ));
                         }
-                        let values_needed = if let Some(mask) = mask {
-                            count_valid_in_block(
-                                mask,
-                                width,
-                                block_x * micro_block_size,
-                                block_y * micro_block_size,
-                                this_block_width,
-                                this_block_height,
-                            )
-                        } else {
-                            this_block_width * this_block_height
-                        };
+                        let values_needed = validity.count_in_block(
+                            width,
+                            block_x * micro_block_size,
+                            block_y * micro_block_size,
+                            this_block_width,
+                            this_block_height,
+                        );
                         let byte_len = values_needed
                             .checked_mul(info.data_type.byte_len())
-                            .ok_or_else(|| {
-                                Error::InvalidBlob(
-                                    "uncompressed block byte length overflows usize".into(),
-                                )
-                            })?;
+                            .ok_or(Error::SizeOverflow("Lerc2 uncompressed block byte count"))?;
                         let raw_values =
                             read_values_as::<T>(cursor.read_bytes(byte_len)?, info.data_type)?;
                         let mut src = 0usize;
@@ -1170,15 +888,15 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
                             let pixel_row = block_y * micro_block_size + row;
                             for col in 0..this_block_width {
                                 let pixel = pixel_row * width + block_x * micro_block_size + col;
-                                if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
+                                if validity.is_valid(pixel) {
                                     out.write(pixel, dim, raw_values[src]);
                                     src += 1;
                                 }
                             }
                         }
                         if src != raw_values.len() {
-                            return Err(Error::InvalidBlob(
-                                "uncompressed tile block payload contains trailing values".into(),
+                            return Err(Error::invalid_blob(
+                                "uncompressed tile block payload contains trailing values",
                             ));
                         }
                     }
@@ -1199,7 +917,7 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
                                 for col in 0..this_block_width {
                                     let pixel =
                                         pixel_row * width + block_x * micro_block_size + col;
-                                    if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
+                                    if validity.is_valid(pixel) {
                                         let value = if is_diff_encoding {
                                             (out.read(pixel, dim - 1).to_f64() + offset).min(z_max)
                                         } else {
@@ -1215,13 +933,18 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
                             }
                         } else {
                             block_buffer.fill(0.0);
+                            let stuffed_max_value = if is_diff_encoding {
+                                f64::INFINITY
+                            } else {
+                                z_max
+                            };
                             let block_values = decode_bits(
                                 cursor,
                                 version,
                                 &mut block_buffer,
                                 Some(offset),
                                 info.max_z_error,
-                                z_max,
+                                stuffed_max_value,
                             )?;
                             let mut src = 0usize;
                             for row in 0..this_block_height {
@@ -1229,9 +952,10 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
                                 for col in 0..this_block_width {
                                     let pixel =
                                         pixel_row * width + block_x * micro_block_size + col;
-                                    if mask.map(|m| m[pixel] != 0).unwrap_or(true) {
+                                    if validity.is_valid(pixel) {
                                         let value = if is_diff_encoding {
-                                            block_buffer[src] + out.read(pixel, dim - 1).to_f64()
+                                            (block_buffer[src] + out.read(pixel, dim - 1).to_f64())
+                                                .min(z_max)
                                         } else {
                                             block_buffer[src]
                                         };
@@ -1245,14 +969,14 @@ fn decode_tiles_into<T: Sample, W: BandWriter<T>>(
                                 }
                             }
                             if src != block_values {
-                                return Err(Error::InvalidBlob(
-                                    "bit-stuffed tile block value count does not match the block mask".into(),
+                                return Err(Error::invalid_blob(
+                                    "bit-stuffed tile block value count does not match the block mask",
                                 ));
                             }
                         }
                     }
                     _ => {
-                        return Err(Error::InvalidBlob(format!(
+                        return Err(Error::invalid_blob(format!(
                             "invalid tile block encoding {block_encoding}"
                         )));
                     }

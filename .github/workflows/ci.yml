@@ -71,4 +71,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run Miri tests
-        run: rustup run nightly cargo miri test -p lerc-band-materialize -p lerc-reader --lib --locked
+        run: rustup run nightly cargo miri test -p lerc-reader --lib --locked

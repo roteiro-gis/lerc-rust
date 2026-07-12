@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 //! Shared types and errors for pure-Rust LERC codecs.
 
 mod error;

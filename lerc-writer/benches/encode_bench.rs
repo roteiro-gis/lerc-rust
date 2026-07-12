@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn synthetic_u8() -> Vec<u8> {
@@ -13,11 +15,9 @@ fn synthetic_f32() -> Vec<f32> {
 fn encode_benchmarks(c: &mut Criterion) {
     let u8_pixels = synthetic_u8();
     let u8_raster = lerc_core::RasterView::new(256, 256, 1, &u8_pixels).unwrap();
-    let u8_options = lerc_writer::EncodeOptions {
-        max_z_error: 0.5,
-        micro_block_size: 8,
-        ..lerc_writer::EncodeOptions::default()
-    };
+    let u8_options = lerc_writer::EncodeOptions::new()
+        .with_max_z_error(0.5)
+        .with_micro_block_size(8);
     c.bench_function("lerc-writer/encode/u8-bitstuff", |b| {
         b.iter(|| {
             let blob =
@@ -28,11 +28,9 @@ fn encode_benchmarks(c: &mut Criterion) {
 
     let f32_pixels = synthetic_f32();
     let f32_raster = lerc_core::RasterView::new(256, 256, 1, &f32_pixels).unwrap();
-    let f32_options = lerc_writer::EncodeOptions {
-        max_z_error: 0.125,
-        micro_block_size: 8,
-        ..lerc_writer::EncodeOptions::default()
-    };
+    let f32_options = lerc_writer::EncodeOptions::new()
+        .with_max_z_error(0.125)
+        .with_micro_block_size(8);
     c.bench_function("lerc-writer/encode-plus-decode/f32", |b| {
         b.iter(|| {
             let blob =

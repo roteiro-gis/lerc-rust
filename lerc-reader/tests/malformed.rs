@@ -1,4 +1,6 @@
-use lerc_core::Error;
+#![allow(missing_docs)]
+
+use lerc_core::{BandLayout, Error, PixelData};
 
 #[path = "../../test-support/lerc_test.rs"]
 mod lerc_test;
@@ -118,6 +120,38 @@ fn build_lerc1_blob_with_block_grid(
     bytes
 }
 
+fn build_lerc1_remainder_tile_blob() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"CntZImage ");
+    bytes.extend_from_slice(&11i32.to_le_bytes());
+    bytes.extend_from_slice(&0i32.to_le_bytes());
+    bytes.extend_from_slice(&5u32.to_le_bytes());
+    bytes.extend_from_slice(&5u32.to_le_bytes());
+    bytes.extend_from_slice(&0.5f64.to_le_bytes());
+
+    // No mask: all 25 pixels are valid.
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+    // A nominal 3x3 grid over 5x5 has four blocks on each axis. The final
+    // block is 2x2 even though the base blocks are 1x1.
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&3.0f32.to_le_bytes());
+
+    bytes.extend_from_slice(&[2; 15]); // Zero blocks.
+
+    bytes.push(1); // Stuffed block with an f32 offset.
+    bytes.extend_from_slice(&0.0f32.to_le_bytes());
+    bytes.push((2 << 6) | 2); // u8 valid-count followed by two-bit values.
+    bytes.push(4);
+    bytes.extend_from_slice(&pack_msb_bits(&[0, 1, 2, 3], 2));
+    bytes
+}
+
 fn assert_metadata_invalid_header(blob: &[u8], expected: &'static str) {
     let result = lerc_reader::get_blob_info(blob);
     assert!(
@@ -130,6 +164,30 @@ fn assert_metadata_invalid_header(blob: &[u8], expected: &'static str) {
         matches!(result, Err(Error::InvalidHeader(actual)) if actual == expected),
         "{result:?}"
     );
+}
+
+#[test]
+fn accepts_lerc1_stuffed_remainder_tile_larger_than_base_tile() {
+    let blob = build_lerc1_remainder_tile_blob();
+    let expected = vec![
+        0.0, 0.0, 0.0, 0.0, 0.0, // row 0
+        0.0, 0.0, 0.0, 0.0, 0.0, // row 1
+        0.0, 0.0, 0.0, 0.0, 0.0, // row 2
+        0.0, 0.0, 0.0, 0.0, 1.0, // row 3
+        0.0, 0.0, 0.0, 2.0, 3.0, // row 4
+    ];
+
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+    assert_eq!((info.width, info.height), (5, 5));
+    assert_eq!((info.z_min, info.z_max), (0.0, 3.0));
+
+    let decoded = lerc_reader::decode(&blob).unwrap();
+    assert_eq!(decoded.pixels, PixelData::F32(expected.clone()));
+
+    let mut direct = vec![f32::NAN; expected.len()];
+    let band_info = lerc_reader::decode_band_set_into(&blob, BandLayout::Bsq, &mut direct).unwrap();
+    assert_eq!(band_info.bands, vec![info]);
+    assert_eq!(direct, expected);
 }
 
 #[test]

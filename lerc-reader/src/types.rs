@@ -1,117 +1,236 @@
 use std::any::TypeId;
 
-use lerc_band_materialize::{
-    copy_band_values_into_slice, BandLayout as MaterializeLayout, BandMaterializer,
-};
+use crate::materialize::{copy_band_values_into_slice, BandMaterializer};
 use lerc_core::{BandLayout, BandSetInfo, BlobInfo, Error, PixelData, Result};
+#[cfg(feature = "ndarray")]
 use ndarray::{ArrayD, IxDyn};
 
+#[cfg(feature = "ndarray")]
 use crate::allocation::{checked_mul, default_vec, vec_with_capacity};
 
+/// Native-typed pixels, validated metadata, and an optional validity mask for one blob.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decoded {
+    /// Validated blob metadata.
     pub info: BlobInfo,
+    /// Pixel-interleaved samples in the blob's native numeric type.
     pub pixels: PixelData,
+    /// Row-major validity bytes, when the blob has a mask.
     pub mask: Option<Vec<u8>>,
 }
 
 impl Decoded {
+    #[cfg(feature = "ndarray")]
+    /// Borrows this result and copies its pixels into an ndarray.
+    ///
+    /// # Errors
+    /// Returns an error if `T` differs from the native type or the shape is invalid.
+    pub fn to_ndarray<T: NdArrayElement>(&self) -> Result<ArrayD<T>> {
+        self.pixels.clone().into_ndarray(&self.info.ndarray_shape())
+    }
+
+    #[cfg(feature = "ndarray")]
+    /// Consumes this result and moves its pixels into an ndarray.
+    ///
+    /// # Errors
+    /// Returns an error if `T` differs from the native type or the shape is invalid.
     pub fn into_ndarray<T: NdArrayElement>(self) -> Result<ArrayD<T>> {
         let shape = self.info.ndarray_shape();
         self.pixels.into_ndarray(&shape)
     }
 
+    #[cfg(feature = "ndarray")]
+    /// Consumes this result and moves its optional mask into an ndarray.
+    ///
+    /// # Errors
+    /// Returns an error if decoded metadata and mask length disagree.
     pub fn into_mask_ndarray(self) -> Result<Option<ArrayD<u8>>> {
         let shape = self.info.mask_ndarray_shape();
         self.mask
             .map(|mask| {
                 ArrayD::from_shape_vec(IxDyn(&shape), mask).map_err(|err| {
-                    Error::InvalidBlob(format!("failed to build ndarray from decoded mask: {err}"))
+                    Error::invalid_blob(format!("failed to build ndarray from decoded mask: {err}"))
+                })
+            })
+            .transpose()
+    }
+
+    #[cfg(feature = "ndarray")]
+    /// Copies the optional validity mask into an ndarray.
+    ///
+    /// # Errors
+    /// Returns an error if decoded metadata and mask length disagree.
+    pub fn mask_ndarray(&self) -> Result<Option<ArrayD<u8>>> {
+        let shape = self.info.mask_ndarray_shape();
+        self.mask
+            .as_ref()
+            .map(|mask| {
+                ArrayD::from_shape_vec(IxDyn(&shape), mask.clone()).map_err(|err| {
+                    Error::invalid_blob(format!("failed to build ndarray from decoded mask: {err}"))
                 })
             })
             .transpose()
     }
 }
 
+/// Promoted `f64` pixels, validated metadata, and an optional mask for one blob.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedF64 {
+    /// Validated blob metadata.
     pub info: BlobInfo,
+    /// Pixel-interleaved samples promoted to `f64`.
     pub pixels: Vec<f64>,
+    /// Row-major validity bytes, when present.
     pub mask: Option<Vec<u8>>,
 }
 
 impl DecodedF64 {
+    #[cfg(feature = "ndarray")]
+    /// Copies the promoted pixels into an ndarray.
+    ///
+    /// # Errors
+    /// Returns an error if metadata and sample length disagree.
+    pub fn to_ndarray(&self) -> Result<ArrayD<f64>> {
+        ArrayD::from_shape_vec(IxDyn(&self.info.ndarray_shape()), self.pixels.clone()).map_err(
+            |err| {
+                Error::invalid_blob(format!(
+                    "failed to build ndarray from decoded pixels: {err}"
+                ))
+            },
+        )
+    }
+
+    #[cfg(feature = "ndarray")]
+    /// Moves the promoted pixels into an ndarray.
+    ///
+    /// # Errors
+    /// Returns an error if metadata and sample length disagree.
     pub fn into_ndarray(self) -> Result<ArrayD<f64>> {
         ArrayD::from_shape_vec(IxDyn(&self.info.ndarray_shape()), self.pixels).map_err(|err| {
-            Error::InvalidBlob(format!(
+            Error::invalid_blob(format!(
                 "failed to build ndarray from decoded pixels: {err}"
             ))
         })
     }
 
+    #[cfg(feature = "ndarray")]
+    /// Moves the optional validity mask into an ndarray.
+    ///
+    /// # Errors
+    /// Returns an error if metadata and mask length disagree.
     pub fn into_mask_ndarray(self) -> Result<Option<ArrayD<u8>>> {
         let shape = self.info.mask_ndarray_shape();
         self.mask
             .map(|mask| {
                 ArrayD::from_shape_vec(IxDyn(&shape), mask).map_err(|err| {
-                    Error::InvalidBlob(format!("failed to build ndarray from decoded mask: {err}"))
+                    Error::invalid_blob(format!("failed to build ndarray from decoded mask: {err}"))
+                })
+            })
+            .transpose()
+    }
+
+    #[cfg(feature = "ndarray")]
+    /// Copies the optional validity mask into an ndarray.
+    ///
+    /// # Errors
+    /// Returns an error if metadata and mask length disagree.
+    pub fn mask_ndarray(&self) -> Result<Option<ArrayD<u8>>> {
+        let shape = self.info.mask_ndarray_shape();
+        self.mask
+            .as_ref()
+            .map(|mask| {
+                ArrayD::from_shape_vec(IxDyn(&shape), mask.clone()).map_err(|err| {
+                    Error::invalid_blob(format!("failed to build ndarray from decoded mask: {err}"))
                 })
             })
             .transpose()
     }
 }
 
+/// Native-typed bands, per-band masks, and shared band-set metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedBandSet {
+    /// Validated metadata for every band.
     pub info: BandSetInfo,
+    /// Native-typed pixel buffers in band order.
     pub bands: Vec<PixelData>,
+    /// Logical mask for each band, including inherited masks.
     pub band_masks: Vec<Option<Vec<u8>>>,
 }
 
 impl DecodedBandSet {
+    #[cfg(feature = "ndarray")]
+    /// Copies the band set into an interleaved ndarray.
+    ///
+    /// # Errors
+    /// Returns an error for incompatible types or inconsistent shapes.
+    pub fn to_ndarray<T: BandElement>(&self) -> Result<ArrayD<T>> {
+        self.clone().into_ndarray()
+    }
+
+    #[cfg(feature = "ndarray")]
+    /// Moves the band set into an interleaved ndarray.
+    ///
+    /// # Errors
+    /// Returns an error for incompatible types or inconsistent shapes.
     pub fn into_ndarray<T: BandElement>(self) -> Result<ArrayD<T>> {
         self.into_ndarray_with_layout(BandLayout::Interleaved)
     }
 
+    #[cfg(feature = "ndarray")]
+    /// Moves the band set into an ndarray using the requested layout.
+    ///
+    /// # Errors
+    /// Returns an error for incompatible types or inconsistent shapes.
     pub fn into_ndarray_with_layout<T: BandElement>(self, layout: BandLayout) -> Result<ArrayD<T>> {
         let shape = self.info.ndarray_shape_for_layout(layout);
         let values = self.into_vec_with_layout(layout)?;
         ArrayD::from_shape_vec(IxDyn(&shape), values).map_err(|err| {
-            Error::InvalidBlob(format!(
+            Error::invalid_blob(format!(
                 "failed to build ndarray from decoded band set: {err}"
             ))
         })
     }
 
+    /// Materializes every band as one homogeneous vector in `layout`.
+    ///
+    /// # Errors
+    /// Returns an error when band types cannot convert to `T` or metadata is inconsistent.
     pub fn into_vec_with_layout<T: BandElement>(self, layout: BandLayout) -> Result<Vec<T>> {
         if self.bands.len() == 1 {
-            return T::from_pixel_data(self.bands.into_iter().next().unwrap());
+            let band = self
+                .bands
+                .into_iter()
+                .next()
+                .ok_or(Error::Internal("single-band decode lost its only band"))?;
+            return T::from_pixel_data(band);
         }
 
         let mut materializer = BandMaterializer::new(
             self.info.bands[0].pixel_count()?,
             self.info.depth() as usize,
             self.info.band_count(),
-            materialize_layout(layout),
-        )
-        .map_err(materialize_error)?;
+            layout,
+        )?;
         for (band_index, band) in self.bands.into_iter().enumerate() {
             copy_pixel_data_into_materializer(&mut materializer, band_index, band)?;
         }
-        materializer.finish().map_err(materialize_error)
+        materializer.finish()
     }
 
+    /// Copies every band into an exactly sized caller-provided slice.
+    ///
+    /// # Errors
+    /// Returns an error for the wrong output length, incompatible types, or bad metadata.
     pub fn copy_into_slice<T: BandElement>(self, layout: BandLayout, out: &mut [T]) -> Result<()> {
         let pixel_count = self.info.bands[0].pixel_count()?;
         let depth = self.info.depth() as usize;
         let band_count = self.info.band_count();
         let expected_len = self.info.value_count()?;
         if out.len() != expected_len {
-            return Err(Error::InvalidBlob(format!(
-                "output slice length {} does not match decoded band set length {}",
-                out.len(),
-                expected_len
-            )));
+            return Err(Error::InvalidArgument(
+                "output slice length does not match decoded band set length",
+            ));
         }
 
         for (band_index, band) in self.bands.into_iter().enumerate() {
@@ -128,12 +247,27 @@ impl DecodedBandSet {
         Ok(())
     }
 
+    #[cfg(feature = "ndarray")]
+    /// Moves per-band masks into an ndarray.
+    ///
+    /// # Errors
+    /// Returns an error if mask metadata and lengths disagree.
     pub fn into_band_mask_ndarray(self) -> Result<Option<ArrayD<u8>>> {
-        into_band_mask_ndarray(self.info, self.band_masks)
+        band_masks_into_ndarray(self.info, self.band_masks)
+    }
+
+    #[cfg(feature = "ndarray")]
+    /// Copies per-band masks into an ndarray.
+    ///
+    /// # Errors
+    /// Returns an error if mask metadata and lengths disagree.
+    pub fn band_mask_ndarray(&self) -> Result<Option<ArrayD<u8>>> {
+        band_masks_into_ndarray(self.info.clone(), self.band_masks.clone())
     }
 }
 
-pub fn into_band_mask_ndarray(
+#[cfg(feature = "ndarray")]
+pub(crate) fn band_masks_into_ndarray(
     info: BandSetInfo,
     band_masks: Vec<Option<Vec<u8>>>,
 ) -> Result<Option<ArrayD<u8>>> {
@@ -155,7 +289,7 @@ pub fn into_band_mask_ndarray(
         return ArrayD::from_shape_vec(IxDyn(&shape), mask)
             .map(Some)
             .map_err(|err| {
-                Error::InvalidBlob(format!("failed to build ndarray from decoded mask: {err}"))
+                Error::invalid_blob(format!("failed to build ndarray from decoded mask: {err}"))
             });
     }
 
@@ -170,7 +304,7 @@ pub fn into_band_mask_ndarray(
     ArrayD::from_shape_vec(IxDyn(&shape), merged)
         .map(Some)
         .map_err(|err| {
-            Error::InvalidBlob(format!(
+            Error::invalid_blob(format!(
                 "failed to build ndarray from decoded band mask: {err}"
             ))
         })
@@ -215,19 +349,15 @@ fn copy_typed_values_into_materializer<T: BandElement, U: SupportedElementValue>
         // supported primitive type, so the slice layout and alignment are
         // unchanged.
         let typed = unsafe { cast_slice::<U, T>(values) };
-        return materializer
-            .copy_band(band_index, typed)
-            .map_err(materialize_error);
+        return materializer.copy_band(band_index, typed);
     }
     if T::KIND == BandElementKind::F64 {
-        return materializer
-            .copy_band_with(band_index, |index| {
-                // SAFETY: this branch is only entered when T is f64.
-                unsafe_cast::<T, f64>(values[index].into_f64())
-            })
-            .map_err(materialize_error);
+        return materializer.copy_band_with(band_index, |index| {
+            // SAFETY: this branch is only entered when T is f64.
+            unsafe_cast::<T, f64>(values[index].into_f64())
+        });
     }
-    Err(Error::InvalidBlob(format!(
+    Err(Error::invalid_blob(format!(
         "cannot decode {} pixels into ndarray<{}>",
         data_type_name::<U>(),
         std::any::type_name::<T>()
@@ -280,17 +410,16 @@ fn copy_typed_values_into_layout_slice<T: BandElement, U: SupportedElementValue>
             depth,
             band_index,
             band_count,
-            materialize_layout(layout),
-        )
-        .map_err(materialize_error);
+            layout,
+        );
     }
     if T::KIND == BandElementKind::F64 {
         let band_len = pixel_count
             .checked_mul(depth.max(1))
-            .ok_or_else(|| Error::InvalidBlob("decoded band length overflows usize".into()))?;
+            .ok_or(Error::SizeOverflow("decoded band length"))?;
         if values.len() != band_len {
-            return Err(Error::InvalidBlob(
-                "decoded band length does not match its metadata".into(),
+            return Err(Error::invalid_blob(
+                "decoded band length does not match its metadata",
             ));
         }
         for (value_index, value) in values.iter().copied().enumerate() {
@@ -311,7 +440,7 @@ fn copy_typed_values_into_layout_slice<T: BandElement, U: SupportedElementValue>
         }
         return Ok(());
     }
-    Err(Error::InvalidBlob(format!(
+    Err(Error::invalid_blob(format!(
         "cannot decode {} pixels into ndarray<{}>",
         data_type_name::<U>(),
         std::any::type_name::<T>()
@@ -322,11 +451,15 @@ fn copy_typed_values_into_layout_slice<T: BandElement, U: SupportedElementValue>
 }
 
 unsafe fn cast_slice<U, T>(values: &[U]) -> &[T] {
+    debug_assert_eq!(std::mem::size_of::<U>(), std::mem::size_of::<T>());
+    debug_assert_eq!(std::mem::align_of::<U>(), std::mem::align_of::<T>());
     // SAFETY: callers must guarantee U and T are the same primitive element type.
     unsafe { &*(values as *const [U] as *const [T]) }
 }
 
 fn unsafe_cast<T, U: Copy>(value: U) -> T {
+    debug_assert_eq!(std::mem::size_of::<U>(), std::mem::size_of::<T>());
+    debug_assert_eq!(std::mem::align_of::<U>(), std::mem::align_of::<T>());
     // SAFETY: callers only use this helper for same-size primitive casts where
     // T is known by branch guards to match the source value representation.
     unsafe { std::mem::transmute_copy(&value) }
@@ -399,10 +532,6 @@ fn data_type_name<T: 'static>() -> &'static str {
     }
 }
 
-pub trait NdArrayElement: Sized + Clone {
-    fn from_pixel_data(pixels: PixelData) -> Result<Vec<Self>>;
-}
-
 mod private {
     pub trait Sealed {}
 
@@ -416,29 +545,48 @@ mod private {
     impl Sealed for f64 {}
 }
 
+/// Runtime discriminator for supported homogeneous band output types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BandElementKind {
+    /// Signed 8-bit integer.
     I8,
+    /// Unsigned 8-bit integer.
     U8,
+    /// Signed 16-bit integer.
     I16,
+    /// Unsigned 16-bit integer.
     U16,
+    /// Signed 32-bit integer.
     I32,
+    /// Unsigned 32-bit integer.
     U32,
+    /// Single-precision float.
     F32,
+    /// Double-precision float.
     F64,
 }
 
-pub trait BandElement: NdArrayElement + private::Sealed + Copy + Default + 'static {
+/// Sealed primitive types accepted by homogeneous band-set decode APIs.
+pub trait BandElement: private::Sealed + Copy + Default + Send + Sync + 'static {
+    /// Runtime kind corresponding to this primitive.
     const KIND: BandElementKind;
+    /// Converts a native decoded buffer when its representation is compatible.
+    fn from_pixel_data(pixels: PixelData) -> Result<Vec<Self>>;
 }
 
-macro_rules! impl_exact_ndarray_element {
+#[cfg(feature = "ndarray")]
+/// Sealed primitive types accepted by single-blob ndarray decode APIs.
+pub trait NdArrayElement: BandElement {}
+
+macro_rules! impl_exact_band_element {
     ($ty:ty, $variant:ident, $name:literal) => {
-        impl NdArrayElement for $ty {
+        impl BandElement for $ty {
+            const KIND: BandElementKind = BandElementKind::$variant;
+
             fn from_pixel_data(pixels: PixelData) -> Result<Vec<Self>> {
                 match pixels {
                     PixelData::$variant(values) => Ok(values),
-                    other => Err(Error::InvalidBlob(format!(
+                    other => Err(Error::invalid_blob(format!(
                         "cannot decode {} pixels into ndarray<{}>",
                         other.data_type().name(),
                         $name
@@ -449,26 +597,32 @@ macro_rules! impl_exact_ndarray_element {
     };
 }
 
-impl_exact_ndarray_element!(i8, I8, "i8");
-impl_exact_ndarray_element!(u8, U8, "u8");
-impl_exact_ndarray_element!(i16, I16, "i16");
-impl_exact_ndarray_element!(u16, U16, "u16");
-impl_exact_ndarray_element!(i32, I32, "i32");
-impl_exact_ndarray_element!(u32, U32, "u32");
-impl_exact_ndarray_element!(f32, F32, "f32");
+impl_exact_band_element!(i8, I8, "i8");
+impl_exact_band_element!(u8, U8, "u8");
+impl_exact_band_element!(i16, I16, "i16");
+impl_exact_band_element!(u16, U16, "u16");
+impl_exact_band_element!(i32, I32, "i32");
+impl_exact_band_element!(u32, U32, "u32");
+impl_exact_band_element!(f32, F32, "f32");
 
-impl NdArrayElement for f64 {
+impl BandElement for f64 {
+    const KIND: BandElementKind = BandElementKind::F64;
+
     fn from_pixel_data(pixels: PixelData) -> Result<Vec<Self>> {
         Ok(pixels.to_f64())
     }
 }
 
+#[cfg(feature = "ndarray")]
+macro_rules! impl_ndarray_element {
+    ($($ty:ty),+ $(,)?) => { $(impl NdArrayElement for $ty {})+ };
+}
+
+#[cfg(feature = "ndarray")]
+impl_ndarray_element!(i8, u8, i16, u16, i32, u32, f32, f64);
+
 macro_rules! impl_band_element {
     ($ty:ty, $kind:ident) => {
-        impl BandElement for $ty {
-            const KIND: BandElementKind = BandElementKind::$kind;
-        }
-
         impl SupportedElementValue for $ty {
             const KIND: BandElementKind = BandElementKind::$kind;
         }
@@ -484,25 +638,16 @@ impl_band_element!(u32, U32);
 impl_band_element!(f32, F32);
 impl_band_element!(f64, F64);
 
-fn materialize_layout(layout: BandLayout) -> MaterializeLayout {
-    match layout {
-        BandLayout::Interleaved => MaterializeLayout::Interleaved,
-        BandLayout::Bsq => MaterializeLayout::Bsq,
-    }
-}
-
-fn materialize_error(err: lerc_band_materialize::MaterializeError) -> Error {
-    Error::InvalidBlob(err.to_string())
-}
-
+#[cfg(feature = "ndarray")]
 trait PixelDataExt {
     fn into_ndarray<T: NdArrayElement>(self, shape: &[usize]) -> Result<ArrayD<T>>;
 }
 
+#[cfg(feature = "ndarray")]
 impl PixelDataExt for PixelData {
     fn into_ndarray<T: NdArrayElement>(self, shape: &[usize]) -> Result<ArrayD<T>> {
         ArrayD::from_shape_vec(IxDyn(shape), T::from_pixel_data(self)?).map_err(|err| {
-            Error::InvalidBlob(format!(
+            Error::invalid_blob(format!(
                 "failed to build ndarray from decoded pixels: {err}"
             ))
         })

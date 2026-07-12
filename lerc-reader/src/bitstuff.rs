@@ -30,32 +30,28 @@ pub(crate) fn decode_bits(
         1 => cursor.read_u8()? as usize,
         2 => read_u16(cursor.read_bytes(2)?)? as usize,
         4 => cursor.read_u32()? as usize,
-        _ => {
-            return Err(Error::InvalidBlob(
-                "invalid valid pixel count field width".into(),
-            ))
-        }
+        _ => return Err(Error::invalid_blob("invalid valid pixel count field width")),
     };
     if num_elements > out.len() {
-        return Err(Error::InvalidBlob(
-            "bit-stuffed block expands beyond its output buffer".into(),
+        return Err(Error::invalid_blob(
+            "bit-stuffed block expands beyond its output buffer",
         ));
     }
 
     if do_lut {
-        let offset = offset.ok_or(Error::InvalidBlob(
-            "LUT-compressed block is missing its base offset".into(),
+        let offset = offset.ok_or(Error::invalid_blob(
+            "LUT-compressed block is missing its base offset",
         ))?;
         let lut_bytes = cursor.read_u8()? as usize;
         if lut_bytes == 0 {
-            return Err(Error::InvalidBlob(
-                "LUT-compressed block has zero LUT bytes".into(),
+            return Err(Error::invalid_blob(
+                "LUT-compressed block has zero LUT bytes",
             ));
         }
-        let lut_data_bytes = ((lut_bytes - 1) * usize::from(num_bits)).div_ceil(8);
+        let lut_data_bytes = packed_byte_len(num_bits, lut_bytes - 1)?;
         let lut_words = words_from_padded(cursor.read_bytes(lut_data_bytes)?);
         let lut_bits_per_element = bits_required(lut_bytes - 1);
-        let stuffed_data_bytes = (num_elements * usize::from(lut_bits_per_element)).div_ceil(8);
+        let stuffed_data_bytes = packed_byte_len(lut_bits_per_element, num_elements)?;
         let stuffed_words = words_from_padded(cursor.read_bytes(stuffed_data_bytes)?);
 
         let lut_values = if version >= 3 {
@@ -113,7 +109,7 @@ pub(crate) fn decode_bits(
         return Ok(num_elements);
     }
 
-    let stuffed_data_bytes = (num_elements * usize::from(num_bits)).div_ceil(8);
+    let stuffed_data_bytes = packed_byte_len(num_bits, num_elements)?;
     let stuffed_words = words_from_padded(cursor.read_bytes(stuffed_data_bytes)?);
     match (version >= 3, offset) {
         (true, Some(offset)) => unstuff_v3(
@@ -163,16 +159,13 @@ pub(crate) fn unstuff_v2(
         });
     }
 
-    let mut words = src.to_vec();
     let num_invalid_tail_bytes = available_bytes - expected_bytes;
     if num_invalid_tail_bytes >= 4 {
-        return Err(Error::InvalidBlob(
-            "bit-stuffed payload has extra padded words".into(),
+        return Err(Error::invalid_blob(
+            "bit-stuffed payload has extra padded words",
         ));
     }
-    if let Some(last) = words.last_mut() {
-        *last <<= 8 * num_invalid_tail_bytes;
-    }
+    let tail_shift = 8 * num_invalid_tail_bytes;
 
     let mut index = 0usize;
     let mut bits_left = 0usize;
@@ -186,7 +179,7 @@ pub(crate) fn unstuff_v2(
             0
         } else {
             if bits_left == 0 {
-                buffer = read_word(&words, &mut index)?;
+                buffer = read_v2_word(src, &mut index, tail_shift)?;
                 bits_left = 32;
             }
             if bits_left >= bits_per_pixel as usize {
@@ -196,7 +189,7 @@ pub(crate) fn unstuff_v2(
             } else {
                 let missing_bits = bits_per_pixel as usize - bits_left;
                 let mut n = ((buffer & bit_mask) << missing_bits) & bit_mask;
-                buffer = read_word(&words, &mut index)?;
+                buffer = read_v2_word(src, &mut index, tail_shift)?;
                 bits_left = 32 - missing_bits;
                 n += buffer >> bits_left;
                 n
@@ -351,8 +344,8 @@ fn bit_mask(bits_per_pixel: u8) -> Result<u32> {
         0 => Ok(0),
         1..=31 => Ok((1u32 << bits_per_pixel) - 1),
         32 => Ok(u32::MAX),
-        _ => Err(Error::InvalidBlob(
-            "bit-stuffed block uses more than 32 bits per pixel".into(),
+        _ => Err(Error::invalid_blob(
+            "bit-stuffed block uses more than 32 bits per pixel",
         )),
     }
 }
@@ -361,14 +354,14 @@ fn packed_byte_len(bits_per_pixel: u8, num_pixels: usize) -> Result<usize> {
     usize::from(bits_per_pixel)
         .checked_mul(num_pixels)
         .map(|bits| bits.div_ceil(8))
-        .ok_or_else(|| Error::InvalidBlob("bit-stuffed payload bit count overflows usize".into()))
+        .ok_or(Error::SizeOverflow("bit-stuffed payload bit count"))
 }
 
 fn word_bytes(words: &[u32]) -> Result<usize> {
     words
         .len()
         .checked_mul(4)
-        .ok_or_else(|| Error::InvalidBlob("bit-stuffed word count overflows usize".into()))
+        .ok_or(Error::SizeOverflow("bit-stuffed word byte count"))
 }
 
 fn read_word(words: &[u32], index: &mut usize) -> Result<u32> {
@@ -385,19 +378,34 @@ fn read_word(words: &[u32], index: &mut usize) -> Result<u32> {
     Ok(word)
 }
 
+fn read_v2_word(words: &[u32], index: &mut usize, tail_shift: usize) -> Result<u32> {
+    let word_index = *index;
+    let word = read_word(words, index)?;
+    Ok(if word_index + 1 == words.len() {
+        word << tail_shift
+    } else {
+        word
+    })
+}
+
 fn unstuffed_value(n: u32, options: &UnstuffOptions<'_>, nmax: Option<f64>) -> Result<f64> {
     match (options.lut_values, options.offset) {
         (Some(lut_values), _) => lut_values
             .get(n as usize)
             .copied()
-            .ok_or_else(|| Error::InvalidBlob("bit-stuffed LUT index is outside the LUT".into())),
-        (None, Some(offset)) => Ok(quantized_value(
-            offset,
-            options.scale,
-            options.max_value,
-            n,
-            nmax.unwrap(),
-        )),
+            .ok_or_else(|| Error::invalid_blob("bit-stuffed LUT index is outside the LUT")),
+        (None, Some(offset)) => {
+            let nmax = nmax.ok_or(Error::Internal(
+                "bit-stuffed quantization maximum is missing",
+            ))?;
+            Ok(quantized_value(
+                offset,
+                options.scale,
+                options.max_value,
+                n,
+                nmax,
+            ))
+        }
         (None, None) => Ok(n as f64),
     }
 }
@@ -448,5 +456,7 @@ pub(crate) fn read_typed_scalar(cursor: &mut Cursor<'_>, data_type: DataType) ->
 }
 
 fn read_u16(bytes: &[u8]) -> Result<u16> {
-    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+    let bytes = <[u8; 2]>::try_from(bytes)
+        .map_err(|_| Error::Internal("bit-stuffed u16 field has the wrong width"))?;
+    Ok(u16::from_le_bytes(bytes))
 }
