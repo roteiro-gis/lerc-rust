@@ -16,6 +16,6 @@ docker run --rm \
   -w /workspace \
   "${image_name}" bash -c '
   helper="$(./scripts/build-reference-helper.sh)"
-  LERC_READER_REFERENCE_HELPER="${helper}" cargo test -p lerc-reader --test reference_parity
-  LERC_READER_REFERENCE_HELPER="${helper}" cargo test -p lerc-writer --test reference_parity
+  LERC_PARITY_REQUIRED=1 LERC_READER_REFERENCE_HELPER="${helper}" cargo test -p lerc-reader --test reference_parity
+  LERC_PARITY_REQUIRED=1 LERC_READER_REFERENCE_HELPER="${helper}" cargo test -p lerc-writer --test reference_parity
 '
