@@ -8,7 +8,7 @@ Included fixtures:
 - `world.lerc1`: official Esri Lerc1 sample with an external validity mask
 - `california_400_400_1_float.lerc2`: official masked float Lerc2 sample
 - `bluemarble_256_256_3_byte.lerc2`: official concatenated 3-band byte Lerc2
-  sample
+  sample whose first blob exercises libLerc's integer Huffman encoding
 - `esri_js_sanity_u8_3d.csv`: byte-for-byte fixture from Esri's JavaScript
   sanity test covering `depth > 1`
 

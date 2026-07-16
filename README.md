@@ -44,13 +44,24 @@ let pixels = vec![1u8, 2, 3, 4];
 let blob = encode(
     RasterView::new(2, 2, 1, &pixels)?,
     None,
-    EncodeOptions {
-        max_z_error: 0.5,
-        micro_block_size: 8,
-        ..EncodeOptions::default()
-    },
+    EncodeOptions::new().with_max_z_error(0.5),
 )?;
 ```
+
+### Features
+
+`lerc-reader` enables `ndarray` by default. Disable default features for a
+minimal slice/vector decoder, or opt into parallel multi-band decoding:
+
+```toml
+lerc-reader = { version = "0.5", default-features = false }
+# or
+lerc-reader = { version = "0.5", features = ["ndarray", "rayon"] }
+```
+
+The `rayon` feature resolves concatenated blob boundaries and inherited masks
+sequentially, then decodes independent bands in parallel. BSQ output is written
+directly to disjoint slices; interleaved output is scattered deterministically.
 
 ### Version Support
 
@@ -70,6 +81,8 @@ depends on the encoded byte stream:
 Single-blob entry points are strict. If you intentionally want first-blob
 inspection or decode from a concatenated payload, use `inspect_first()` or
 `decode_first()`.
+Use `InspectOptions::new().with_compute_value_range(false)` when Lerc1 header
+metadata is sufficient and exact range scanning would be unnecessary work.
 For Lerc1 shared-mask or Lerc2 external-mask blobs, use the corresponding
 single-blob `*_with_mask()` entry points.
 For concatenated Lerc2 band sets whose first blob uses an external mask, use
@@ -87,6 +100,10 @@ let (info, bsq): (_, Vec<u8>) =
 assert_eq!(bsq.len(), (info.width() * info.height() * info.band_count() as u32) as usize);
 ```
 
+`decode_from_reader` reads exactly one blob and leaves subsequent bytes unread.
+`decode_band_set_from_reader` continues through clean EOF, enabling bounded
+blob-by-blob decoding from files, sockets, and other `std::io::Read` sources.
+
 ## Supported Now
 
 - Lerc1 header parsing, mask decoding, tiled block decode, and concatenated
@@ -98,16 +115,19 @@ assert_eq!(bsq.len(), (info.width() * info.height() * info.band_count() as u32) 
   Huffman, v5 diff-tile encode paths, and v6/no-data emission
 - Lerc2 v6/no-data decode support
 - Native typed decode and type-promoting `f64` decode
+- Exact one-blob and EOF-terminated band-set streaming from `std::io::Read`
+- Optional deterministic Rayon parallelism across concatenated bands
 - Strict single-blob APIs plus permissive first-blob adapters for concatenated payloads
-- Direct `ndarray::ArrayD` conversion for rasters, band sets, and masks, with selectable band layout
+- Feature-gated `ndarray::ArrayD` conversion for rasters, band sets, and masks, with selectable band layout
 - Codec-neutral typed raster views and shared metadata types in `lerc-core`
 
 ## Testing
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo check -p lerc-reader --no-default-features
 ```
 
 For coordinated workspace publishes, see
@@ -158,6 +178,7 @@ cargo fuzz run headers
 cargo fuzz run mask_rle
 cargo fuzz run huffman_tables
 cargo fuzz run bitstuff_blocks
+cargo fuzz run lerc2_bitstuff_blocks
 cargo fuzz run concatenated
 cargo fuzz run encode_roundtrip
 ```
