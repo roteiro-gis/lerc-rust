@@ -137,3 +137,25 @@ fn decodes_official_bluemarble_band_set_fixture() {
     assert_eq!(band_mask[IxDyn(&[255, 255, 1])], 0);
     assert_eq!(band_mask[IxDyn(&[255, 255, 2])], 0);
 }
+
+#[test]
+fn decodes_liblerc_canonical_huffman_wraparound_fixture() {
+    let blob = load_binary_fixture("liblerc-v4-u8-huffman.lerc2");
+
+    let info = lerc_reader::get_blob_info(&blob).unwrap();
+    assert_eq!(info.version, lerc_core::Version::Lerc2(4));
+    assert_eq!(info.width, 16);
+    assert_eq!(info.height, 8);
+    assert_eq!(info.depth, 1);
+    assert_eq!(info.data_type, DataType::U8);
+    assert_eq!(info.valid_pixel_count, 128);
+    assert_eq!(info.max_z_error, 0.5);
+
+    let raster = lerc_reader::decode_ndarray::<u8>(&blob).unwrap();
+    let expected: Vec<u8> = (0..16 * 8)
+        .map(|index| ((index * 17 + index / 3) % 29) as u8)
+        .collect();
+    assert_eq!(raster.shape(), &[8, 16]);
+    assert!(raster.iter().copied().eq(expected));
+    assert_eq!(lerc_reader::decode_mask_ndarray(&blob).unwrap(), None);
+}
