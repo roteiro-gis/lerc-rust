@@ -5,6 +5,9 @@ use ndarray::ArrayD;
 #[path = "../../test-support/reference.rs"]
 mod reference;
 
+const LIBLERC_HUFFMAN_FIXTURE: &[u8] =
+    include_bytes!("../../testdata/interoperability/liblerc-v4-u8-huffman.lerc2");
+
 fn json_shape(value: &serde_json::Value) -> Vec<usize> {
     value
         .as_array()
@@ -12,6 +15,148 @@ fn json_shape(value: &serde_json::Value) -> Vec<usize> {
         .iter()
         .map(|value| value.as_u64().unwrap() as usize)
         .collect()
+}
+
+fn assert_reference_decode<T>(helper: &std::path::Path, name: &str, blob: &[u8])
+where
+    T: lerc_reader::NdArrayElement + reference::SampleBytes,
+{
+    let path = reference::write_temp_bytes(&format!("liblerc-encoded-{name}"), "lerc2", blob);
+    let reference_json = reference::run_reference_json(helper, &["hash", path.to_str().unwrap()]);
+    let raster: ArrayD<T> = lerc_reader::decode_ndarray(blob)
+        .unwrap_or_else(|err| panic!("Rust failed to decode {name}: {err}"));
+    let (pixel_len, pixel_hash) = reference::array_hash(&raster);
+    assert_eq!(raster.shape(), json_shape(&reference_json["pixel_shape"]));
+    assert_eq!(
+        pixel_len,
+        reference_json["pixel_byte_len"].as_u64().unwrap() as usize
+    );
+    assert_eq!(pixel_hash, reference_json["pixel_hash"].as_str().unwrap());
+
+    let mask = lerc_reader::decode_mask_ndarray(blob).unwrap();
+    match mask {
+        Some(mask) => {
+            let (mask_len, mask_hash) = reference::array_hash(&mask);
+            assert_eq!(mask.shape(), json_shape(&reference_json["mask_shape"]));
+            assert_eq!(
+                mask_len,
+                reference_json["mask_byte_len"].as_u64().unwrap() as usize
+            );
+            assert_eq!(mask_hash, reference_json["mask_hash"].as_str().unwrap());
+        }
+        None => assert!(reference_json["mask_shape"].is_null()),
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+fn assert_type_decodes_reference<T>(helper: &std::path::Path, name: &str)
+where
+    T: lerc_core::Sample + lerc_reader::NdArrayElement + reference::SampleBytes,
+{
+    const WIDTH: usize = 16;
+    const HEIGHT: usize = 8;
+    let pixels: Vec<T> = (0..WIDTH * HEIGHT)
+        .map(|index| T::from_f64(((index * 17 + index / 3) % 29) as f64))
+        .collect();
+    let mask: Vec<u8> = (0..WIDTH * HEIGHT)
+        .map(|index| u8::from(index % 5 != 0 && index % 11 != 0))
+        .collect();
+    let max_z_errors = if T::IS_INTEGER {
+        [0.0, 1.0]
+    } else {
+        [0.0, 0.25]
+    };
+
+    for max_z_error in max_z_errors {
+        for mask_data in [None, Some(mask.as_slice())] {
+            let reference_blob = reference::encode_with_reference(
+                helper,
+                &pixels,
+                mask_data,
+                reference::ReferenceEncodeOptions {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth: 1,
+                    max_z_error,
+                    codec_version: 4,
+                    no_data_value: None,
+                },
+            );
+            let mask_name = if mask_data.is_some() {
+                "masked"
+            } else {
+                "all-valid"
+            };
+            if name == "u8" && mask_data.is_none() && max_z_error == 0.0 {
+                assert_eq!(
+                    reference_blob, LIBLERC_HUFFMAN_FIXTURE,
+                    "pinned libLerc no longer reproduces the Huffman fixture"
+                );
+            }
+            assert_reference_decode::<T>(
+                helper,
+                &format!("{name}-{mask_name}-max-z-error-{max_z_error}"),
+                &reference_blob,
+            );
+        }
+    }
+}
+
+#[test]
+fn decodes_liblerc_encoded_type_matrix() {
+    let Some(helper) = reference::helper_path() else {
+        eprintln!("skipping libLerc encode parity test because the helper is unset");
+        return;
+    };
+
+    assert_type_decodes_reference::<i8>(&helper, "i8");
+    assert_type_decodes_reference::<u8>(&helper, "u8");
+    assert_type_decodes_reference::<i16>(&helper, "i16");
+    assert_type_decodes_reference::<u16>(&helper, "u16");
+    assert_type_decodes_reference::<i32>(&helper, "i32");
+    assert_type_decodes_reference::<u32>(&helper, "u32");
+    assert_type_decodes_reference::<f32>(&helper, "f32");
+    assert_type_decodes_reference::<f64>(&helper, "f64");
+}
+
+#[test]
+fn decodes_liblerc_encoded_no_data() {
+    let Some(helper) = reference::helper_path() else {
+        eprintln!("skipping libLerc encode parity test because the helper is unset");
+        return;
+    };
+
+    const WIDTH: usize = 16;
+    const HEIGHT: usize = 8;
+    const DEPTH: usize = 2;
+    const NO_DATA: f32 = -9_999.0;
+    let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * DEPTH);
+    for pixel in 0..WIDTH * HEIGHT {
+        pixels.push((pixel % 31) as f32);
+        pixels.push(if pixel % 7 == 0 {
+            NO_DATA
+        } else {
+            ((pixel * 3) % 37) as f32
+        });
+    }
+    let mask: Vec<u8> = (0..WIDTH * HEIGHT)
+        .map(|index| u8::from(index % 13 != 0))
+        .collect();
+    let reference_blob = reference::encode_with_reference(
+        &helper,
+        &pixels,
+        Some(&mask),
+        reference::ReferenceEncodeOptions {
+            width: WIDTH,
+            height: HEIGHT,
+            depth: DEPTH,
+            max_z_error: 0.25,
+            codec_version: 6,
+            no_data_value: Some(f64::from(NO_DATA)),
+        },
+    );
+
+    assert_reference_decode::<f32>(&helper, "f32-masked-no-data", &reference_blob);
 }
 
 #[test]

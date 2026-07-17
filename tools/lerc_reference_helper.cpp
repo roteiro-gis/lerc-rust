@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -25,6 +26,64 @@ lerc_status lerc_getBlobInfo(
     double* dataRangeArray,
     int infoArraySize,
     int dataRangeArraySize);
+
+lerc_status lerc_computeCompressedSizeForVersion(
+    const void* pData,
+    int codecVersion,
+    unsigned int dataType,
+    int nDepth,
+    int nCols,
+    int nRows,
+    int nBands,
+    int nMasks,
+    const unsigned char* pValidBytes,
+    double maxZErr,
+    unsigned int* numBytes);
+
+lerc_status lerc_encodeForVersion(
+    const void* pData,
+    int codecVersion,
+    unsigned int dataType,
+    int nDepth,
+    int nCols,
+    int nRows,
+    int nBands,
+    int nMasks,
+    const unsigned char* pValidBytes,
+    double maxZErr,
+    unsigned char* pOutBuffer,
+    unsigned int outBufferSize,
+    unsigned int* nBytesWritten);
+
+lerc_status lerc_computeCompressedSize_4D(
+    const void* pData,
+    unsigned int dataType,
+    int nDepth,
+    int nCols,
+    int nRows,
+    int nBands,
+    int nMasks,
+    const unsigned char* pValidBytes,
+    double maxZErr,
+    unsigned int* numBytes,
+    const unsigned char* pUsesNoData,
+    const double* noDataValues);
+
+lerc_status lerc_encode_4D(
+    const void* pData,
+    unsigned int dataType,
+    int nDepth,
+    int nCols,
+    int nRows,
+    int nBands,
+    int nMasks,
+    const unsigned char* pValidBytes,
+    double maxZErr,
+    unsigned char* pOutBuffer,
+    unsigned int outBufferSize,
+    unsigned int* nBytesWritten,
+    const unsigned char* pUsesNoData,
+    const double* noDataValues);
 
 lerc_status lerc_decode_4D(
     const unsigned char* pLercBlob,
@@ -69,6 +128,21 @@ struct DecodeResult {
   std::optional<std::vector<int>> mask_shape;
   double checksum = 0;
   std::uint64_t valid_sum = 0;
+};
+
+struct EncodeArgs {
+  std::string data_path;
+  std::string output_path;
+  unsigned int data_type = 0;
+  int depth = 0;
+  int width = 0;
+  int height = 0;
+  int bands = 0;
+  int masks = 0;
+  std::optional<std::string> mask_path;
+  double max_z_error = 0;
+  int codec_version = 0;
+  std::optional<double> no_data_value;
 };
 
 [[noreturn]] void fail(const std::string& message) {
@@ -137,6 +211,215 @@ std::size_t data_type_size(unsigned int data_type) {
     default:
       fail("unsupported LERC data type code: " + std::to_string(data_type));
   }
+}
+
+std::size_t checked_multiply(std::size_t lhs, std::size_t rhs, const char* label) {
+  if (rhs != 0 && lhs > std::numeric_limits<std::size_t>::max() / rhs) {
+    fail(std::string(label) + " size overflow");
+  }
+  return lhs * rhs;
+}
+
+int parse_positive_int(const std::string& value, const char* label) {
+  const auto parsed = std::stoll(value);
+  if (parsed <= 0 || parsed > std::numeric_limits<int>::max()) {
+    fail(std::string(label) + " must be in the range 1..INT_MAX");
+  }
+  return static_cast<int>(parsed);
+}
+
+int parse_nonnegative_int(const std::string& value, const char* label) {
+  const auto parsed = std::stoll(value);
+  if (parsed < 0 || parsed > std::numeric_limits<int>::max()) {
+    fail(std::string(label) + " must be in the range 0..INT_MAX");
+  }
+  return static_cast<int>(parsed);
+}
+
+EncodeArgs parse_encode_args(int argc, char** argv) {
+  if (argc != 14) {
+    fail(
+        "usage: lerc-reference encode <data-path> <output-path> <data-type> "
+        "<depth> <width> <height> <bands> <masks> <mask-path|-> "
+        "<max-z-error> <codec-version> <no-data|->");
+  }
+
+  EncodeArgs args;
+  args.data_path = argv[2];
+  args.output_path = argv[3];
+  const auto data_type = std::stoul(argv[4]);
+  if (data_type > 7) {
+    fail("data-type must be in the range 0..7");
+  }
+  args.data_type = static_cast<unsigned int>(data_type);
+  args.depth = parse_positive_int(argv[5], "depth");
+  args.width = parse_positive_int(argv[6], "width");
+  args.height = parse_positive_int(argv[7], "height");
+  args.bands = parse_positive_int(argv[8], "bands");
+  args.masks = parse_nonnegative_int(argv[9], "masks");
+  if (args.masks != 0 && args.masks != 1 && args.masks != args.bands) {
+    fail("masks must be 0, 1, or equal to bands");
+  }
+  if (std::string_view(argv[10]) != "-") {
+    args.mask_path = argv[10];
+  }
+  if ((args.masks == 0) != !args.mask_path.has_value()) {
+    fail("mask-path must be '-' exactly when masks is 0");
+  }
+  args.max_z_error = std::stod(argv[11]);
+  if (!std::isfinite(args.max_z_error) || args.max_z_error < 0) {
+    fail("max-z-error must be finite and non-negative");
+  }
+  args.codec_version = parse_positive_int(argv[12], "codec-version");
+  if (args.codec_version < 2 || args.codec_version > 6) {
+    fail("codec-version must be in the range 2..6");
+  }
+  if (std::string_view(argv[13]) != "-") {
+    args.no_data_value = std::stod(argv[13]);
+    if (!std::isfinite(*args.no_data_value)) {
+      fail("no-data must be finite");
+    }
+    if (args.codec_version != 6) {
+      fail("no-data encoding requires codec-version 6");
+    }
+  }
+  return args;
+}
+
+void write_blob(const std::string& path, const std::vector<std::uint8_t>& bytes) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    fail("failed to open output file: " + path);
+  }
+  if (!bytes.empty()) {
+    out.write(
+        reinterpret_cast<const char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
+  }
+  if (!out) {
+    fail("failed to write output file: " + path);
+  }
+}
+
+std::vector<std::uint8_t> encode_blob(const EncodeArgs& args) {
+  const auto raw = read_blob(args.data_path);
+  std::size_t sample_count = static_cast<std::size_t>(args.depth);
+  sample_count = checked_multiply(sample_count, static_cast<std::size_t>(args.width), "sample");
+  sample_count = checked_multiply(sample_count, static_cast<std::size_t>(args.height), "sample");
+  sample_count = checked_multiply(sample_count, static_cast<std::size_t>(args.bands), "sample");
+  const auto expected_bytes = checked_multiply(sample_count, data_type_size(args.data_type), "input");
+  if (raw.size() != expected_bytes) {
+    fail(
+        "input byte length mismatch: expected " + std::to_string(expected_bytes) +
+        ", got " + std::to_string(raw.size()));
+  }
+
+  const auto aligned_len = (raw.size() + sizeof(double) - 1) / sizeof(double);
+  std::vector<double> aligned_raw(aligned_len);
+  if (!raw.empty()) {
+    std::memcpy(aligned_raw.data(), raw.data(), raw.size());
+  }
+
+  std::vector<std::uint8_t> mask;
+  if (args.mask_path.has_value()) {
+    mask = read_blob(*args.mask_path);
+    auto expected_mask_bytes = checked_multiply(
+        static_cast<std::size_t>(args.width),
+        static_cast<std::size_t>(args.height),
+        "mask");
+    expected_mask_bytes = checked_multiply(
+        expected_mask_bytes, static_cast<std::size_t>(args.masks), "mask");
+    if (mask.size() != expected_mask_bytes) {
+      fail(
+          "mask byte length mismatch: expected " + std::to_string(expected_mask_bytes) +
+          ", got " + std::to_string(mask.size()));
+    }
+    for (auto& value : mask) {
+      value = value == 0 ? 0 : 1;
+    }
+  }
+
+  const auto* mask_ptr = mask.empty() ? nullptr : mask.data();
+  unsigned int compressed_size = 0;
+  lerc_status status = 0;
+  std::vector<std::uint8_t> uses_no_data;
+  std::vector<double> no_data_values;
+  if (args.no_data_value.has_value()) {
+    uses_no_data.assign(static_cast<std::size_t>(args.bands), 1);
+    no_data_values.assign(static_cast<std::size_t>(args.bands), *args.no_data_value);
+    status = lerc_computeCompressedSize_4D(
+        aligned_raw.data(),
+        args.data_type,
+        args.depth,
+        args.width,
+        args.height,
+        args.bands,
+        args.masks,
+        mask_ptr,
+        args.max_z_error,
+        &compressed_size,
+        uses_no_data.data(),
+        no_data_values.data());
+  } else {
+    status = lerc_computeCompressedSizeForVersion(
+        aligned_raw.data(),
+        args.codec_version,
+        args.data_type,
+        args.depth,
+        args.width,
+        args.height,
+        args.bands,
+        args.masks,
+        mask_ptr,
+        args.max_z_error,
+        &compressed_size);
+  }
+  if (status != 0) {
+    fail("libLerc size computation failed with status " + std::to_string(status));
+  }
+
+  std::vector<std::uint8_t> encoded(compressed_size);
+  unsigned int written = 0;
+  if (args.no_data_value.has_value()) {
+    status = lerc_encode_4D(
+        aligned_raw.data(),
+        args.data_type,
+        args.depth,
+        args.width,
+        args.height,
+        args.bands,
+        args.masks,
+        mask_ptr,
+        args.max_z_error,
+        encoded.data(),
+        compressed_size,
+        &written,
+        uses_no_data.data(),
+        no_data_values.data());
+  } else {
+    status = lerc_encodeForVersion(
+        aligned_raw.data(),
+        args.codec_version,
+        args.data_type,
+        args.depth,
+        args.width,
+        args.height,
+        args.bands,
+        args.masks,
+        mask_ptr,
+        args.max_z_error,
+        encoded.data(),
+        compressed_size,
+        &written);
+  }
+  if (status != 0) {
+    fail("libLerc encoding failed with status " + std::to_string(status));
+  }
+  if (written > compressed_size) {
+    fail("libLerc reported an encoded length larger than its output buffer");
+  }
+  encoded.resize(written);
+  return encoded;
 }
 
 BlobInfo get_blob_info(const std::vector<std::uint8_t>& blob) {
@@ -503,10 +786,22 @@ std::size_t parse_iterations(const std::vector<std::string_view>& args) {
 int main(int argc, char** argv) {
   try {
     if (argc < 3) {
-      fail("usage: lerc-reference <metadata|hash|benchmark> <blob-path> [--iterations N]");
+      fail(
+          "usage: lerc-reference <metadata|hash|benchmark> <blob-path> "
+          "[--iterations N] | lerc-reference encode ...");
     }
 
     const std::string command = argv[1];
+    if (command == "encode") {
+      const auto encoded = encode_blob(parse_encode_args(argc, argv));
+      write_blob(argv[3], encoded);
+      std::cout << '{'
+                << "\"blob_size\":" << encoded.size() << ','
+                << "\"blob_hash\":\"" << fnv1a64(encoded) << "\""
+                << "}\n";
+      return 0;
+    }
+
     const std::string blob_path = argv[2];
     const auto blob = read_blob(blob_path);
 

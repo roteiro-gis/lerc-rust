@@ -77,55 +77,155 @@ pub fn fnv1a64(bytes: &[u8]) -> String {
 }
 
 pub trait SampleBytes {
+    const LERC_DATA_TYPE: u8;
+
     fn append_ne_bytes(&self, out: &mut Vec<u8>);
 }
 
 impl SampleBytes for u8 {
+    const LERC_DATA_TYPE: u8 = 1;
+
     fn append_ne_bytes(&self, out: &mut Vec<u8>) {
         out.push(*self);
     }
 }
 
 impl SampleBytes for i8 {
+    const LERC_DATA_TYPE: u8 = 0;
+
     fn append_ne_bytes(&self, out: &mut Vec<u8>) {
         out.push(*self as u8);
     }
 }
 
 impl SampleBytes for u16 {
+    const LERC_DATA_TYPE: u8 = 3;
+
     fn append_ne_bytes(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_ne_bytes());
     }
 }
 
 impl SampleBytes for i16 {
+    const LERC_DATA_TYPE: u8 = 2;
+
     fn append_ne_bytes(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_ne_bytes());
     }
 }
 
 impl SampleBytes for u32 {
+    const LERC_DATA_TYPE: u8 = 5;
+
     fn append_ne_bytes(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_ne_bytes());
     }
 }
 
 impl SampleBytes for i32 {
+    const LERC_DATA_TYPE: u8 = 4;
+
     fn append_ne_bytes(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_ne_bytes());
     }
 }
 
 impl SampleBytes for f32 {
+    const LERC_DATA_TYPE: u8 = 6;
+
     fn append_ne_bytes(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_ne_bytes());
     }
 }
 
 impl SampleBytes for f64 {
+    const LERC_DATA_TYPE: u8 = 7;
+
     fn append_ne_bytes(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.to_ne_bytes());
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReferenceEncodeOptions {
+    pub width: usize,
+    pub height: usize,
+    pub depth: usize,
+    pub max_z_error: f64,
+    pub codec_version: u8,
+    pub no_data_value: Option<f64>,
+}
+
+pub fn encode_with_reference<T: SampleBytes>(
+    helper: &Path,
+    samples: &[T],
+    mask: Option<&[u8]>,
+    options: ReferenceEncodeOptions,
+) -> Vec<u8> {
+    let pixel_count = options
+        .width
+        .checked_mul(options.height)
+        .expect("reference raster pixel count overflowed");
+    let sample_count = pixel_count
+        .checked_mul(options.depth)
+        .expect("reference raster sample count overflowed");
+    assert_eq!(samples.len(), sample_count);
+    if let Some(mask) = mask {
+        assert_eq!(mask.len(), pixel_count);
+    }
+
+    let mut sample_bytes = Vec::with_capacity(std::mem::size_of_val(samples));
+    for sample in samples {
+        sample.append_ne_bytes(&mut sample_bytes);
+    }
+    let input_path = write_temp_bytes("lerc-reference-input", "bin", &sample_bytes);
+    let output_path = write_temp_bytes("lerc-reference-output", "lerc2", &[]);
+    let mask_path = mask.map(|mask| write_temp_bytes("lerc-reference-mask", "bin", mask));
+    let mask_count = usize::from(mask.is_some()).to_string();
+    let mask_arg = mask_path
+        .as_deref()
+        .map_or_else(|| std::ffi::OsStr::new("-"), Path::as_os_str);
+    let no_data = options
+        .no_data_value
+        .map_or_else(|| "-".to_owned(), |value| value.to_string());
+
+    let output = Command::new(helper)
+        .arg("encode")
+        .arg(&input_path)
+        .arg(&output_path)
+        .arg(T::LERC_DATA_TYPE.to_string())
+        .arg(options.depth.to_string())
+        .arg(options.width.to_string())
+        .arg(options.height.to_string())
+        .arg("1")
+        .arg(mask_count)
+        .arg(mask_arg)
+        .arg(options.max_z_error.to_string())
+        .arg(options.codec_version.to_string())
+        .arg(no_data)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run LERC reference encoder: {err}"));
+    assert!(
+        output.status.success(),
+        "LERC reference encoder failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let encoded = std::fs::read(&output_path).expect("reference encoder did not write its blob");
+    let metadata: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("failed to parse LERC reference encoder JSON: {err}"));
+    assert_eq!(
+        metadata["blob_size"].as_u64().unwrap() as usize,
+        encoded.len()
+    );
+    assert_eq!(metadata["blob_hash"].as_str().unwrap(), fnv1a64(&encoded));
+
+    let _ = std::fs::remove_file(input_path);
+    let _ = std::fs::remove_file(output_path);
+    if let Some(mask_path) = mask_path {
+        let _ = std::fs::remove_file(mask_path);
+    }
+    encoded
 }
 
 pub fn array_hash<T: SampleBytes>(array: &ArrayD<T>) -> (usize, String) {
