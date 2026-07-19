@@ -126,9 +126,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
-      - uses: rustsec/audit-check@v2
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@13608cbb45b01feb47ef444ab1a42dc41ad56f1a # v2.79.11
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit@0.22.2
+          fallback: none
+      - name: Audit Rust dependencies
+        run: cargo audit --deny warnings
 
   coverage:
     name: Coverage
