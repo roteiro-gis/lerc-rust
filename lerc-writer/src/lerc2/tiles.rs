@@ -34,6 +34,16 @@ pub(super) struct TilingPlan {
     blocks: Vec<BlockPlan>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TilingOptions {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) depth: u32,
+    pub(super) data_type: DataType,
+    pub(super) max_z_error: f64,
+    pub(super) micro_block_size: u32,
+}
+
 #[derive(Debug, Clone)]
 enum BlockBody {
     ZeroOrEmpty,
@@ -121,14 +131,14 @@ struct TilePosition {
 }
 
 impl TileGrid {
-    fn new(analysis: &RasterAnalysis) -> Self {
-        let width = analysis.width as usize;
-        let height = analysis.height as usize;
-        let micro = analysis.micro_block_size as usize;
+    fn new(width: u32, height: u32, depth: u32, micro_block_size: u32) -> Self {
+        let width = width as usize;
+        let height = height as usize;
+        let micro = micro_block_size as usize;
         Self {
             width,
             height,
-            depth: analysis.depth as usize,
+            depth: depth as usize,
             micro,
             blocks_x: width.div_ceil(micro),
             blocks_y: height.div_ceil(micro),
@@ -140,6 +150,18 @@ impl TileGrid {
             .checked_mul(self.blocks_y)
             .and_then(|count| count.checked_mul(self.depth))
             .ok_or(Error::SizeOverflow("tile plan block count"))
+    }
+
+    fn strip_slot_count(self) -> Result<usize> {
+        self.blocks_x
+            .checked_mul(self.depth)
+            .ok_or(Error::SizeOverflow("tile planning strip slot count"))
+    }
+
+    fn block_capacity(self) -> Result<usize> {
+        self.micro
+            .checked_mul(self.micro)
+            .ok_or(Error::SizeOverflow("tile planning block capacity"))
     }
 
     fn visit(self, mut visitor: impl FnMut(TilePosition, usize) -> Result<()>) -> Result<()> {
@@ -167,62 +189,100 @@ impl TileGrid {
 pub(super) fn plan<T: Sample, R: RasterSource<T>>(
     raster: R,
     mask: Option<&[u8]>,
-    analysis: &RasterAnalysis,
+    options: TilingOptions,
+    mut observe_pixel: impl FnMut(usize, &[f64]) -> Result<()>,
 ) -> Result<TilingPlan> {
-    let grid = TileGrid::new(analysis);
-    let diff_supported =
-        supports_diff_tiles(analysis.data_type, analysis.max_z_error, analysis.depth);
+    let grid = TileGrid::new(
+        options.width,
+        options.height,
+        options.depth,
+        options.micro_block_size,
+    );
+    let diff_supported = supports_diff_tiles(options.data_type, options.max_z_error, options.depth);
     let mut scratch = TileScratch::default();
+    let mut pixel_values = Vec::with_capacity(grid.depth);
     let mut data_len = 0usize;
     let mut blocks = Vec::with_capacity(grid.plan_capacity()?);
+    let block_capacity = grid.block_capacity()?;
+    let mut block_values: Vec<Vec<f64>> = (0..grid.strip_slot_count()?)
+        .map(|_| Vec::with_capacity(block_capacity))
+        .collect();
     let mut used_diff = false;
 
-    grid.visit(|position, dim| {
-        collect_block_values(
-            &mut scratch,
-            raster,
-            mask,
-            grid.width,
-            position,
-            dim,
-            diff_supported && dim > 0,
-        );
+    for block_y in 0..grid.blocks_y {
+        for values in &mut block_values {
+            values.clear();
+        }
 
-        let absolute_plan = choose_absolute_block_plan(
-            &scratch.values_f64,
-            scratch.raw_bytes.len(),
-            analysis.data_type,
-            analysis.max_z_error,
-            &mut scratch.quantized,
-            &mut scratch.bitstuff_payload,
-        )?;
-        let mut selected_plan = absolute_plan;
-        if diff_supported
-            && dim > 0
-            && build_diff_values(
-                &scratch.values_f64,
-                &scratch.prev_values_f64,
-                &mut scratch.diff_values_f64,
-            )?
-        {
-            if let Some(diff_plan) = choose_diff_block_plan(
-                &scratch.diff_values_f64,
-                analysis.max_z_error,
-                &mut scratch.quantized,
-                &mut scratch.bitstuff_payload,
-            )? {
-                if diff_plan.encoded_len() < selected_plan.encoded_len() {
-                    selected_plan = diff_plan;
-                    used_diff = true;
+        let origin_y = block_y * grid.micro;
+        let block_height = (grid.height - origin_y).min(grid.micro);
+        for row in 0..block_height {
+            let pixel_row = origin_y + row;
+            for block_x in 0..grid.blocks_x {
+                let block_base = block_x * grid.depth;
+                let origin_x = block_x * grid.micro;
+                let block_width = (grid.width - origin_x).min(grid.micro);
+                for col in 0..block_width {
+                    let pixel = pixel_row * grid.width + origin_x + col;
+                    if !pixel_is_valid(mask, pixel) {
+                        continue;
+                    }
+
+                    pixel_values.clear();
+                    for dim in 0..grid.depth {
+                        let value = raster.sample(pixel, dim).to_f64();
+                        block_values[block_base + dim].push(value);
+                        pixel_values.push(value);
+                    }
+                    observe_pixel(pixel, &pixel_values)?;
                 }
             }
         }
-        data_len = data_len
-            .checked_add(selected_plan.encoded_len())
-            .ok_or(Error::SizeOverflow("tile payload byte count"))?;
-        blocks.push(selected_plan);
-        Ok(())
-    })?;
+
+        for block_x in 0..grid.blocks_x {
+            let block_base = block_x * grid.depth;
+            for dim in 0..grid.depth {
+                let values = &block_values[block_base + dim];
+                let raw_byte_len = values
+                    .len()
+                    .checked_mul(options.data_type.byte_len())
+                    .ok_or(Error::SizeOverflow("raw block byte count"))?;
+                let absolute_plan = choose_absolute_block_plan(
+                    values,
+                    raw_byte_len,
+                    options.data_type,
+                    options.max_z_error,
+                    &mut scratch.quantized,
+                    &mut scratch.bitstuff_payload,
+                )?;
+                let mut selected_plan = absolute_plan;
+                if diff_supported
+                    && dim > 0
+                    && build_diff_values(
+                        values,
+                        &block_values[block_base + dim - 1],
+                        &mut scratch.diff_values_f64,
+                    )?
+                {
+                    if let Some(diff_plan) = choose_diff_block_plan(
+                        &scratch.diff_values_f64,
+                        options.max_z_error,
+                        &mut scratch.quantized,
+                        &mut scratch.bitstuff_payload,
+                    )? {
+                        if diff_plan.encoded_len() < selected_plan.encoded_len() {
+                            selected_plan = diff_plan;
+                            used_diff = true;
+                        }
+                    }
+                }
+                data_len = data_len
+                    .checked_add(selected_plan.encoded_len())
+                    .ok_or(Error::SizeOverflow("tile payload byte count"))?;
+                blocks.push(selected_plan);
+            }
+        }
+    }
 
     Ok(TilingPlan {
         version: if used_diff { VERSION_5 } else { VERSION_4 },
@@ -237,18 +297,20 @@ pub(super) fn write<T: Sample, R: RasterSource<T>>(
     raster: R,
     mask: Option<&[u8]>,
     analysis: &RasterAnalysis,
+    version: i32,
     plan: &TilingPlan,
 ) -> Result<()> {
     sink.push(0)?;
-    if needs_encode_mode_flag(
-        analysis.data_type,
-        analysis.max_z_error,
-        analysis.plan.version,
-    ) {
+    if needs_encode_mode_flag(analysis.data_type, analysis.max_z_error, version) {
         sink.push(0)?;
     }
 
-    let grid = TileGrid::new(analysis);
+    let grid = TileGrid::new(
+        analysis.width,
+        analysis.height,
+        analysis.depth,
+        analysis.micro_block_size,
+    );
     let mut block_plan_index = 0usize;
     grid.visit(|position, dim| {
         let block_plan = plan
@@ -277,7 +339,7 @@ pub(super) fn write<T: Sample, R: RasterSource<T>>(
             sink,
             block_plan,
             position.check_code,
-            analysis.plan.version,
+            version,
             &scratch.raw_bytes,
             &scratch.bitstuff_payload,
         )

@@ -3,8 +3,9 @@ use lerc_core::{BandSetView, DataType, Error, Result, Sample};
 use super::{
     huffman::{HistogramBuilder, HuffmanHistograms},
     mask::{pixel_is_valid, shared_mask_for_band, validate_slice, MaskKind, PreparedMask},
-    plan_raster, BandRasterView, BodyPlan, EncodeOptions, EncodePlan, RasterSource, RemappedRaster,
-    VERSION_4,
+    select_encode_plan,
+    tiles::{plan as plan_tiled_body, TilingOptions},
+    BandRasterView, EncodeOptions, EncodePlan, RasterSource, RemappedRaster,
 };
 
 #[derive(Debug, Clone)]
@@ -23,13 +24,98 @@ pub(super) struct RasterAnalysis {
     pub(super) min_values: Option<Vec<f64>>,
     pub(super) max_values: Option<Vec<f64>>,
     pub(super) huffman_histograms: Option<HuffmanHistograms>,
-    pub(super) plan: EncodePlan,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct PreparedBand<'a> {
     pub(super) mask: PreparedMask<'a>,
     pub(super) analysis: RasterAnalysis,
+    pub(super) plan: EncodePlan,
+}
+
+struct SemanticStatistics {
+    valid_pixel_count: usize,
+    z_min: f64,
+    z_max: f64,
+    min_values: Vec<f64>,
+    max_values: Vec<f64>,
+}
+
+impl SemanticStatistics {
+    fn new(depth: usize) -> Self {
+        Self {
+            valid_pixel_count: 0,
+            z_min: f64::INFINITY,
+            z_max: f64::NEG_INFINITY,
+            min_values: vec![f64::INFINITY; depth],
+            max_values: vec![f64::NEG_INFINITY; depth],
+        }
+    }
+
+    fn observe_value(&mut self, dim: usize, value: f64) {
+        self.z_min = self.z_min.min(value);
+        self.z_max = self.z_max.max(value);
+        self.min_values[dim] = self.min_values[dim].min(value);
+        self.max_values[dim] = self.max_values[dim].max(value);
+    }
+}
+
+struct FinishedStatistics {
+    valid_pixel_count: u32,
+    z_min: f64,
+    z_max: f64,
+    min_values: Option<Vec<f64>>,
+    max_values: Option<Vec<f64>>,
+}
+
+impl FinishedStatistics {
+    fn uses_constant_body(&self) -> bool {
+        self.valid_pixel_count == 0
+            || self.z_min == self.z_max
+            || self
+                .min_values
+                .as_ref()
+                .zip(self.max_values.as_ref())
+                .is_some_and(|(mins, maxs)| mins == maxs)
+    }
+}
+
+fn finish_statistics(
+    mut statistics: SemanticStatistics,
+    encoded_no_data_value: Option<f64>,
+    no_data_by_depth: &[bool],
+) -> Result<FinishedStatistics> {
+    let valid_pixel_count = u32::try_from(statistics.valid_pixel_count)
+        .map_err(|_| Error::SizeOverflow("valid pixel count as u32"))?;
+    let mut z_min = statistics.z_min;
+    let mut z_max = statistics.z_max;
+    if let Some(no_data_value) = encoded_no_data_value {
+        z_min = z_min.min(no_data_value);
+        z_max = z_max.max(no_data_value);
+        for (dim, contains_no_data) in no_data_by_depth.iter().copied().enumerate() {
+            if contains_no_data {
+                statistics.min_values[dim] = statistics.min_values[dim].min(no_data_value);
+                statistics.max_values[dim] = statistics.max_values[dim].max(no_data_value);
+            }
+        }
+    }
+    if valid_pixel_count == 0 {
+        z_min = 0.0;
+        z_max = 0.0;
+    }
+
+    let (min_values, max_values) = if valid_pixel_count != 0 && z_min != z_max {
+        (Some(statistics.min_values), Some(statistics.max_values))
+    } else {
+        (None, None)
+    };
+    Ok(FinishedStatistics {
+        valid_pixel_count,
+        z_min,
+        z_max,
+        min_values,
+        max_values,
+    })
 }
 
 pub(super) fn prepare_band_set<'a, T: Sample>(
@@ -96,61 +182,42 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
         .map(|value| validate_and_coerce_no_data::<T>(value, data_type))
         .transpose()?;
     let mut mask = PreparedMask::from_kind(mask);
-    let mut huffman_histograms = HistogramBuilder::new(data_type, raster.width() as usize, depth)?;
-
-    let mut valid_pixel_count = 0usize;
-    let mut semantic_z_min = f64::INFINITY;
-    let mut semantic_z_max = f64::NEG_INFINITY;
-    let mut semantic_min_values = vec![f64::INFINITY; depth];
-    let mut semantic_max_values = vec![f64::NEG_INFINITY; depth];
+    let mut statistics = SemanticStatistics::new(depth);
     let mut no_data_by_depth = vec![false; depth];
     let mut has_mixed_no_data = false;
-    let mut pixel_values = Vec::with_capacity(depth);
-
-    for pixel in 0..pixel_count {
-        if !pixel_is_valid(mask.data(), pixel) {
-            continue;
-        }
-
-        pixel_values.clear();
-        let mut no_data_count = 0usize;
-        for dim in 0..depth {
-            let value = raster.sample(pixel, dim).to_f64();
-            if !value.is_finite() {
-                return Err(Error::InvalidArgument(
-                    "valid raster samples must be finite",
-                ));
+    if let Some(no_data_value) = input_no_data_value {
+        let mut pixel_values = Vec::with_capacity(depth);
+        for pixel in 0..pixel_count {
+            if !pixel_is_valid(mask.data(), pixel) {
+                continue;
             }
-            if input_no_data_value == Some(value) {
-                no_data_count += 1;
+
+            pixel_values.clear();
+            let mut no_data_count = 0usize;
+            for dim in 0..depth {
+                let value = raster.sample(pixel, dim).to_f64();
+                validate_sample(value)?;
+                no_data_count += usize::from(value == no_data_value);
+                pixel_values.push(value);
             }
-            pixel_values.push(value);
-        }
 
-        if no_data_count == depth {
-            mask.derive(pixel_count)?[pixel] = 0;
-            continue;
-        }
+            if no_data_count == depth {
+                mask.derive(pixel_count)?[pixel] = 0;
+                continue;
+            }
 
-        valid_pixel_count += 1;
-        has_mixed_no_data |= no_data_count != 0;
-        if let Some(histograms) = huffman_histograms.as_mut() {
-            histograms.observe(pixel, mask.data(), &pixel_values)?;
-        }
-        for (dim, &value) in pixel_values.iter().enumerate() {
-            if input_no_data_value == Some(value) {
-                no_data_by_depth[dim] = true;
-            } else {
-                semantic_z_min = semantic_z_min.min(value);
-                semantic_z_max = semantic_z_max.max(value);
-                semantic_min_values[dim] = semantic_min_values[dim].min(value);
-                semantic_max_values[dim] = semantic_max_values[dim].max(value);
+            statistics.valid_pixel_count += 1;
+            has_mixed_no_data |= no_data_count != 0;
+            for (dim, &value) in pixel_values.iter().enumerate() {
+                if value == no_data_value {
+                    no_data_by_depth[dim] = true;
+                } else {
+                    statistics.observe_value(dim, value);
+                }
             }
         }
     }
 
-    let valid_pixel_count = u32::try_from(valid_pixel_count)
-        .map_err(|_| Error::SizeOverflow("valid pixel count as u32"))?;
     let mut max_z_error = effective_max_z_error(data_type, options.max_z_error);
     let original_no_data_value = has_mixed_no_data.then_some(options.no_data_value).flatten();
     let mut encoded_no_data_value = has_mixed_no_data.then_some(input_no_data_value).flatten();
@@ -158,66 +225,112 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
         (max_z_error, *no_data_value) = resolve_no_data_encoding::<T>(
             data_type,
             *no_data_value,
-            semantic_z_min,
-            semantic_z_max,
+            statistics.z_min,
+            statistics.z_max,
             max_z_error,
         );
     }
 
-    let mut z_min = semantic_z_min;
-    let mut z_max = semantic_z_max;
-    if let Some(no_data_value) = encoded_no_data_value {
-        z_min = z_min.min(no_data_value);
-        z_max = z_max.max(no_data_value);
-        for dim in 0..depth {
-            if no_data_by_depth[dim] {
-                semantic_min_values[dim] = semantic_min_values[dim].min(no_data_value);
-                semantic_max_values[dim] = semantic_max_values[dim].max(no_data_value);
-            }
-        }
-    }
-    if valid_pixel_count == 0 {
-        z_min = 0.0;
-        z_max = 0.0;
-    }
-
-    let (min_values, max_values) = if valid_pixel_count != 0 && z_min != z_max {
-        (Some(semantic_min_values), Some(semantic_max_values))
+    let mut statistics = Some(statistics);
+    let mut finished_statistics = if input_no_data_value.is_some() {
+        Some(finish_statistics(
+            statistics.take().ok_or(Error::Internal(
+                "semantic statistics were already finalized",
+            ))?,
+            encoded_no_data_value,
+            &no_data_by_depth,
+        )?)
     } else {
-        (None, None)
+        None
     };
-    let huffman_histograms = if encoded_no_data_value != input_no_data_value {
+    let skip_tiling = finished_statistics
+        .as_ref()
+        .is_some_and(FinishedStatistics::uses_constant_body);
+    let mut huffman_histograms = if !skip_tiling && encoded_no_data_value == input_no_data_value {
+        HistogramBuilder::new(data_type, raster.width() as usize, depth)?
+    } else {
+        None
+    };
+    let tiling = if skip_tiling {
         None
     } else {
-        huffman_histograms.map(HistogramBuilder::finish)
+        let remapped_raster =
+            RemappedRaster::new(raster, original_no_data_value, encoded_no_data_value);
+        Some(plan_tiled_body(
+            remapped_raster,
+            mask.data(),
+            TilingOptions {
+                width: raster.width(),
+                height: raster.height(),
+                depth: raster.depth(),
+                data_type,
+                max_z_error,
+                micro_block_size: options.micro_block_size,
+            },
+            |pixel, values| {
+                if let Some(statistics) = statistics.as_mut() {
+                    statistics.valid_pixel_count += 1;
+                    for (dim, &value) in values.iter().enumerate() {
+                        validate_sample(value)?;
+                        statistics.observe_value(dim, value);
+                    }
+                } else {
+                    for &value in values {
+                        validate_sample(value)?;
+                    }
+                }
+                if let Some(histograms) = huffman_histograms.as_mut() {
+                    histograms.observe(pixel, mask.data(), values)?;
+                }
+                Ok(())
+            },
+        )?)
     };
+    if finished_statistics.is_none() {
+        finished_statistics = Some(finish_statistics(
+            statistics
+                .take()
+                .ok_or(Error::Internal("semantic statistics are missing"))?,
+            encoded_no_data_value,
+            &no_data_by_depth,
+        )?);
+    }
+    let finished_statistics =
+        finished_statistics.ok_or(Error::Internal("semantic statistics were not finalized"))?;
+    let huffman_histograms = huffman_histograms.map(HistogramBuilder::finish);
 
-    let mut analysis = RasterAnalysis {
+    let analysis = RasterAnalysis {
         data_type,
         width: raster.width(),
         height: raster.height(),
         depth: raster.depth(),
-        valid_pixel_count,
+        valid_pixel_count: finished_statistics.valid_pixel_count,
         max_z_error,
         micro_block_size: options.micro_block_size,
-        z_min,
-        z_max,
+        z_min: finished_statistics.z_min,
+        z_max: finished_statistics.z_max,
         encoded_no_data_value,
         original_no_data_value,
-        min_values,
-        max_values,
+        min_values: finished_statistics.min_values,
+        max_values: finished_statistics.max_values,
         huffman_histograms,
-        plan: EncodePlan {
-            version: VERSION_4,
-            body: BodyPlan::Constant,
-        },
     };
-    analysis.plan = plan_raster(
-        RemappedRaster::new(raster, &analysis),
-        mask.data(),
-        &analysis,
-    )?;
-    Ok(PreparedBand { mask, analysis })
+    let plan = select_encode_plan(&analysis, tiling)?;
+    Ok(PreparedBand {
+        mask,
+        analysis,
+        plan,
+    })
+}
+
+fn validate_sample(value: f64) -> Result<()> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(
+            "valid raster samples must be finite",
+        ))
+    }
 }
 
 fn resolve_no_data_encoding<T: Sample>(
