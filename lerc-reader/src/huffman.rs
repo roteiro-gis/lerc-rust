@@ -186,7 +186,7 @@ fn read_huffman_tree(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<Huffman
 
     let mut code_table: Vec<Option<(u8, u32)>> = vec![None; size];
     for i in i0..i1 {
-        let j = if i < size { i } else { i - size };
+        let j = i % size;
         let bit_len = code_lengths[i - i0];
         if !bit_len.is_finite()
             || bit_len.fract() != 0.0
@@ -205,8 +205,11 @@ fn read_huffman_tree(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<Huffman
         bit_pos: 0,
     };
 
-    for entry in code_table.iter_mut().flatten() {
-        if entry.0 > 0 {
+    for i in i0..i1 {
+        let entry = code_table[i % size]
+            .as_mut()
+            .ok_or_else(|| Error::invalid_blob("Huffman range is missing a code-table entry"))?;
+        if entry.0 != 0 {
             entry.1 = stream.peek_bits(entry.0 as usize)?;
             stream.advance(entry.0 as usize)?;
         }

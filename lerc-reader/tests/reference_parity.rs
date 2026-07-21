@@ -95,6 +95,7 @@ fn metadata_matches_liblerc_for_interoperability_fixtures() {
             FixtureKind::BandSetU8,
             3usize,
         ),
+        ("liblerc-v4-u8-huffman.lerc2", FixtureKind::U8, 1usize),
         ("esri_js_sanity_u8_3d.csv", FixtureKind::U8, 1usize),
     ];
 
@@ -209,6 +210,7 @@ fn decoded_pixels_and_masks_match_liblerc_hashes() {
         ("world.lerc1", FixtureKind::F32),
         ("california_400_400_1_float.lerc2", FixtureKind::F32),
         ("bluemarble_256_256_3_byte.lerc2", FixtureKind::BandSetU8),
+        ("liblerc-v4-u8-huffman.lerc2", FixtureKind::U8),
         ("esri_js_sanity_u8_3d.csv", FixtureKind::U8),
     ];
 
