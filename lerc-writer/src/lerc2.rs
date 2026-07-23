@@ -23,7 +23,7 @@ use mask::{
 };
 use options::validate as validate_encode_options;
 pub use options::EncodeOptions;
-use tiles::{plan as plan_tiled_body, write as write_tiled_body, TileScratch, TilingPlan};
+use tiles::{write as write_tiled_body, TileScratch, TilingPlan};
 
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
 const VERSION_4: i32 = 4;
@@ -186,16 +186,27 @@ struct RemappedRaster<T: Sample, R: RasterSource<T>> {
 }
 
 impl<T: Sample, R: RasterSource<T>> RemappedRaster<T, R> {
-    fn new(raster: R, analysis: &RasterAnalysis) -> Self {
-        let no_data_mapping = analysis
-            .original_no_data_value
-            .zip(analysis.encoded_no_data_value)
+    fn new(
+        raster: R,
+        original_no_data_value: Option<f64>,
+        encoded_no_data_value: Option<f64>,
+    ) -> Self {
+        let no_data_mapping = original_no_data_value
+            .zip(encoded_no_data_value)
             .map(|(original, encoded)| (T::from_f64(original), T::from_f64(encoded)))
             .filter(|(original, encoded)| original.to_f64() != encoded.to_f64());
         Self {
             raster,
             no_data_mapping,
         }
+    }
+
+    fn from_analysis(raster: R, analysis: &RasterAnalysis) -> Self {
+        Self::new(
+            raster,
+            analysis.original_no_data_value,
+            analysis.encoded_no_data_value,
+        )
     }
 }
 
@@ -244,7 +255,12 @@ pub fn encoded_len_upper_bound<T: Sample>(
 
     let mask = mask.map_or(MaskKind::None, |mask| MaskKind::Explicit(mask.data()));
     let prepared = prepare_single_raster(raster, mask, options)?;
-    encoded_len_upper_bound_from_analysis(raster, &prepared.mask, &prepared.analysis)
+    encoded_len_upper_bound_from_analysis(
+        raster,
+        &prepared.mask,
+        &prepared.analysis,
+        &prepared.plan,
+    )
 }
 
 /// Returns a conservative output-buffer size for a concatenated band set.
@@ -272,6 +288,7 @@ pub fn encoded_band_set_len_upper_bound<T: Sample>(
                 band,
                 &prepared.mask,
                 &prepared.analysis,
+                &prepared.plan,
             )?)
             .ok_or(Error::SizeOverflow("encoded band set size"))?;
     }
@@ -293,10 +310,20 @@ pub fn encode<T: Sample>(
 
     let mask = mask.map_or(MaskKind::None, |mask| MaskKind::Explicit(mask.data()));
     let prepared = prepare_single_raster(raster, mask, options)?;
-    let upper_bound =
-        encoded_len_upper_bound_from_analysis(raster, &prepared.mask, &prepared.analysis)?;
+    let upper_bound = encoded_len_upper_bound_from_analysis(
+        raster,
+        &prepared.mask,
+        &prepared.analysis,
+        &prepared.plan,
+    )?;
     let mut out = vec![0u8; upper_bound];
-    let written = encode_into_with_analysis(raster, &prepared.mask, &prepared.analysis, &mut out)?;
+    let written = encode_into_with_analysis(
+        raster,
+        &prepared.mask,
+        &prepared.analysis,
+        &prepared.plan,
+        &mut out,
+    )?;
     out.truncate(written);
     Ok(out)
 }
@@ -329,6 +356,7 @@ pub fn encode_band_set<T: Sample>(
                 band,
                 &prepared.mask,
                 &prepared.analysis,
+                &prepared.plan,
             )?)
             .ok_or(Error::SizeOverflow("encoded band set size"))?;
     }
@@ -357,7 +385,13 @@ pub fn encode_into<T: Sample>(
 
     let mask = mask.map_or(MaskKind::None, |mask| MaskKind::Explicit(mask.data()));
     let prepared = prepare_single_raster(raster, mask, options)?;
-    encode_into_with_analysis(raster, &prepared.mask, &prepared.analysis, out)
+    encode_into_with_analysis(
+        raster,
+        &prepared.mask,
+        &prepared.analysis,
+        &prepared.plan,
+        out,
+    )
 }
 
 /// Encodes a multi-band raster directly into a caller-provided byte slice.
@@ -384,6 +418,7 @@ fn encoded_len_upper_bound_from_analysis<T: Sample, R: RasterSource<T>>(
     raster: R,
     mask: &PreparedMask<'_>,
     analysis: &RasterAnalysis,
+    plan: &EncodePlan,
 ) -> Result<usize> {
     let pixel_count = raster.pixel_count()?;
     validate_mask_slice(mask.data(), pixel_count)?;
@@ -403,11 +438,7 @@ fn encoded_len_upper_bound_from_analysis<T: Sample, R: RasterSource<T>>(
     {
         0
     } else {
-        body_prefix_len(
-            raster.data_type(),
-            analysis.max_z_error,
-            analysis.plan.version,
-        )
+        body_prefix_len(raster.data_type(), analysis.max_z_error, plan.version)
     };
     let tile_header_len = num_tiles
         .checked_mul(depth)
@@ -417,7 +448,7 @@ fn encoded_len_upper_bound_from_analysis<T: Sample, R: RasterSource<T>>(
         .and_then(|len| len.checked_mul(byte_len))
         .ok_or(Error::SizeOverflow("raw tile payload byte count"))?;
 
-    header_len(analysis.plan.version)
+    header_len(plan.version)
         .checked_add(MASK_COUNT_LEN)
         .and_then(|len| len.checked_add(mask_len))
         .and_then(|len| len.checked_add(range_len))
@@ -431,6 +462,7 @@ fn encode_into_with_analysis<T: Sample, R: RasterSource<T>>(
     raster: R,
     mask: &PreparedMask<'_>,
     analysis: &RasterAnalysis,
+    plan: &EncodePlan,
     out: &mut [u8],
 ) -> Result<usize> {
     let pixel_count = raster.pixel_count()?;
@@ -438,7 +470,7 @@ fn encode_into_with_analysis<T: Sample, R: RasterSource<T>>(
 
     let mut sink = SliceSink::new(out);
     let mut scratch = TileScratch::default();
-    write_header_prefix(&mut sink, analysis)?;
+    write_header_prefix(&mut sink, analysis, plan.version)?;
     write_u32(
         &mut sink,
         u32::try_from(mask.payload().len())
@@ -449,9 +481,10 @@ fn encode_into_with_analysis<T: Sample, R: RasterSource<T>>(
     write_body(
         &mut sink,
         &mut scratch,
-        RemappedRaster::new(raster, analysis),
+        RemappedRaster::from_analysis(raster, analysis),
         mask.data(),
         analysis,
+        plan,
     )?;
 
     let written = sink.len();
@@ -486,6 +519,7 @@ fn encode_band_set_into_with_analysis<T: Sample>(
             band,
             &prepared.mask,
             &prepared.analysis,
+            &prepared.plan,
             &mut out[offset..],
         )?;
         offset = offset
@@ -501,20 +535,19 @@ fn write_body<T: Sample, R: RasterSource<T>>(
     raster: R,
     mask: Option<&[u8]>,
     analysis: &RasterAnalysis,
+    plan: &EncodePlan,
 ) -> Result<()> {
-    match &analysis.plan.body {
+    match &plan.body {
         BodyPlan::Constant | BodyPlan::PerDepthConstant => Ok(()),
         BodyPlan::OneSweep => write_one_sweep_body(sink, raster, mask),
-        BodyPlan::Tiled(plan) => write_tiled_body(sink, scratch, raster, mask, analysis, plan),
+        BodyPlan::Tiled(tiling) => {
+            write_tiled_body(sink, scratch, raster, mask, analysis, plan.version, tiling)
+        }
         BodyPlan::Huffman(plan) => write_huffman_body(sink, raster, mask, plan),
     }
 }
 
-fn plan_raster<T: Sample, R: RasterSource<T>>(
-    raster: R,
-    mask: Option<&[u8]>,
-    analysis: &RasterAnalysis,
-) -> Result<EncodePlan> {
+fn select_encode_plan(analysis: &RasterAnalysis, tiling: Option<TilingPlan>) -> Result<EncodePlan> {
     if analysis.valid_pixel_count == 0 || analysis.z_min == analysis.z_max {
         return Ok(EncodePlan {
             version: version_with_no_data(analysis, VERSION_4),
@@ -528,7 +561,10 @@ fn plan_raster<T: Sample, R: RasterSource<T>>(
         });
     }
 
-    let tiling = plan_tiled_body(raster, mask, analysis)?;
+    let tiling = tiling.ok_or(Error::Internal(
+        "non-constant raster is missing its fused tile plan",
+    ))?;
+
     let mut best_version = tiling.version;
     let mut best_non_one_len = tiling
         .data_len
@@ -621,4 +657,138 @@ fn version_with_no_data(analysis: &RasterAnalysis, version: i32) -> i32 {
 
 fn tile_header(check_code: u8, encoding: u8) -> u8 {
     ((check_code & 15) << 2) | (encoding & 3)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct CountingRaster<'a, T> {
+        width: u32,
+        height: u32,
+        depth: u32,
+        values: &'a [T],
+        reads: &'a Cell<usize>,
+    }
+
+    impl<T: Sample> RasterSource<T> for CountingRaster<'_, T> {
+        fn width(self) -> u32 {
+            self.width
+        }
+
+        fn height(self) -> u32 {
+            self.height
+        }
+
+        fn depth(self) -> u32 {
+            self.depth
+        }
+
+        fn data_type(self) -> DataType {
+            T::DATA_TYPE
+        }
+
+        fn pixel_count(self) -> Result<usize> {
+            (self.width as usize)
+                .checked_mul(self.height as usize)
+                .ok_or(Error::SizeOverflow("counting raster pixel count"))
+        }
+
+        fn sample(self, pixel: usize, dim: usize) -> T {
+            self.reads.set(self.reads.get() + 1);
+            self.values[pixel * self.depth as usize + dim]
+        }
+    }
+
+    #[test]
+    fn fused_planner_reads_each_valid_sample_once() {
+        const WIDTH: u32 = 17;
+        const HEIGHT: u32 = 9;
+        const DEPTH: u32 = 3;
+        let values: Vec<u8> = (0..(WIDTH * HEIGHT * DEPTH) as usize)
+            .map(|index| ((index * 17 + index / 7) % 251) as u8)
+            .collect();
+        let mask: Vec<u8> = (0..(WIDTH * HEIGHT) as usize)
+            .map(|pixel| u8::from(pixel % 4 != 0))
+            .collect();
+        let reads = Cell::new(0);
+        let raster = CountingRaster {
+            width: WIDTH,
+            height: HEIGHT,
+            depth: DEPTH,
+            values: &values,
+            reads: &reads,
+        };
+
+        prepare_single_raster(raster, MaskKind::Explicit(&mask), EncodeOptions::new()).unwrap();
+
+        let valid_samples = mask.iter().filter(|&&valid| valid != 0).count() * DEPTH as usize;
+        assert_eq!(reads.get(), valid_samples);
+    }
+
+    #[test]
+    fn single_depth_encoding_uses_two_sample_passes() {
+        const WIDTH: u32 = 17;
+        const HEIGHT: u32 = 9;
+        let values: Vec<u16> = (0..(WIDTH * HEIGHT) as usize)
+            .map(|index| ((index * 103 + index / 5) % 4093) as u16)
+            .collect();
+        let reads = Cell::new(0);
+        let raster = CountingRaster {
+            width: WIDTH,
+            height: HEIGHT,
+            depth: 1,
+            values: &values,
+            reads: &reads,
+        };
+        let prepared = prepare_single_raster(raster, MaskKind::None, EncodeOptions::new()).unwrap();
+        let upper_bound = encoded_len_upper_bound_from_analysis(
+            raster,
+            &prepared.mask,
+            &prepared.analysis,
+            &prepared.plan,
+        )
+        .unwrap();
+        let mut out = vec![0; upper_bound];
+
+        encode_into_with_analysis(
+            raster,
+            &prepared.mask,
+            &prepared.analysis,
+            &prepared.plan,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(reads.get(), values.len() * 2);
+    }
+
+    #[test]
+    fn all_no_data_raster_stops_after_the_semantic_pass() {
+        const WIDTH: u32 = 17;
+        const HEIGHT: u32 = 9;
+        const DEPTH: u32 = 2;
+        let values = vec![u8::MAX; (WIDTH * HEIGHT * DEPTH) as usize];
+        let reads = Cell::new(0);
+        let raster = CountingRaster {
+            width: WIDTH,
+            height: HEIGHT,
+            depth: DEPTH,
+            values: &values,
+            reads: &reads,
+        };
+
+        let prepared = prepare_single_raster(
+            raster,
+            MaskKind::None,
+            EncodeOptions::new().with_no_data_value(u8::MAX as f64),
+        )
+        .unwrap();
+
+        assert_eq!(reads.get(), values.len());
+        assert!(matches!(prepared.plan.body, BodyPlan::Constant));
+    }
 }

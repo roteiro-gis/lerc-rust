@@ -6,9 +6,13 @@ const FIXED_HEADER_LEN_V4_V5: usize = 66;
 const FIXED_HEADER_LEN_V6: usize = 90;
 pub(super) const MASK_COUNT_LEN: usize = 4;
 
-pub(super) fn write_prefix(sink: &mut impl ByteSink, analysis: &RasterAnalysis) -> Result<()> {
+pub(super) fn write_prefix(
+    sink: &mut impl ByteSink,
+    analysis: &RasterAnalysis,
+    version: i32,
+) -> Result<()> {
     sink.extend_from_slice(MAGIC_LERC2)?;
-    write_i32(sink, analysis.plan.version)?;
+    write_i32(sink, version)?;
     write_u32(sink, 0)?;
     write_u32(sink, analysis.height)?;
     write_u32(sink, analysis.width)?;
@@ -17,7 +21,7 @@ pub(super) fn write_prefix(sink: &mut impl ByteSink, analysis: &RasterAnalysis) 
     write_i32(sink, analysis.micro_block_size as i32)?;
     write_i32(sink, 0)?;
     write_i32(sink, analysis.data_type.code() as i32)?;
-    if analysis.plan.version >= VERSION_6 {
+    if version >= VERSION_6 {
         write_i32(sink, 0)?;
         sink.push(u8::from(analysis.original_no_data_value.is_some()))?;
         sink.push(0)?;
@@ -27,7 +31,7 @@ pub(super) fn write_prefix(sink: &mut impl ByteSink, analysis: &RasterAnalysis) 
     write_f64(sink, analysis.max_z_error)?;
     write_f64(sink, analysis.z_min)?;
     write_f64(sink, analysis.z_max)?;
-    if analysis.plan.version >= VERSION_6 {
+    if version >= VERSION_6 {
         write_f64(sink, analysis.encoded_no_data_value.unwrap_or(0.0))?;
         write_f64(sink, analysis.original_no_data_value.unwrap_or(0.0))?;
     }
