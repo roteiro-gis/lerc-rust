@@ -7,8 +7,12 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[features]
+default = ["fuzzing"]
+fuzzing = ["dep:libfuzzer-sys"]
+
 [dependencies]
-libfuzzer-sys = "0.4"
+libfuzzer-sys = { version = "0.4", optional = true }
 lerc-core = { path = "../lerc-core" }
 lerc-reader = { path = "../lerc-reader" }
 lerc-writer = { path = "../lerc-writer" }
@@ -19,6 +23,7 @@ path = "fuzz_targets/headers.rs"
 test = false
 doc = false
 bench = false
+required-features = ["fuzzing"]
 
 [[bin]]
 name = "mask_rle"
@@ -26,6 +31,7 @@ path = "fuzz_targets/mask_rle.rs"
 test = false
 doc = false
 bench = false
+required-features = ["fuzzing"]
 
 [[bin]]
 name = "huffman_tables"
@@ -33,6 +39,7 @@ path = "fuzz_targets/huffman_tables.rs"
 test = false
 doc = false
 bench = false
+required-features = ["fuzzing"]
 
 [[bin]]
 name = "bitstuff_blocks"
@@ -40,6 +47,7 @@ path = "fuzz_targets/bitstuff_blocks.rs"
 test = false
 doc = false
 bench = false
+required-features = ["fuzzing"]
 
 [[bin]]
 name = "lerc2_bitstuff_blocks"
@@ -47,6 +55,7 @@ path = "fuzz_targets/lerc2_bitstuff_blocks.rs"
 test = false
 doc = false
 bench = false
+required-features = ["fuzzing"]
 
 [[bin]]
 name = "concatenated"
@@ -54,6 +63,7 @@ path = "fuzz_targets/concatenated.rs"
 test = false
 doc = false
 bench = false
+required-features = ["fuzzing"]
 
 [[bin]]
 name = "encode_roundtrip"
@@ -61,3 +71,4 @@ path = "fuzz_targets/encode_roundtrip.rs"
 test = false
 doc = false
 bench = false
+required-features = ["fuzzing"]

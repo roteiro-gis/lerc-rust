@@ -180,5 +180,8 @@ jobs:
           RUSTFLAGS: ""
         run: cargo +1.91.0 install cargo-fuzz --version 0.13.1 --locked
       - uses: Swatinem/rust-cache@v2
+      - name: Verify headers corpus regressions
+        if: matrix.target == 'headers'
+        run: cargo +1.91.0 test --manifest-path fuzz/Cargo.toml --no-default-features --locked
       - name: Run smoke fuzzing
         run: cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time="${FUZZ_SECONDS}" -dict=fuzz/dictionaries/lerc.dict
