@@ -3,7 +3,7 @@
 ## Unreleased
 
 - fix Lerc1 remainder-tile decoding and inspection for legal grids whose final tile is larger than the base tile, and replace unchecked reader size arithmetic
-- align integer zero-error encoding and multidimensional no-data filtering/remapping with libLerc semantics; constrain micro-block sizes to 2 through 64
+- align integer zero-error encoding and multidimensional no-data filtering/remapping with libLerc semantics; constrain micro-block sizes to the libLerc-compatible range 2 through 32
 - fix signed reduced offsets and absolute-range clamping for bit-stuffed v5 difference tiles
 - redesign the public error taxonomy to distinguish caller arguments, corrupt blobs, size overflow, checksum failure, internal invariants, and stream I/O
 - split the writer into analysis, headers, masks, tiles, bit-stuffing, Huffman, and options modules; remove the duplicate band-materialization crate and duplicate owned decode walks
@@ -11,7 +11,14 @@
 - make `ndarray` optional, add complete layout-aware `f64` ndarray APIs and borrowing conversions, and add the optional deterministic `rayon` band decoder
 - add exact one-blob and EOF-terminated band-set decoding from `std::io::Read`, plus configurable Lerc1 range inspection
 - add encoded-byte snapshots, all-datatype property tests, expanded no-data/type fuzzing, workspace lints, public API documentation, and broader CI coverage
-- bump the coordinated workspace crates to 0.5.0; `EncodeOptions` and `Error` are now non-exhaustive and use forward-compatible builders/variants
+- reject Lerc2 masks whose decoded cardinality disagrees with the header, noncanonical all-invalid mask payloads, and micro-block sizes unsupported by libLerc
+- respect declared Lerc1 pixel-section boundaries instead of parsing into following bytes
+- emit the remaining-band count in v6 band sets and make encoded-size queries exact so undersized output buffers fail before mutation
+- require native output types in direct band-set decode APIs except for explicit `f64` promotion
+- make `BandSetInfo` and `DecodedBandSet` construction-safe through validated constructors and read-only accessors
+- report allocation reservation failures without aborting primary decode, materialization, streaming, or encode output paths, and eliminate padded bit-stuffed scratch copies
+- test the minimal and Rayon-only reader configurations independently from the optional ndarray integration
+- prepare the coordinated workspace crates for 0.5.0; keep these changes under Unreleased until the release is tagged
 
 ## 0.4.3 - 2026-06-25
 

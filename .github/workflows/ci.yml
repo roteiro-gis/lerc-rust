@@ -41,8 +41,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features --locked
 
-      - name: Check minimal reader features
-        run: cargo check -p lerc-reader --no-default-features --locked
+      - name: Test minimal reader features
+        run: cargo test -p lerc-reader --no-default-features --locked
+
+      - name: Test Rayon without ndarray
+        run: cargo test -p lerc-reader --no-default-features --features rayon --locked
 
       - name: Check documentation
         env:
@@ -64,7 +67,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run locked workspace tests
-        run: cargo +1.77.0 test --workspace --locked
+        run: cargo +1.77.0 test --workspace --all-features --locked
 
       - name: Guard dependency MSRV drift
         env:

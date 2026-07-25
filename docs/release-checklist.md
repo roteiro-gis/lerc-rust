@@ -6,16 +6,18 @@ Use this checklist for coordinated `lerc-rust` workspace releases.
 
 1. Update `[workspace.package].version` in the root `Cargo.toml`.
 2. Update all internal dependency pins to the same version.
-3. Update `CHANGELOG.md` with the release date and user-facing changes.
+3. Keep user-facing changes under `Unreleased` while preparing the release.
+   When tagging, rename that section to the version and actual release date.
 4. Run the standard workspace checks:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
-cargo check -p lerc-reader --no-default-features --locked
+cargo test -p lerc-reader --no-default-features --locked
+cargo test -p lerc-reader --no-default-features --features rayon --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-rustup run 1.77.0 cargo test --workspace --locked
+rustup run 1.77.0 cargo test --workspace --all-features --locked
 cargo deny check
 cargo audit
 ./scripts/run-reference-parity.sh

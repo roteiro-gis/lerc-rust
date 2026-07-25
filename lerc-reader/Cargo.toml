@@ -11,18 +11,18 @@ readme = "../README.md"
 documentation = "https://docs.rs/lerc-reader"
 keywords = ["lerc", "raster", "compression", "gis", "geospatial"]
 categories = ["compression", "science"]
+exclude = ["benches/**", "tests/**"]
 
 [lints]
 workspace = true
 
 [features]
 default = ["ndarray"]
-ndarray = ["dep:half", "dep:ndarray"]
+ndarray = ["dep:ndarray"]
 rayon = ["dep:rayon"]
 
 [dependencies]
 lerc-core = { version = "0.5.0", path = "../lerc-core" }
-half = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
 rayon = { version = "=1.10.0", optional = true }
 

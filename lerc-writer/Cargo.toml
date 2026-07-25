@@ -11,6 +11,7 @@ readme = "../README.md"
 documentation = "https://docs.rs/lerc-writer"
 keywords = ["lerc", "raster", "compression", "gis", "geospatial"]
 categories = ["compression", "science"]
+exclude = ["benches/**", "tests/**"]
 
 [lints]
 workspace = true
