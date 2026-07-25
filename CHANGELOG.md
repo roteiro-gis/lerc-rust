@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-## 0.5.0 - 2026-07-10
-
 - fix Lerc1 remainder-tile decoding and inspection for legal grids whose final tile is larger than the base tile, and replace unchecked reader size arithmetic
 - align integer zero-error encoding and multidimensional no-data filtering/remapping with libLerc semantics; constrain micro-block sizes to 2 through 64
 - fix signed reduced offsets and absolute-range clamping for bit-stuffed v5 difference tiles

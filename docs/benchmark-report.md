@@ -26,7 +26,6 @@ The current suite measures:
 - masked single-band Lerc1 decode (`world.lerc1`)
 - masked single-band Lerc2 decode (`california_400_400_1_float.lerc2`)
 - concatenated multi-band Lerc2 decode (`bluemarble_256_256_3_byte.lerc2`)
-- serial and feature-gated Rayon band-set decode paths
 - writer analysis/planning/emission after cached mask, diff-plan, and bit-packer optimizations
 
 Each benchmark validates decoded byte-hash parity against `libLerc` before

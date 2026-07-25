@@ -412,7 +412,7 @@ impl BandSetInfo {
         }
     }
 
-    /// Returns `[band, height, width]` when masks differ, otherwise `[height, width]`.
+    /// Returns `[height, width]` for one band, or `[height, width, band]` for multiple bands.
     pub fn band_mask_shape(&self) -> Vec<usize> {
         let height = self.height() as usize;
         let width = self.width() as usize;
