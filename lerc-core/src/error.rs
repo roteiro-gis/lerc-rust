@@ -38,6 +38,8 @@ pub enum Error {
     InvalidBlob(Cow<'static, str>),
     /// Checked size arithmetic overflowed.
     SizeOverflow(&'static str),
+    /// Memory for a validated allocation could not be reserved.
+    AllocationFailed(&'static str),
     /// An internal codec invariant was violated.
     Internal(&'static str),
     /// Reading from an external stream failed.
@@ -95,6 +97,9 @@ impl fmt::Display for Error {
             Self::InvalidArgument(reason) => write!(f, "invalid argument: {reason}"),
             Self::InvalidBlob(reason) => write!(f, "invalid LERC blob: {reason}"),
             Self::SizeOverflow(context) => write!(f, "size overflow while computing {context}"),
+            Self::AllocationFailed(context) => {
+                write!(f, "unable to reserve memory for {context}")
+            }
             Self::Internal(reason) => write!(f, "internal codec invariant failed: {reason}"),
             Self::Io { message, .. } => write!(f, "I/O error: {message}"),
             Self::ChecksumMismatch { expected, actual } => {

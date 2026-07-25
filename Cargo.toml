@@ -13,7 +13,6 @@ homepage = "https://github.com/i-norden/lerc-rust"
 
 [workspace.dependencies]
 clap = { version = "=4.5.50", default-features = false, features = ["std"] }
-half = "=2.4.1"
 ndarray = "0.17"
 
 [workspace.lints.rust]

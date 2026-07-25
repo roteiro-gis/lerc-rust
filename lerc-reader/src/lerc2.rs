@@ -35,12 +35,18 @@ pub(crate) fn is_lerc2(blob: &[u8]) -> bool {
 pub(crate) fn inspect(blob: &[u8], inherited_mask: Option<&[u8]>) -> Result<BlobInfo> {
     let (parsed, mut cursor) = parse(blob)?;
     let mut info = parsed.info.clone();
-    if parsed.info.uses_external_mask() {
-        if let Some(mask) = inherited_mask {
-            validate_external_mask(&parsed.info, mask)?;
+    match parsed.info.mask_encoding {
+        MaskEncoding::External => {
+            if let Some(mask) = inherited_mask {
+                validate_external_mask(&parsed.info, mask)?;
+            }
         }
-    } else {
-        skip_mask(&mut cursor, &parsed)?;
+        MaskEncoding::Explicit => {
+            read_mask(&mut cursor, &parsed, None)?;
+        }
+        MaskEncoding::None | MaskEncoding::ImplicitAllInvalid => {
+            skip_mask(&mut cursor, &parsed)?;
+        }
     }
 
     read_public_depth_ranges(&mut cursor, &parsed, &mut info)?;
@@ -191,9 +197,9 @@ pub(crate) fn parse(blob: &[u8]) -> Result<(ParsedLerc2, Cursor<'_>)> {
             "width and height must be greater than zero",
         ));
     }
-    if micro_block_size <= 0 {
+    if !(1..=32).contains(&micro_block_size) {
         return Err(Error::InvalidHeader(
-            "micro block size must be greater than zero",
+            "micro block size must be in the range 1..=32",
         ));
     }
     if depth == 0 {
@@ -206,6 +212,11 @@ pub(crate) fn parse(blob: &[u8]) -> Result<(ParsedLerc2, Cursor<'_>)> {
     }
     if !raw_z_min.is_finite() || !raw_z_max.is_finite() {
         return Err(Error::InvalidHeader("z range values must be finite"));
+    }
+    if raw_z_min > raw_z_max {
+        return Err(Error::InvalidHeader(
+            "minimum encoded value must not exceed maximum",
+        ));
     }
     if encoded_no_data_value
         .into_iter()
@@ -295,6 +306,7 @@ pub(crate) fn parse(blob: &[u8]) -> Result<(ParsedLerc2, Cursor<'_>)> {
         valid_pixel_count,
         micro_block_size: micro_block_size as u32,
         blob_size,
+        remaining_band_count: n_blobs_more as u32,
         max_z_error,
         z_min,
         z_max,
@@ -334,11 +346,12 @@ fn infer_mask_encoding(
     }
 
     if num_valid == 0 {
-        return Ok(if mask_num_bytes == 0 {
-            MaskEncoding::ImplicitAllInvalid
-        } else {
-            MaskEncoding::Explicit
-        });
+        if mask_num_bytes != 0 {
+            return Err(Error::invalid_blob(
+                "all-invalid LERC blob unexpectedly contains mask bytes",
+            ));
+        }
+        return Ok(MaskEncoding::ImplicitAllInvalid);
     }
 
     Ok(if mask_num_bytes == 0 {
@@ -418,7 +431,14 @@ fn read_mask(
                 cursor.read_bytes(parsed.mask_num_bytes)?,
                 num_pixels.div_ceil(8),
             )?;
-            Ok(Some(unpack_mask_bitset(&bitset, num_pixels)?))
+            let mask = unpack_mask_bitset(&bitset, num_pixels)?;
+            let valid_pixel_count = mask.iter().filter(|&&value| value != 0).count();
+            if valid_pixel_count != info.valid_pixel_count as usize {
+                return Err(Error::invalid_blob(
+                    "decoded mask valid count does not match the Lerc2 header",
+                ));
+            }
+            Ok(Some(mask))
         }
     }
 }
@@ -489,6 +509,24 @@ fn read_depth_ranges(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<DepthRa
         .ok_or(Error::SizeOverflow("Lerc2 depth-range byte count"))?;
     let min_values = read_typed_values(cursor.read_bytes(range_bytes)?, info.data_type)?;
     let max_values = read_typed_values(cursor.read_bytes(range_bytes)?, info.data_type)?;
+    if min_values
+        .iter()
+        .chain(&max_values)
+        .any(|value| !value.is_finite())
+    {
+        return Err(Error::invalid_blob(
+            "Lerc2 per-depth range values must be finite",
+        ));
+    }
+    if min_values
+        .iter()
+        .zip(&max_values)
+        .any(|(min, max)| min > max)
+    {
+        return Err(Error::invalid_blob(
+            "Lerc2 per-depth minimum exceeds its maximum",
+        ));
+    }
     Ok(DepthRanges {
         min_values,
         max_values,

@@ -20,10 +20,19 @@ pub(crate) fn check_allocation<T>(len: usize, label: &'static str) -> Result<()>
 
 pub(crate) fn default_vec<T: Default + Clone>(len: usize, label: &'static str) -> Result<Vec<T>> {
     check_allocation::<T>(len, label)?;
-    Ok(vec![T::default(); len])
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| Error::AllocationFailed(label))?;
+    values.resize(len, T::default());
+    Ok(values)
 }
 
 pub(crate) fn vec_with_capacity<T>(len: usize, label: &'static str) -> Result<Vec<T>> {
     check_allocation::<T>(len, label)?;
-    Ok(Vec::with_capacity(len))
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| Error::AllocationFailed(label))?;
+    Ok(values)
 }

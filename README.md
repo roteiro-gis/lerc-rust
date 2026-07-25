@@ -127,7 +127,8 @@ blob-by-blob decoding from files, sockets, and other `std::io::Read` sources.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo check -p lerc-reader --no-default-features
+cargo test -p lerc-reader --no-default-features
+cargo test -p lerc-reader --no-default-features --features rayon
 ```
 
 For coordinated workspace publishes, see

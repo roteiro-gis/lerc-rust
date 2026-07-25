@@ -28,7 +28,7 @@ impl EncodeOptions {
         self
     }
 
-    /// Sets the square micro-block size. Supported values are 2 through 64.
+    /// Sets the square micro-block size. Supported values are 2 through 32.
     pub const fn with_micro_block_size(mut self, micro_block_size: u32) -> Self {
         self.micro_block_size = micro_block_size;
         self
@@ -59,9 +59,9 @@ pub(super) fn validate(options: EncodeOptions) -> Result<()> {
             "max_z_error must be finite and non-negative",
         ));
     }
-    if !(2..=64).contains(&options.micro_block_size) {
+    if !(2..=32).contains(&options.micro_block_size) {
         return Err(Error::InvalidArgument(
-            "micro_block_size must be in the range 2..=64",
+            "micro_block_size must be in the range 2..=32",
         ));
     }
     if options

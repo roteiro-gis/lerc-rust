@@ -1,6 +1,6 @@
 # Benchmark Report
 
-Last methodology update: 2026-07-10
+Last methodology update: 2026-07-24
 
 This report summarizes the current Criterion comparison suite for
 `lerc-reader` against Esri's official native `libLerc` decoder and records the
@@ -14,7 +14,7 @@ repo-level benchmark entry points that now include `lerc-writer`.
 - OS: macOS 13.0
 - Architecture: `arm64`
 - Rust toolchain: `rustc 1.92.0`
-- Reference environment: native `libLerc` v4.1.0 helper
+- Reference environment: native `libLerc` v4.1.1 helper
 
 These numbers reflect this host and should be treated as a local baseline, not
 as universal throughput claims.
@@ -71,7 +71,7 @@ Notes:
 
 The figures below are the last recorded fixed-host baseline (2026-04-02).
 They remain historical comparison points; run the commands above to measure
-the 0.5.0 implementation on the current host.
+the 0.5.0 release candidate on the current host.
 
 A 2026-07-10 local 0.5.0 writer smoke run on Apple Silicon recorded:
 

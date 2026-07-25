@@ -10,6 +10,7 @@ pub(super) fn write_prefix(
     sink: &mut impl ByteSink,
     analysis: &RasterAnalysis,
     version: i32,
+    remaining_bands: i32,
 ) -> Result<()> {
     sink.extend_from_slice(MAGIC_LERC2)?;
     write_i32(sink, version)?;
@@ -22,7 +23,7 @@ pub(super) fn write_prefix(
     write_i32(sink, 0)?;
     write_i32(sink, analysis.data_type.code() as i32)?;
     if version >= VERSION_6 {
-        write_i32(sink, 0)?;
+        write_i32(sink, remaining_bands)?;
         sink.push(u8::from(analysis.original_no_data_value.is_some()))?;
         sink.push(0)?;
         sink.push(0)?;

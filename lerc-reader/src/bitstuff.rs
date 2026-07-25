@@ -49,10 +49,10 @@ pub(crate) fn decode_bits(
             ));
         }
         let lut_data_bytes = packed_byte_len(num_bits, lut_bytes - 1)?;
-        let lut_words = words_from_padded(cursor.read_bytes(lut_data_bytes)?);
+        let lut_words = words_from_padded(cursor.read_bytes(lut_data_bytes)?)?;
         let lut_bits_per_element = bits_required(lut_bytes - 1);
         let stuffed_data_bytes = packed_byte_len(lut_bits_per_element, num_elements)?;
-        let stuffed_words = words_from_padded(cursor.read_bytes(stuffed_data_bytes)?);
+        let stuffed_words = words_from_padded(cursor.read_bytes(stuffed_data_bytes)?)?;
 
         let lut_values = if version >= 3 {
             unstuff_lut_v3(
@@ -110,7 +110,7 @@ pub(crate) fn decode_bits(
     }
 
     let stuffed_data_bytes = packed_byte_len(num_bits, num_elements)?;
-    let stuffed_words = words_from_padded(cursor.read_bytes(stuffed_data_bytes)?);
+    let stuffed_words = words_from_padded(cursor.read_bytes(stuffed_data_bytes)?)?;
     match (version >= 3, offset) {
         (true, Some(offset)) => unstuff_v3(
             &stuffed_words,

@@ -30,9 +30,11 @@ mod stream;
 mod types;
 
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 
-use lerc_core::{BandLayout, BandSetInfo, BlobInfo, Error, Result};
+use lerc_core::{BandLayout, BandSetInfo, BlobInfo, DataType, Error, Result};
 use materialize::BandSink;
 #[cfg(feature = "rayon")]
 use materialize::{copy_band_values_into_slice, PixelDataWriter};
@@ -180,25 +182,52 @@ pub fn get_band_count(blob: &[u8]) -> Result<usize> {
     let mut offset = 0usize;
     let mut count = 0usize;
     let mut lerc1_mask: Option<Vec<u8>> = None;
+    let mut lerc2_mask: Option<Vec<u8>> = None;
+    let mut declared_band_count: Option<usize> = None;
 
     while offset < blob.len() {
+        if declared_band_count == Some(count) {
+            return Err(Error::invalid_blob(
+                "Lerc2 v6 remaining-band count is smaller than the payload",
+            ));
+        }
         let slice = &blob[offset..];
-        let next_len = if lerc1::is_lerc1(slice) {
+        let info = if lerc1::is_lerc1(slice) {
             let parsed = lerc1::parse(slice, lerc1_mask.as_deref())?;
-            let next_len = parsed.info.blob_size;
             lerc1_mask = parsed.mask;
-            next_len
+            lerc2_mask = None;
+            parsed.info
         } else if lerc2::is_lerc2(slice) {
-            let (parsed, _) = lerc2::parse(slice)?;
-            parsed.info.blob_size
+            let (info, mask) = lerc2::inspect_with_mask(slice, lerc2_mask.as_deref())?;
+            lerc2_mask = mask;
+            lerc1_mask = None;
+            info
         } else {
             return Err(Error::InvalidMagic);
         };
 
-        offset = checked_next_offset(offset, next_len, blob.len())?;
+        if matches!(info.version, lerc_core::Version::Lerc2(version) if version >= 6) {
+            let declared = count
+                .checked_add(1)
+                .and_then(|count| count.checked_add(info.remaining_band_count as usize))
+                .ok_or(Error::SizeOverflow("declared Lerc2 band count"))?;
+            if declared_band_count.is_some_and(|previous| previous != declared) {
+                return Err(Error::invalid_blob(
+                    "Lerc2 v6 headers disagree about the remaining-band count",
+                ));
+            }
+            declared_band_count = Some(declared);
+        }
+
+        offset = checked_next_offset(offset, info.blob_size, blob.len())?;
         count += 1;
     }
 
+    if declared_band_count.is_some_and(|declared| declared != count) {
+        return Err(Error::invalid_blob(
+            "Lerc2 v6 remaining-band count exceeds the payload",
+        ));
+    }
     Ok(count)
 }
 
@@ -490,11 +519,7 @@ fn decode_band_set_with_lerc2_mask(
         band_masks.push(decoded.mask);
     }
 
-    Ok(DecodedBandSet {
-        info: BandSetInfo::new(infos)?,
-        bands,
-        band_masks,
-    })
+    DecodedBandSet::new(BandSetInfo::new(infos)?, bands, band_masks)
 }
 
 #[cfg(feature = "ndarray")]
@@ -762,6 +787,7 @@ fn decode_band_set_into_impl_with_info<T: Sample + BandElement>(
     band_info: &BandSetInfo,
     out: &mut [T],
 ) -> Result<BandSetInfo> {
+    validate_band_output_type::<T>(band_info)?;
     #[cfg(feature = "rayon")]
     {
         if band_info.band_count() > 1 {
@@ -769,6 +795,32 @@ fn decode_band_set_into_impl_with_info<T: Sample + BandElement>(
         }
     }
     decode_band_set_into_sequential(blob, layout, initial_mask, band_info, out)
+}
+
+fn validate_band_output_type<T: BandElement>(band_info: &BandSetInfo) -> Result<()> {
+    if T::KIND == BandElementKind::F64 {
+        return Ok(());
+    }
+    let expected = match T::KIND {
+        BandElementKind::I8 => DataType::I8,
+        BandElementKind::U8 => DataType::U8,
+        BandElementKind::I16 => DataType::I16,
+        BandElementKind::U16 => DataType::U16,
+        BandElementKind::I32 => DataType::I32,
+        BandElementKind::U32 => DataType::U32,
+        BandElementKind::F32 => DataType::F32,
+        BandElementKind::F64 => unreachable!("f64 promotion returned above"),
+    };
+    if band_info
+        .bands()
+        .iter()
+        .any(|band| band.data_type != expected)
+    {
+        return Err(Error::InvalidArgument(
+            "output element type must match every native band type unless decoding to f64",
+        ));
+    }
+    Ok(())
 }
 
 fn decode_band_set_into_sequential<T: Sample + BandElement>(
@@ -786,7 +838,7 @@ fn decode_band_set_into_sequential<T: Sample + BandElement>(
         ));
     }
 
-    let pixel_count = band_info.bands[0].pixel_count()?;
+    let pixel_count = band_info.first().pixel_count()?;
     let depth = band_info.depth() as usize;
     let mut offset = 0usize;
     let mut band_index = 0usize;
@@ -929,9 +981,9 @@ fn decode_band_set_into_parallel<T: Sample + BandElement>(
             "parallel band scan disagrees with decoded band metadata",
         ));
     }
-    let pixel_count = band_info.bands[0].pixel_count()?;
+    let pixel_count = band_info.first().pixel_count()?;
     let depth = band_info.depth() as usize;
-    let band_len = band_info.bands[0].sample_count()?;
+    let band_len = band_info.first().sample_count()?;
 
     let infos = match layout {
         BandLayout::Bsq => out
@@ -1015,23 +1067,26 @@ fn scan_band_infos(blob: &[u8], initial_mask: Option<&[u8]>) -> Result<BandSetIn
     let mut offset = 0usize;
     let mut infos = Vec::new();
     let mut lerc1_mask = initial_mask.map(<[u8]>::to_vec);
+    let mut lerc2_mask = initial_mask.map(<[u8]>::to_vec);
 
     while offset < blob.len() {
         let slice = &blob[offset..];
-        let (info, next_lerc1_mask) = if lerc1::is_lerc1(slice) {
+        let info = if lerc1::is_lerc1(slice) {
             let parsed = lerc1::parse(slice, lerc1_mask.as_deref())?;
             let info = parsed.info;
-            let next_mask = parsed.mask;
-            (info, next_mask)
+            lerc1_mask = parsed.mask;
+            lerc2_mask = None;
+            info
         } else if lerc2::is_lerc2(slice) {
-            let (parsed, _) = lerc2::parse(slice)?;
-            (parsed.info, None)
+            let (info, mask) = lerc2::inspect_with_mask(slice, lerc2_mask.as_deref())?;
+            lerc2_mask = mask;
+            lerc1_mask = None;
+            info
         } else {
             return Err(Error::InvalidMagic);
         };
 
         offset = checked_next_offset(offset, info.blob_size, blob.len())?;
-        lerc1_mask = next_lerc1_mask;
         infos.push(info);
     }
 
@@ -1075,11 +1130,7 @@ fn decode_band_set_from_reader_impl<R: std::io::Read + ?Sized>(
         band_masks.push(decoded.mask);
     }
 
-    Ok(DecodedBandSet {
-        info: BandSetInfo::new(infos)?,
-        bands,
-        band_masks,
-    })
+    DecodedBandSet::new(BandSetInfo::new(infos)?, bands, band_masks)
 }
 
 fn ensure_single_blob_consumed(

@@ -286,7 +286,14 @@ pub trait Sample: Copy + Default + private::Sealed + 'static {
                 "typed value payload length is not aligned to its data type",
             ));
         }
-        chunks.map(Self::read_le).collect()
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(bytes.len() / size)
+            .map_err(|_| Error::AllocationFailed("typed sample buffer"))?;
+        for chunk in chunks {
+            values.push(Self::read_le(chunk)?);
+        }
+        Ok(values)
     }
 }
 
@@ -403,7 +410,9 @@ pub fn read_values_as<T: Sample>(bytes: &[u8], source_type: DataType) -> Result<
             "typed value payload length is not aligned to its data type",
         ));
     }
-    let mut out = Vec::with_capacity(bytes.len() / sample_size);
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len() / sample_size)
+        .map_err(|_| Error::AllocationFailed("converted sample buffer"))?;
     crate::dispatch_data_type!(source_type, Source => {
         for chunk in bytes.chunks_exact(sample_size) {
             out.push(T::from_f64(Source::read_le(chunk)?.to_f64()));
@@ -433,14 +442,17 @@ pub fn read_scalar(bytes: &[u8], data_type: DataType) -> Result<f64> {
 
 /// Reads an aligned little-endian sample buffer as promoted `f64` values.
 pub fn read_typed_values(bytes: &[u8], data_type: DataType) -> Result<Vec<f64>> {
-    let mut out = Vec::with_capacity(bytes.len() / data_type.byte_len());
-    for chunk in bytes.chunks_exact(data_type.byte_len()) {
-        out.push(read_scalar(chunk, data_type)?);
-    }
-    if bytes.len() % data_type.byte_len() != 0 {
+    let sample_size = data_type.byte_len();
+    if bytes.len() % sample_size != 0 {
         return Err(Error::invalid_blob(
             "typed value payload length is not aligned to its data type",
         ));
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len() / sample_size)
+        .map_err(|_| Error::AllocationFailed("promoted sample buffer"))?;
+    for chunk in bytes.chunks_exact(sample_size) {
+        out.push(read_scalar(chunk, data_type)?);
     }
     Ok(out)
 }
@@ -485,17 +497,30 @@ pub fn bits_required(max_index: usize) -> u8 {
     bits
 }
 
-/// Pads a byte slice to 32-bit alignment and returns little-endian words.
-pub fn words_from_padded(bytes: &[u8]) -> Vec<u32> {
+/// Converts a byte slice to zero-padded little-endian words.
+///
+/// # Errors
+/// Returns an error when memory for the word buffer cannot be reserved.
+pub fn words_from_padded(bytes: &[u8]) -> Result<Vec<u32>> {
     if bytes.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let mut padded = vec![0u8; bytes.len().div_ceil(4) * 4];
-    padded[..bytes.len()].copy_from_slice(bytes);
-    padded
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
+    let mut words = Vec::new();
+    words
+        .try_reserve_exact(bytes.len().div_ceil(4))
+        .map_err(|_| Error::AllocationFailed("bit-stuffed word buffer"))?;
+
+    let mut chunks = bytes.chunks_exact(4);
+    for chunk in &mut chunks {
+        words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    let remainder = chunks.remainder();
+    if !remainder.is_empty() {
+        let mut word = [0u8; 4];
+        word[..remainder.len()].copy_from_slice(remainder);
+        words.push(u32::from_le_bytes(word));
+    }
+    Ok(words)
 }
 
 /// Computes the Fletcher-32 checksum variant used by Lerc2.
@@ -527,6 +552,22 @@ pub fn fletcher32(bytes: &[u8]) -> u32 {
     sum1 = (sum1 & 0xffff) + (sum1 >> 16);
     sum2 = (sum2 & 0xffff) + (sum2 >> 16);
     (sum2 << 16) | (sum1 & 0xffff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::words_from_padded;
+
+    #[test]
+    fn converts_aligned_and_partial_little_endian_words_without_a_padding_buffer() {
+        assert!(words_from_padded(&[]).unwrap().is_empty());
+        assert_eq!(words_from_padded(&[1]).unwrap(), vec![1]);
+        assert_eq!(words_from_padded(&[1, 2, 3, 4]).unwrap(), vec![0x0403_0201]);
+        assert_eq!(
+            words_from_padded(&[1, 2, 3, 4, 5]).unwrap(),
+            vec![0x0403_0201, 5]
+        );
+    }
 }
 
 /// Computes the pixel-interleaved sample index `pixel * depth + dim`.

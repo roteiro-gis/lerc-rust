@@ -4,7 +4,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential cmake curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ARG LERC_VERSION=v4.1.0
+ARG LERC_VERSION=v4.1.1
 
 RUN mkdir -p /tmp/lerc-src \
     && curl -L --max-redirs 5 "https://api.github.com/repos/Esri/lerc/tarball/refs/tags/${LERC_VERSION}" \
