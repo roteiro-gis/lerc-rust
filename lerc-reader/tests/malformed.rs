@@ -2,7 +2,7 @@
 
 use lerc_core::{BandLayout, Error, PixelData};
 
-#[path = "../../test-support/lerc_test.rs"]
+#[path = "../src/test_support.rs"]
 mod lerc_test;
 
 use lerc_test::{
@@ -48,6 +48,13 @@ fn build_lerc1_blob_with_stuffed_count(
     bytes.push(declared_valid_count);
     bytes.extend_from_slice(&payload);
     bytes
+}
+
+fn lerc1_pixel_section_len_offset(mask: &[u8]) -> usize {
+    const FILE_HEADER_LEN: usize = 10 + 4 + 4 + 4 + 4 + 8;
+    const MASK_HEADER_LEN: usize = 4 + 4 + 4 + 4;
+    const PIXEL_BLOCK_COUNTS_LEN: usize = 4 + 4;
+    FILE_HEADER_LEN + MASK_HEADER_LEN + encode_mask_rle(mask).len() + PIXEL_BLOCK_COUNTS_LEN
 }
 
 fn build_huffman_blob(table_payload: &[u8]) -> Vec<u8> {
@@ -139,7 +146,8 @@ fn build_lerc1_remainder_tile_blob() -> Vec<u8> {
     // block is 2x2 even though the base blocks are 1x1.
     bytes.extend_from_slice(&3u32.to_le_bytes());
     bytes.extend_from_slice(&3u32.to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
+    let pixel_section_len = 15 + 1 + 4 + 1 + 1 + 1;
+    bytes.extend_from_slice(&(pixel_section_len as u32).to_le_bytes());
     bytes.extend_from_slice(&3.0f32.to_le_bytes());
 
     bytes.extend_from_slice(&[2; 15]); // Zero blocks.
@@ -186,7 +194,7 @@ fn accepts_lerc1_stuffed_remainder_tile_larger_than_base_tile() {
 
     let mut direct = vec![f32::NAN; expected.len()];
     let band_info = lerc_reader::decode_band_set_into(&blob, BandLayout::Bsq, &mut direct).unwrap();
-    assert_eq!(band_info.bands, vec![info]);
+    assert_eq!(band_info.bands(), &[info]);
     assert_eq!(direct, expected);
 }
 
@@ -249,6 +257,23 @@ fn rejects_lerc2_trailing_pixel_payload_in_all_invalid_blob() {
 }
 
 #[test]
+fn rejects_lerc1_blocks_that_overrun_declared_pixel_section() {
+    let mask = [1, 0, 0, 0];
+    let mut blob = build_lerc1_blob_with_stuffed_count(&mask, &[1.0], 1);
+    let section_len_offset = lerc1_pixel_section_len_offset(&mask);
+    let declared_len = u32::from_le_bytes(
+        blob[section_len_offset..section_len_offset + 4]
+            .try_into()
+            .unwrap(),
+    );
+    blob[section_len_offset..section_len_offset + 4]
+        .copy_from_slice(&(declared_len - 1).to_le_bytes());
+
+    let result = lerc_reader::decode(&blob);
+    assert!(matches!(result, Err(Error::Truncated { .. })), "{result:?}");
+}
+
+#[test]
 fn rejects_zero_sized_lerc2_band_set_vec_before_payload_decode() {
     let blob = build_lerc2_v4_no_mask_blob(0, 1, 1, 0, 0.0, 0.0, b"junk");
     let result = lerc_reader::decode(&blob);
@@ -273,27 +298,30 @@ fn rejects_zero_sized_lerc2_band_set_vec_before_payload_decode() {
         "{result:?}"
     );
 
-    let result = lerc_reader::decode_band_set_ndarray::<u8>(&blob);
-    assert!(
-        matches!(
-            result,
-            Err(Error::InvalidHeader(
-                "width and height must be greater than zero"
-            ))
-        ),
-        "{result:?}"
-    );
+    #[cfg(feature = "ndarray")]
+    {
+        let result = lerc_reader::decode_band_set_ndarray::<u8>(&blob);
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidHeader(
+                    "width and height must be greater than zero"
+                ))
+            ),
+            "{result:?}"
+        );
 
-    let result = lerc_reader::decode_band_set_ndarray_f64(&blob);
-    assert!(
-        matches!(
-            result,
-            Err(Error::InvalidHeader(
-                "width and height must be greater than zero"
-            ))
-        ),
-        "{result:?}"
-    );
+        let result = lerc_reader::decode_band_set_ndarray_f64(&blob);
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidHeader(
+                    "width and height must be greater than zero"
+                ))
+            ),
+            "{result:?}"
+        );
+    }
 }
 
 #[test]
@@ -320,6 +348,51 @@ fn rejects_mask_rle_with_trailing_bytes_after_sentinel() {
 }
 
 #[test]
+fn rejects_explicit_mask_whose_valid_count_disagrees_with_header() {
+    let mask = encode_mask_rle(&[1, 0, 0, 0]);
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 2,
+        height: 2,
+        valid_pixel_count: 2,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 7.0,
+        z_max: 7.0,
+        payload_len: mask.len(),
+    });
+    blob.extend_from_slice(&(mask.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&mask);
+
+    let result = lerc_reader::get_blob_info(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+
+    let result = lerc_reader::decode(&blob);
+    assert!(matches!(result, Err(Error::InvalidBlob(_))), "{result:?}");
+}
+
+#[test]
+fn rejects_all_invalid_lerc2_blob_with_explicit_mask_bytes() {
+    let mask = encode_mask_rle(&[0, 0, 0, 0]);
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 2,
+        height: 2,
+        valid_pixel_count: 0,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 0.0,
+        z_max: 0.0,
+        payload_len: mask.len(),
+    });
+    blob.extend_from_slice(&(mask.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&mask);
+
+    assert!(matches!(
+        lerc_reader::get_blob_info(&blob),
+        Err(Error::InvalidBlob(_))
+    ));
+}
+
+#[test]
 fn rejects_zero_sized_lerc2_dimensions_in_metadata_paths() {
     for (width, height) in [(0, 1), (1, 0)] {
         let mut blob = build_header_v2(HeaderV2 {
@@ -339,21 +412,23 @@ fn rejects_zero_sized_lerc2_dimensions_in_metadata_paths() {
 }
 
 #[test]
-fn rejects_zero_lerc2_micro_block_size_in_metadata_paths() {
-    let mut blob = build_header_v2(HeaderV2 {
-        width: 1,
-        height: 1,
-        valid_pixel_count: 1,
-        image_type: 1,
-        max_z_error: 0.0,
-        z_min: 7.0,
-        z_max: 7.0,
-        payload_len: 0,
-    });
-    blob.extend_from_slice(&0u32.to_le_bytes());
-    blob[22..26].copy_from_slice(&0i32.to_le_bytes());
+fn rejects_lerc2_micro_block_sizes_outside_reference_range() {
+    for micro_block_size in [0i32, 33] {
+        let mut blob = build_header_v2(HeaderV2 {
+            width: 1,
+            height: 1,
+            valid_pixel_count: 1,
+            image_type: 1,
+            max_z_error: 0.0,
+            z_min: 7.0,
+            z_max: 7.0,
+            payload_len: 0,
+        });
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob[22..26].copy_from_slice(&micro_block_size.to_le_bytes());
 
-    assert_metadata_invalid_header(&blob, "micro block size must be greater than zero");
+        assert_metadata_invalid_header(&blob, "micro block size must be in the range 1..=32");
+    }
 }
 
 #[test]
@@ -384,6 +459,19 @@ fn rejects_non_finite_lerc2_numeric_fields_in_metadata_paths() {
     blob.extend_from_slice(&0u32.to_le_bytes());
     assert_metadata_invalid_header(&blob, "z range values must be finite");
 
+    let mut blob = build_header_v2(HeaderV2 {
+        width: 1,
+        height: 1,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 8.0,
+        z_max: 7.0,
+        payload_len: 0,
+    });
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    assert_metadata_invalid_header(&blob, "minimum encoded value must not exceed maximum");
+
     let mut blob = build_header_v6(HeaderV6 {
         width: 1,
         height: 1,
@@ -400,6 +488,16 @@ fn rejects_non_finite_lerc2_numeric_fields_in_metadata_paths() {
     blob.extend_from_slice(&0u32.to_le_bytes());
     let blob = finalize_lerc2_with_checksum(blob);
     assert_metadata_invalid_header(&blob, "no-data values must be finite");
+}
+
+#[test]
+fn rejects_reversed_lerc2_per_depth_range() {
+    let blob = build_lerc2_v4_no_mask_blob(1, 1, 2, 1, 0.0, 10.0, &[9, 0, 1, 10]);
+
+    assert!(matches!(
+        lerc_reader::get_blob_info(&blob),
+        Err(Error::InvalidBlob(_))
+    ));
 }
 
 #[test]
@@ -424,6 +522,41 @@ fn rejects_zero_depth_lerc2_header() {
     assert!(matches!(
         lerc_reader::get_blob_info(&blob),
         Err(Error::InvalidHeader("depth must be greater than zero"))
+    ));
+}
+
+#[test]
+fn rejects_v6_remaining_band_count_that_exceeds_payload() {
+    let mut blob = build_header_v6(HeaderV6 {
+        width: 1,
+        height: 1,
+        depth: 2,
+        valid_pixel_count: 1,
+        image_type: 1,
+        max_z_error: 0.0,
+        z_min: 7.0,
+        z_max: 7.0,
+        internal_no_data_value: -1.0,
+        original_no_data_value: -1.0,
+        payload_len: 0,
+    });
+    blob[42..46].copy_from_slice(&1i32.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    let blob = finalize_lerc2_with_checksum(blob);
+
+    assert_eq!(
+        lerc_reader::get_blob_info(&blob)
+            .unwrap()
+            .remaining_band_count,
+        1
+    );
+    assert!(matches!(
+        lerc_reader::get_band_count(&blob),
+        Err(Error::InvalidBlob(_))
+    ));
+    assert!(matches!(
+        lerc_reader::decode_band_set(&blob),
+        Err(Error::InvalidBlob(_))
     ));
 }
 

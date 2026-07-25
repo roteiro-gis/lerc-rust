@@ -220,14 +220,13 @@ fn roundtrips_lossless_f64_raster() {
 }
 
 #[test]
-fn encoded_len_upper_bound_is_conservative() {
+fn encoded_len_upper_bound_is_exact() {
     let pixels = vec![9u16; 6];
     let raster = RasterView::new(3, 2, 1, &pixels).unwrap();
     let upper = encoded_len_upper_bound(raster, None, EncodeOptions::default()).unwrap();
     let blob = encode(raster, None, EncodeOptions::default()).unwrap();
 
-    assert!(upper >= blob.len());
-    assert!(upper > blob.len());
+    assert_eq!(upper, blob.len());
 }
 
 #[test]
@@ -285,7 +284,7 @@ fn roundtrips_bitstuffed_tile_with_maximum_micro_block() {
     let raster = RasterView::new(4, 4, 1, &pixels).unwrap();
     let options = EncodeOptions::new()
         .with_max_z_error(0.5)
-        .with_micro_block_size(64);
+        .with_micro_block_size(32);
 
     let blob = encode(raster, None, options).unwrap();
     let info = lerc_reader::get_blob_info(&blob).unwrap();
@@ -632,10 +631,10 @@ fn derived_no_data_masks_are_stored_per_band() {
     assert_eq!(second.mask_encoding, lerc_core::MaskEncoding::Explicit);
 
     let decoded = lerc_reader::decode_band_set(&blob).unwrap();
-    assert_eq!(decoded.info.mask_count(), 2);
-    assert_eq!(decoded.band_masks, vec![Some(vec![0, 1]), Some(vec![1, 0])]);
+    assert_eq!(decoded.info().mask_count(), 2);
+    assert_eq!(decoded.band_masks(), &[Some(vec![0, 1]), Some(vec![1, 0])]);
     assert_eq!(
-        decoded.bands,
+        decoded.bands(),
         vec![
             lerc_core::PixelData::I16(vec![0, 0, 1, 2]),
             lerc_core::PixelData::I16(vec![3, 4, 0, 0]),
@@ -669,7 +668,7 @@ fn upper_bound_covers_v6_no_data_output() {
         .with_no_data_value(f64::from(no_data));
     let upper_bound = encoded_len_upper_bound(raster, None, options).unwrap();
     let blob = encode(raster, None, options).unwrap();
-    assert!(upper_bound >= blob.len());
+    assert_eq!(upper_bound, blob.len());
 
     let mut out = vec![0; upper_bound];
     let written = encode_into(raster, None, options, &mut out).unwrap();
@@ -714,7 +713,20 @@ fn band_set_upper_bound_covers_v6_no_data_output() {
         .with_no_data_value(f64::from(no_data));
     let upper_bound = encoded_band_set_len_upper_bound(band_set, None, options).unwrap();
     let blob = encode_band_set(band_set, None, options).unwrap();
-    assert!(upper_bound >= blob.len());
+    assert_eq!(upper_bound, blob.len());
+
+    let first = lerc_reader::inspect_first(&blob).unwrap();
+    let second = lerc_reader::get_blob_info(&blob[first.blob_size..]).unwrap();
+    assert_eq!(first.remaining_band_count, 1);
+    assert_eq!(second.remaining_band_count, 0);
+    let first_remaining = i32::from_le_bytes(blob[42..46].try_into().unwrap());
+    let second_remaining = i32::from_le_bytes(
+        blob[first.blob_size + 42..first.blob_size + 46]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(first_remaining, 1);
+    assert_eq!(second_remaining, 0);
 
     let mut out = vec![0; upper_bound];
     let written = encode_band_set_into(band_set, None, options, &mut out).unwrap();
@@ -781,18 +793,18 @@ fn roundtrips_shared_mask_band_set_from_interleaved_input() {
     assert_eq!(second_info.mask_count(), 0);
 
     let decoded = lerc_reader::decode_band_set(&blob).unwrap();
-    assert_eq!(decoded.info.band_count(), 2);
-    assert_eq!(decoded.info.mask_count(), 1);
+    assert_eq!(decoded.info().band_count(), 2);
+    assert_eq!(decoded.info().mask_count(), 1);
     assert_eq!(
-        decoded.band_masks,
+        decoded.band_masks(),
         vec![Some(mask_pixels.clone()), Some(mask_pixels.clone())]
     );
     assert_eq!(
-        decoded.bands[0],
+        decoded.bands()[0],
         lerc_core::PixelData::U8(vec![10, 0, 11, 12])
     );
     assert_eq!(
-        decoded.bands[1],
+        decoded.bands()[1],
         lerc_core::PixelData::U8(vec![50, 0, 51, 52])
     );
 }
@@ -806,18 +818,18 @@ fn roundtrips_shared_mask_band_set_from_bsq_input() {
 
     let blob = encode_band_set(band_set, Some(mask), EncodeOptions::default()).unwrap();
     let decoded = lerc_reader::decode_band_set(&blob).unwrap();
-    assert_eq!(decoded.info.band_count(), 2);
-    assert_eq!(decoded.info.mask_count(), 1);
+    assert_eq!(decoded.info().band_count(), 2);
+    assert_eq!(decoded.info().mask_count(), 1);
     assert_eq!(
-        decoded.band_masks,
+        decoded.band_masks(),
         vec![Some(mask_pixels.clone()), Some(mask_pixels.clone())]
     );
     assert_eq!(
-        decoded.bands[0],
+        decoded.bands()[0],
         lerc_core::PixelData::U8(vec![10, 0, 11, 12])
     );
     assert_eq!(
-        decoded.bands[1],
+        decoded.bands()[1],
         lerc_core::PixelData::U8(vec![50, 0, 51, 52])
     );
 }
@@ -856,12 +868,15 @@ fn encode_band_set_into_reports_small_output_buffers() {
     let band_set = BandSetView::new(2, 2, 1, 2, BandLayout::Interleaved, &pixels).unwrap();
     let mask = MaskView::new(2, 2, &mask_pixels).unwrap();
     let blob = encode_band_set(band_set, Some(mask), EncodeOptions::default()).unwrap();
-    let mut out = vec![0u8; blob.len() - 1];
+    let mut out = vec![0xA5; blob.len() - 1];
+    let before = out.clone();
 
     assert!(matches!(
         encode_band_set_into(band_set, Some(mask), EncodeOptions::default(), &mut out),
-        Err(Error::OutputTooSmall { .. })
+        Err(Error::OutputTooSmall { needed, available })
+            if needed == blob.len() && available == blob.len() - 1
     ));
+    assert_eq!(out, before);
 }
 
 #[test]
@@ -881,12 +896,15 @@ fn encode_into_reports_small_output_buffers() {
     let pixels = vec![1u8, 2, 3, 4];
     let raster = RasterView::new(2, 2, 1, &pixels).unwrap();
     let blob = encode(raster, None, EncodeOptions::default()).unwrap();
-    let mut out = vec![0u8; blob.len() - 1];
+    let mut out = vec![0xA5; blob.len() - 1];
+    let before = out.clone();
 
     assert!(matches!(
         encode_into(raster, None, EncodeOptions::default(), &mut out),
-        Err(Error::OutputTooSmall { .. })
+        Err(Error::OutputTooSmall { needed, available })
+            if needed == blob.len() && available == blob.len() - 1
     ));
+    assert_eq!(out, before);
 }
 
 #[test]

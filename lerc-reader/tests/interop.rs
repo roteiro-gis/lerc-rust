@@ -1,4 +1,5 @@
 #![allow(missing_docs)]
+#![cfg(feature = "ndarray")]
 
 use lerc_core::{DataType, PixelData};
 use ndarray::IxDyn;

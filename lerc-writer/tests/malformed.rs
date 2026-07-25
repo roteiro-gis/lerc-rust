@@ -102,7 +102,7 @@ fn rejects_micro_block_sizes_outside_the_supported_range() {
     let pixels = vec![1u8, 2, 3, 4];
     let raster = RasterView::new(2, 2, 1, &pixels).unwrap();
 
-    for micro_block_size in [0, 1, 65, u32::MAX] {
+    for micro_block_size in [0, 1, 33, u32::MAX] {
         let result = encode(
             raster,
             None,

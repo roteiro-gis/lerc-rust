@@ -118,7 +118,7 @@ fn read_exact_to<R: Read + ?Sized>(
         return Err(Error::Internal("stream target moved behind buffered input"));
     }
     blob.try_reserve(target_len - blob.len())
-        .map_err(|_| Error::invalid_blob("unable to reserve the declared stream blob size"))?;
+        .map_err(|_| Error::AllocationFailed("declared stream blob"))?;
     let mut filled = blob.len();
     blob.resize(target_len, 0);
     while filled < target_len {

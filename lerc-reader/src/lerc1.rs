@@ -275,7 +275,7 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
 
     let pixels_num_blocks_y = cursor.read_u32()? as usize;
     let pixels_num_blocks_x = cursor.read_u32()? as usize;
-    let _pixels_num_bytes = cursor.read_u32()? as usize;
+    let pixels_num_bytes = cursor.read_u32()? as usize;
     let pixels_max_value = cursor.read_f32()?;
 
     if pixels_num_blocks_x == 0 || pixels_num_blocks_y == 0 {
@@ -308,6 +308,9 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
             .map_err(|_| Error::SizeOverflow("Lerc1 valid pixel count as u32"))?,
     };
 
+    let pixel_payload = cursor.read_bytes(pixels_num_bytes)?;
+    let eof_offset = cursor.offset();
+    let mut pixel_cursor = Cursor::new(pixel_payload);
     let mut blocks = vec_with_capacity(grid.block_count()?, "Lerc1 block table")?;
     grid.for_each_block(|block_pos| {
         let block_valid_pixels = if let Some(mask) = mask.as_deref() {
@@ -327,7 +330,7 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
             )?
         };
 
-        let header_byte = cursor.read_u8()?;
+        let header_byte = pixel_cursor.read_u8()?;
         let encoding = header_byte & 63;
         if encoding > 3 {
             return Err(Error::invalid_blob(format!(
@@ -338,15 +341,15 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
         let block_encoding = match encoding {
             2 => Lerc1BlockEncoding::Zero,
             3 => Lerc1BlockEncoding::Constant(
-                read_offset_if_present(&mut cursor, header_byte)?.ok_or(Error::invalid_blob(
-                    "Lerc1 constant block is missing its offset",
-                ))?,
+                read_offset_if_present(&mut pixel_cursor, header_byte)?.ok_or(
+                    Error::invalid_blob("Lerc1 constant block is missing its offset"),
+                )?,
             ),
             0 => {
                 let byte_len = block_valid_pixels
                     .checked_mul(4)
                     .ok_or(Error::SizeOverflow("Lerc1 raw block byte count"))?;
-                let values = cursor
+                let values = pixel_cursor
                     .read_bytes(byte_len)?
                     .chunks_exact(4)
                     .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -354,15 +357,15 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
                 Lerc1BlockEncoding::Raw(values)
             }
             1 => {
-                let offset = read_offset_if_present(&mut cursor, header_byte)?.ok_or(
+                let offset = read_offset_if_present(&mut pixel_cursor, header_byte)?.ok_or(
                     Error::invalid_blob("Lerc1 bit-stuffed block is missing its offset"),
                 )?;
-                let packed_header = cursor.read_u8()?;
+                let packed_header = pixel_cursor.read_u8()?;
                 let bits_per_pixel = packed_header & 63;
                 let num_valid_pixels = match packed_header >> 6 {
-                    0 => cursor.read_u32()? as usize,
-                    1 => read_u16(cursor.read_bytes(2)?)? as usize,
-                    2 => cursor.read_u8()? as usize,
+                    0 => pixel_cursor.read_u32()? as usize,
+                    1 => read_u16(pixel_cursor.read_bytes(2)?)? as usize,
+                    2 => pixel_cursor.read_u8()? as usize,
                     other => {
                         return Err(Error::invalid_blob(format!(
                             "invalid Lerc1 valid pixel count type {other}"
@@ -378,7 +381,7 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
                     .checked_mul(usize::from(bits_per_pixel))
                     .ok_or(Error::SizeOverflow("Lerc1 stuffed block bit count"))?
                     .div_ceil(8);
-                let stuffed_data = words_from_padded(cursor.read_bytes(data_bytes)?);
+                let stuffed_data = words_from_padded(pixel_cursor.read_bytes(data_bytes)?)?;
                 Lerc1BlockEncoding::Stuffed {
                     offset,
                     bits_per_pixel,
@@ -395,7 +398,6 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
         Ok(())
     })?;
 
-    let eof_offset = cursor.offset();
     let info = BlobInfo {
         version: Version::Lerc1(version as u32),
         data_type: map_lerc1_data_type(image_type),
@@ -407,6 +409,7 @@ fn parse_with_mask_source(blob: &[u8], mask_source: MaskSource<'_>) -> Result<Le
         valid_pixel_count,
         micro_block_size: 0,
         blob_size: eof_offset,
+        remaining_band_count: 0,
         max_z_error,
         z_min: 0.0,
         z_max: pixels_max_value as f64,

@@ -198,7 +198,7 @@ fn read_huffman_tree(cursor: &mut Cursor<'_>, info: &BlobInfo) -> Result<Huffman
         code_table[j] = Some((bit_len as u8, 0));
     }
 
-    let stuffed_data = words_from_padded(cursor.read_bytes(cursor.remaining())?);
+    let stuffed_data = words_from_padded(cursor.read_bytes(cursor.remaining())?)?;
     let mut stream = HuffmanStream {
         words: &stuffed_data,
         src_ptr: 0,

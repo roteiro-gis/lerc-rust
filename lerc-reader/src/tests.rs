@@ -1,15 +1,13 @@
+#[cfg(feature = "ndarray")]
 use ndarray::IxDyn;
 
+use crate::test_support::{
+    build_header_v2, encode_mask_rle, finalize_lerc2_with_checksum, pack_msb_bits, HeaderV2,
+};
+#[cfg(feature = "ndarray")]
+use crate::test_support::{build_header_v6, HeaderV6};
 use crate::*;
 use lerc_core::{BandLayout, DataType, Error, MaskEncoding, PixelData, Version};
-
-#[path = "../../test-support/lerc_test.rs"]
-mod lerc_test;
-
-use lerc_test::{
-    build_header_v2, build_header_v6, encode_mask_rle, finalize_lerc2_with_checksum, pack_msb_bits,
-    HeaderV2, HeaderV6,
-};
 
 fn build_lerc1_blob(
     include_mask_header: bool,
@@ -68,6 +66,7 @@ fn build_lerc1_blob(
     bytes
 }
 
+#[cfg(feature = "ndarray")]
 fn build_external_mask_lerc2_blob(values: &[u8]) -> Vec<u8> {
     assert_eq!(values.len(), 3);
 
@@ -134,6 +133,53 @@ fn reads_blob_info_for_constant_lerc2() {
 }
 
 #[test]
+fn direct_band_set_apis_reject_implicit_numeric_casts() {
+    let first = build_constant_lerc2(3);
+    let second = build_constant_lerc2(7);
+    let mut blob = first;
+    blob.extend_from_slice(&second);
+
+    let result = decode_band_set_vec::<u16>(&blob, BandLayout::Bsq);
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+
+    let mut out = [0u16; 8];
+    let result = decode_band_set_into(&blob, BandLayout::Bsq, &mut out);
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+    assert_eq!(out, [0; 8]);
+
+    let (_, promoted) = decode_band_set_vec::<f64>(&blob, BandLayout::Bsq).unwrap();
+    assert_eq!(
+        promoted,
+        [3.0; 4].into_iter().chain([7.0; 4]).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rejects_band_sets_with_mixed_native_types() {
+    let mut blob = build_constant_lerc2(3);
+    let mut u16_band = build_header_v2(HeaderV2 {
+        width: 2,
+        height: 2,
+        valid_pixel_count: 4,
+        image_type: 3,
+        max_z_error: 0.0,
+        z_min: 7.0,
+        z_max: 7.0,
+        payload_len: 0,
+    });
+    u16_band.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&u16_band);
+
+    assert!(matches!(decode_band_set(&blob), Err(Error::InvalidBlob(_))));
+}
+
+#[test]
 fn streaming_decode_reads_exactly_one_lerc2_blob() {
     let first = build_constant_lerc2(3);
     let second = build_constant_lerc2(7);
@@ -156,9 +202,9 @@ fn streaming_band_set_decode_reads_until_clean_eof() {
     bytes.extend_from_slice(&build_constant_lerc2(7));
     let decoded = decode_band_set_from_reader(&mut std::io::Cursor::new(bytes)).unwrap();
 
-    assert_eq!(decoded.info.band_count(), 2);
+    assert_eq!(decoded.info().band_count(), 2);
     assert_eq!(
-        decoded.bands,
+        decoded.bands(),
         vec![PixelData::U8(vec![3; 4]), PixelData::U8(vec![7; 4])]
     );
 }
@@ -244,6 +290,7 @@ fn decodes_one_sweep_all_valid() {
 }
 
 #[test]
+#[cfg(feature = "ndarray")]
 fn decodes_external_mask_lerc2_via_single_blob_with_mask_apis() {
     let blob = build_external_mask_lerc2_blob(&[1, 2, 3]);
     let external_mask = [1u8, 0, 1, 1];
@@ -307,6 +354,7 @@ fn decodes_external_mask_lerc2_via_single_blob_with_mask_apis() {
 }
 
 #[test]
+#[cfg(feature = "ndarray")]
 fn decodes_external_mask_lerc2_band_set_via_with_mask_apis() {
     let external_mask = [1u8, 0, 1, 1];
     let mut blob = build_external_mask_lerc2_blob(&[1, 2, 3]);
@@ -318,16 +366,16 @@ fn decodes_external_mask_lerc2_band_set_via_with_mask_apis() {
     ));
 
     let decoded = decode_band_set_with_mask(&blob, &external_mask).unwrap();
-    assert_eq!(decoded.info.band_count(), 2);
+    assert_eq!(decoded.info().band_count(), 2);
     assert_eq!(
-        decoded.bands,
+        decoded.bands(),
         vec![
             PixelData::U8(vec![1, 0, 2, 3]),
             PixelData::U8(vec![4, 0, 5, 6]),
         ]
     );
     assert_eq!(
-        decoded.band_masks,
+        decoded.band_masks(),
         vec![Some(external_mask.to_vec()), Some(external_mask.to_vec()),]
     );
 
@@ -384,6 +432,7 @@ fn decodes_external_mask_lerc2_band_set_via_with_mask_apis() {
 }
 
 #[test]
+#[cfg(feature = "ndarray")]
 fn decodes_lerc2_v6_no_data_values_without_public_ranges() {
     let internal_no_data = -7777.0f64;
     let original_no_data = -9999.0f64;
@@ -497,21 +546,21 @@ fn direct_band_set_apis_return_lerc2_per_depth_ranges() {
     let blob = finalize_lerc2_with_checksum(bytes);
     let decoded = decode_band_set(&blob).unwrap();
     assert_eq!(
-        decoded.info.bands[0].min_values.as_deref(),
+        decoded.info().first().min_values.as_deref(),
         Some(&[10.0, 20.0][..])
     );
     assert_eq!(
-        decoded.info.bands[0].max_values.as_deref(),
+        decoded.info().first().max_values.as_deref(),
         Some(&[10.0, 20.0][..])
     );
 
     let (info, values) = decode_band_set_vec::<f32>(&blob, BandLayout::Bsq).unwrap();
-    assert_eq!(info, decoded.info);
+    assert_eq!(&info, decoded.info());
     assert_eq!(values, vec![10.0, 20.0, 10.0, 20.0]);
 
     let mut out = vec![0.0f32; values.len()];
     let info_into = decode_band_set_into(&blob, BandLayout::Bsq, &mut out).unwrap();
-    assert_eq!(info_into, decoded.info);
+    assert_eq!(&info_into, decoded.info());
     assert_eq!(out, values);
 }
 
@@ -616,6 +665,7 @@ fn decodes_lerc1_unsigned_byte_offsets() {
 }
 
 #[test]
+#[cfg(feature = "ndarray")]
 fn lerc1_with_mask_prefers_inline_masked_blob_over_caller_mask() {
     let blob = build_lerc1_blob(true, Some(&[1, 0, 1, 1]), &[1.0, 3.0, 4.0], 0.5, 4.0);
     let caller_mask = [1u8, 1, 1, 1];
@@ -669,20 +719,21 @@ fn direct_band_set_apis_return_decoded_lerc1_ranges() {
     let blob = build_lerc1_blob(true, Some(&[1, 0, 1, 1]), &[1.0, 3.0, 4.0], 0.5, 99.0);
 
     let decoded = decode_band_set(&blob).unwrap();
-    assert_eq!(decoded.info.bands[0].z_min, 1.0);
-    assert_eq!(decoded.info.bands[0].z_max, 4.0);
+    assert_eq!(decoded.info().first().z_min, 1.0);
+    assert_eq!(decoded.info().first().z_max, 4.0);
 
     let (info, values) = decode_band_set_vec::<f32>(&blob, BandLayout::Bsq).unwrap();
-    assert_eq!(info, decoded.info);
+    assert_eq!(&info, decoded.info());
     assert_eq!(values, vec![1.0, 0.0, 3.0, 4.0]);
 
     let mut out = vec![0.0f32; values.len()];
     let info_into = decode_band_set_into(&blob, BandLayout::Bsq, &mut out).unwrap();
-    assert_eq!(info_into, decoded.info);
+    assert_eq!(&info_into, decoded.info());
     assert_eq!(out, values);
 }
 
 #[test]
+#[cfg(feature = "ndarray")]
 fn decodes_lerc2_to_ndarray() {
     let mut blob = build_header_v2(HeaderV2 {
         width: 2,
@@ -707,6 +758,7 @@ fn decodes_lerc2_to_ndarray() {
 }
 
 #[test]
+#[cfg(feature = "ndarray")]
 fn decodes_multidimensional_lerc2_to_f64_ndarray() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"Lerc2 ");
@@ -738,6 +790,7 @@ fn decodes_multidimensional_lerc2_to_f64_ndarray() {
 }
 
 #[test]
+#[cfg(feature = "ndarray")]
 fn decodes_lerc1_mask_to_ndarray() {
     let blob = build_lerc1_blob(true, Some(&[1, 0, 1, 1]), &[1.0, 3.0, 4.0], 0.5, 4.0);
 
@@ -830,6 +883,7 @@ fn decode_band_set_into_supports_bsq_layout() {
 }
 
 #[test]
+#[cfg(feature = "ndarray")]
 fn decode_band_set_ndarray_f64_promotes_concatenated_bands_directly() {
     let mut blob1 = build_header_v2(HeaderV2 {
         width: 1,

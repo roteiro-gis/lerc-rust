@@ -235,6 +235,8 @@ pub struct BlobInfo {
     pub micro_block_size: u32,
     /// Exact encoded length of this blob in bytes.
     pub blob_size: usize,
+    /// Number of appended bands declared by a Lerc2 v6 header, or zero otherwise.
+    pub remaining_band_count: u32,
     /// Maximum absolute reconstruction error declared by the blob.
     pub max_z_error: f64,
     /// Minimum encoded valid sample value.
@@ -320,14 +322,14 @@ impl BlobInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BandSetInfo {
     /// Per-band blob metadata in encoded order.
-    pub bands: Vec<BlobInfo>,
+    bands: Vec<BlobInfo>,
 }
 
 impl BandSetInfo {
     /// Validates and constructs band-set metadata.
     ///
     /// # Errors
-    /// Returns an error for an empty set or mismatched band dimensions/depths.
+    /// Returns an error for an empty set or mismatched band invariants.
     pub fn new(bands: Vec<BlobInfo>) -> Result<Self> {
         let first = bands
             .first()
@@ -339,6 +341,21 @@ impl BandSetInfo {
                     "LERC band set contains mismatched raster dimensions",
                 ));
             }
+            if band.data_type != first.data_type {
+                return Err(Error::invalid_blob(
+                    "LERC band set contains mismatched native data types",
+                ));
+            }
+        }
+        let band_count = bands.len();
+        for (band_index, band) in bands.iter().enumerate() {
+            if matches!(band.version, Version::Lerc2(version) if version >= 6)
+                && band.remaining_band_count as usize != band_count - band_index - 1
+            {
+                return Err(Error::invalid_blob(
+                    "Lerc2 v6 remaining-band count does not match the band set",
+                ));
+            }
         }
         Ok(Self { bands })
     }
@@ -346,6 +363,16 @@ impl BandSetInfo {
     /// Returns the number of bands.
     pub fn band_count(&self) -> usize {
         self.bands.len()
+    }
+
+    /// Returns validated per-band metadata in encoded order.
+    pub fn bands(&self) -> &[BlobInfo] {
+        &self.bands
+    }
+
+    /// Returns the first band's metadata.
+    pub fn first(&self) -> &BlobInfo {
+        &self.bands[0]
     }
 
     /// Returns the shared raster width.
@@ -424,7 +451,7 @@ impl BandSetInfo {
 
     /// Returns the checked sample count across all bands.
     pub fn value_count(&self) -> Result<usize> {
-        self.bands[0]
+        self.first()
             .pixel_count()?
             .checked_mul(self.band_count())
             .and_then(|count| count.checked_mul((self.depth() as usize).max(1)))

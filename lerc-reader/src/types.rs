@@ -151,14 +151,47 @@ impl DecodedF64 {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedBandSet {
     /// Validated metadata for every band.
-    pub info: BandSetInfo,
+    info: BandSetInfo,
     /// Native-typed pixel buffers in band order.
-    pub bands: Vec<PixelData>,
+    bands: Vec<PixelData>,
     /// Logical mask for each band, including inherited masks.
-    pub band_masks: Vec<Option<Vec<u8>>>,
+    band_masks: Vec<Option<Vec<u8>>>,
 }
 
 impl DecodedBandSet {
+    pub(crate) fn new(
+        info: BandSetInfo,
+        bands: Vec<PixelData>,
+        band_masks: Vec<Option<Vec<u8>>>,
+    ) -> Result<Self> {
+        validate_band_set_parts(&info, &bands, &band_masks)?;
+        Ok(Self {
+            info,
+            bands,
+            band_masks,
+        })
+    }
+
+    /// Returns validated metadata for the decoded bands.
+    pub fn info(&self) -> &BandSetInfo {
+        &self.info
+    }
+
+    /// Returns native-typed pixel buffers in band order.
+    pub fn bands(&self) -> &[PixelData] {
+        &self.bands
+    }
+
+    /// Returns logical per-band masks, including inherited masks.
+    pub fn band_masks(&self) -> &[Option<Vec<u8>>] {
+        &self.band_masks
+    }
+
+    /// Consumes the result and returns its validated metadata, bands, and masks.
+    pub fn into_parts(self) -> (BandSetInfo, Vec<PixelData>, Vec<Option<Vec<u8>>>) {
+        (self.info, self.bands, self.band_masks)
+    }
+
     #[cfg(feature = "ndarray")]
     /// Copies the band set into an interleaved ndarray.
     ///
@@ -207,7 +240,7 @@ impl DecodedBandSet {
         }
 
         let mut materializer = BandMaterializer::new(
-            self.info.bands[0].pixel_count()?,
+            self.info.first().pixel_count()?,
             self.info.depth() as usize,
             self.info.band_count(),
             layout,
@@ -223,7 +256,7 @@ impl DecodedBandSet {
     /// # Errors
     /// Returns an error for the wrong output length, incompatible types, or bad metadata.
     pub fn copy_into_slice<T: BandElement>(self, layout: BandLayout, out: &mut [T]) -> Result<()> {
-        let pixel_count = self.info.bands[0].pixel_count()?;
+        let pixel_count = self.info.first().pixel_count()?;
         let depth = self.info.depth() as usize;
         let band_count = self.info.band_count();
         let expected_len = self.info.value_count()?;
@@ -266,6 +299,52 @@ impl DecodedBandSet {
     }
 }
 
+fn validate_band_set_parts(
+    info: &BandSetInfo,
+    bands: &[PixelData],
+    band_masks: &[Option<Vec<u8>>],
+) -> Result<()> {
+    if bands.len() != info.band_count() || band_masks.len() != info.band_count() {
+        return Err(Error::invalid_blob(
+            "decoded band and mask counts do not match band-set metadata",
+        ));
+    }
+    for ((band_info, band), mask) in info.bands().iter().zip(bands).zip(band_masks) {
+        if band.data_type() != band_info.data_type {
+            return Err(Error::invalid_blob(
+                "decoded band type does not match its metadata",
+            ));
+        }
+        if band.len() != band_info.sample_count()? {
+            return Err(Error::invalid_blob(
+                "decoded band length does not match its metadata",
+            ));
+        }
+        match mask {
+            Some(mask) => {
+                if mask.len() != band_info.pixel_count()? {
+                    return Err(Error::invalid_blob(
+                        "decoded band mask length does not match its metadata",
+                    ));
+                }
+                let valid_pixel_count = mask.iter().filter(|&&value| value != 0).count();
+                if valid_pixel_count != band_info.valid_pixel_count as usize {
+                    return Err(Error::invalid_blob(
+                        "decoded band mask count does not match its metadata",
+                    ));
+                }
+            }
+            None if band_info.valid_pixel_count as usize != band_info.pixel_count()? => {
+                return Err(Error::invalid_blob(
+                    "decoded band is missing the mask required by its metadata",
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "ndarray")]
 pub(crate) fn band_masks_into_ndarray(
     info: BandSetInfo,
@@ -275,7 +354,7 @@ pub(crate) fn band_masks_into_ndarray(
         return Ok(None);
     }
 
-    let pixel_count = info.bands[0].pixel_count()?;
+    let pixel_count = info.first().pixel_count()?;
     let band_count = info.band_count();
     let shape = info.band_mask_ndarray_shape();
 

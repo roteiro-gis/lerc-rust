@@ -1,8 +1,9 @@
 #![allow(missing_docs)]
+#![cfg(feature = "ndarray")]
 
 use ndarray::ArrayD;
 
-#[path = "../../test-support/lerc_test.rs"]
+#[path = "../src/test_support.rs"]
 mod lerc_test;
 #[path = "../../test-support/reference.rs"]
 mod reference;
@@ -110,14 +111,14 @@ fn metadata_matches_liblerc_for_interoperability_fixtures() {
                 let band_count = lerc_reader::get_band_count(&blob).unwrap();
                 assert_eq!(band_count, expected_band_count, "{relative_path}");
                 let decoded = lerc_reader::decode_band_set(&blob).unwrap();
-                let first = &decoded.info.bands[0];
+                let first = decoded.info().first();
                 assert_eq!(
-                    decoded.info.bands.len(),
+                    decoded.info().band_count(),
                     expected_band_count,
                     "{relative_path}"
                 );
                 assert_eq!(
-                    decoded.info.bands.len() as u64,
+                    decoded.info().band_count() as u64,
                     reference_json["band_count"].as_u64().unwrap()
                 );
                 assert_eq!(
@@ -137,12 +138,12 @@ fn metadata_matches_liblerc_for_interoperability_fixtures() {
                     reference_json["data_type"].as_u64().unwrap()
                 );
                 assert_eq!(
-                    decoded.info.mask_count() as u64,
+                    decoded.info().mask_count() as u64,
                     reference_json["mask_count"].as_u64().unwrap(),
                     "{relative_path}"
                 );
                 assert_eq!(
-                    decoded.info.uses_no_data_value(),
+                    decoded.info().uses_no_data_value(),
                     reference_json["uses_no_data_value"].as_bool().unwrap(),
                     "{relative_path}"
                 );

@@ -195,7 +195,9 @@ impl<T> BandMaterializer<T> {
             .ok_or(Error::SizeOverflow("materialized band set length"))?;
         check_allocation::<T>(sample_count, "materialized band set")?;
         check_allocation::<bool>(band_count, "materialized band completion flags")?;
-        let mut out = Vec::with_capacity(sample_count);
+        let mut out = Vec::new();
+        out.try_reserve_exact(sample_count)
+            .map_err(|_| Error::AllocationFailed("materialized band set"))?;
         if sample_count != 0 {
             // SAFETY: the element type is MaybeUninit<T>, which is valid in an
             // uninitialized state. Initialization is tracked separately and
@@ -204,6 +206,11 @@ impl<T> BandMaterializer<T> {
                 out.set_len(sample_count);
             }
         }
+        let mut written_bands = Vec::new();
+        written_bands
+            .try_reserve_exact(band_count)
+            .map_err(|_| Error::AllocationFailed("materialized band completion flags"))?;
+        written_bands.resize(band_count, false);
         Ok(Self {
             shape: BandShape {
                 pixel_count,
@@ -212,7 +219,7 @@ impl<T> BandMaterializer<T> {
             },
             layout,
             out,
-            written_bands: vec![false; band_count],
+            written_bands,
             active_band: None,
         })
     }
