@@ -108,7 +108,9 @@ fn decode_huffman_into_with_validity<T: Sample, W: BandWriter<T>, V: Validity>(
                             } else {
                                 delta += prev_value;
                             }
-                            let wrapped = ((delta as i64) & 0xFF) as f64;
+                            // Wrap in the source byte range before conversion: signed
+                            // samples must stay in -128..=127, including predictors.
+                            let wrapped = (((delta + offset) as i64) & 0xFF) as f64 - offset;
                             prev_value = wrapped;
                             wrapped
                         } else {
