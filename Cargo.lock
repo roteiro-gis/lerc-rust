@@ -274,11 +274,11 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "lerc-core"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "lerc-reader"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "clap",
  "criterion",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "lerc-writer"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "clap",
  "criterion",

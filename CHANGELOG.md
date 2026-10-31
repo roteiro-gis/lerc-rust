@@ -3,9 +3,11 @@
 ## Unreleased
 
 - preserve the requested writer error bound when raising floating-point quantization bounds to a coarser grid; store blocks raw when bit-stuffed or constant reconstruction would exceed the original limit
-
 - add `EncoderProfile::Gdal`, an opt-in writer profile that reproduces the Lerc2 v4 blobs GDAL writes for `COMPRESS=LERC*` (libLerc's lookup-table trigger, mask run-length encoding, and header micro-block size); byte-identical except lossless 8-bit Huffman blobs, which decode to identical values
 - shrink lossy writer output to libLerc size or below: store blocks whose range is within `max_z_error` as constants instead of raw values, add lookup-table bit-stuffing, retry low-bit-rate rasters with doubled micro-blocks, and raise floating-point error bounds to a coarser decimal grid the values already lie on, following libLerc's encoder decisions
+
+## 0.5.0 - 2026-07-25
+
 - fix Lerc1 remainder-tile decoding and inspection for legal grids whose final tile is larger than the base tile, and replace unchecked reader size arithmetic
 - align integer zero-error encoding and multidimensional no-data filtering/remapping with libLerc semantics; constrain micro-block sizes to the libLerc-compatible range 2 through 32
 - fix signed reduced offsets and absolute-range clamping for bit-stuffed v5 difference tiles
@@ -22,7 +24,6 @@
 - make `BandSetInfo` and `DecodedBandSet` construction-safe through validated constructors and read-only accessors
 - report allocation reservation failures without aborting primary decode, materialization, streaming, or encode output paths, and eliminate padded bit-stuffed scratch copies
 - test the minimal and Rayon-only reader configurations independently from the optional ndarray integration
-- prepare the coordinated workspace crates for 0.5.0; keep these changes under Unreleased until the release is tagged
 
 ## 0.4.3 - 2026-06-25
 

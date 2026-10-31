@@ -61,11 +61,11 @@ dependencies = [
 
 [[package]]
 name = "lerc-core"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "lerc-reader"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "lerc-core",
  "ndarray",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "lerc-writer"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "lerc-core",
 ]
