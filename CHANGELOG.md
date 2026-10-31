@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- preserve the requested writer error bound when raising floating-point quantization bounds to a coarser grid; store blocks raw when bit-stuffed or constant reconstruction would exceed the original limit
+
 - add `EncoderProfile::Gdal`, an opt-in writer profile that reproduces the Lerc2 v4 blobs GDAL writes for `COMPRESS=LERC*` (libLerc's lookup-table trigger, mask run-length encoding, and header micro-block size); byte-identical except lossless 8-bit Huffman blobs, which decode to identical values
 - shrink lossy writer output to libLerc size or below: store blocks whose range is within `max_z_error` as constants instead of raw values, add lookup-table bit-stuffing, retry low-bit-rate rasters with doubled micro-blocks, and raise floating-point error bounds to a coarser decimal grid the values already lie on, following libLerc's encoder decisions
 - fix Lerc1 remainder-tile decoding and inspection for legal grids whose final tile is larger than the base tile, and replace unchecked reader size arithmetic

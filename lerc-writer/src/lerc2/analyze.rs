@@ -16,6 +16,8 @@ pub(super) struct RasterAnalysis {
     pub(super) depth: u32,
     pub(super) valid_pixel_count: u32,
     pub(super) max_z_error: f64,
+    /// Reconstruction limit, kept separate from the raised header bound.
+    pub(super) requested_max_z_error: f64,
     pub(super) micro_block_size: u32,
     pub(super) z_min: f64,
     pub(super) z_max: f64,
@@ -238,6 +240,8 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
         );
     }
 
+    // No-data remapping may tighten the limit; a grid raise must never relax it.
+    let requested_max_z_error = options.max_z_error.min(max_z_error);
     let mut statistics = Some(statistics);
     let mut finished_statistics = if input_no_data_value.is_some() {
         Some(finish_statistics(
@@ -266,6 +270,7 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
         depth: raster.depth(),
         data_type,
         max_z_error,
+        requested_max_z_error,
         micro_block_size,
         profile: options.profile,
     };
@@ -315,6 +320,7 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
         depth: raster.depth(),
         valid_pixel_count: finished_statistics.valid_pixel_count,
         max_z_error,
+        requested_max_z_error,
         micro_block_size: options.micro_block_size,
         z_min: finished_statistics.z_min,
         z_max: finished_statistics.z_max,
