@@ -22,7 +22,7 @@ use mask::{
     validate_slice as validate_mask_slice, MaskKind, PreparedMask,
 };
 use options::validate as validate_encode_options;
-pub use options::EncodeOptions;
+pub use options::{EncodeOptions, EncoderProfile};
 use tiles::{write as write_tiled_body, TileScratch, TilingPlan};
 
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
@@ -35,6 +35,10 @@ const MAX_MICRO_BLOCK_SIZE: u32 = 32;
 #[derive(Debug, Clone)]
 struct EncodePlan {
     version: i32,
+    /// Micro-block size recorded in the header. libLerc keeps a doubled size
+    /// once the doubled tiling wins, even if one-sweep storage then replaces
+    /// the tiles, so this can differ from the tiled body's size.
+    micro_block_size: u32,
     body: BodyPlan,
 }
 
@@ -597,12 +601,14 @@ fn select_encode_plan(
     if analysis.valid_pixel_count == 0 || analysis.z_min == analysis.z_max {
         return Ok(EncodePlan {
             version: version_with_no_data(analysis, VERSION_4),
+            micro_block_size: analysis.micro_block_size,
             body: BodyPlan::Constant,
         });
     }
     if has_per_depth_constant(analysis) {
         return Ok(EncodePlan {
             version: version_with_no_data(analysis, VERSION_4),
+            micro_block_size: analysis.micro_block_size,
             body: BodyPlan::PerDepthConstant,
         });
     }
@@ -655,10 +661,12 @@ fn select_encode_plan(
     if one_sweep_len <= best_non_one_len {
         return Ok(EncodePlan {
             version: version_with_no_data(analysis, VERSION_4),
+            micro_block_size: tiling.micro_block_size,
             body: BodyPlan::OneSweep,
         });
     }
 
+    let micro_block_size = tiling.micro_block_size;
     let best_body = match selected_huffman {
         Some(huffman) => BodyPlan::Huffman(huffman),
         None => BodyPlan::Tiled(tiling),
@@ -666,6 +674,7 @@ fn select_encode_plan(
 
     Ok(EncodePlan {
         version: version_with_no_data(analysis, best_version),
+        micro_block_size,
         body: best_body,
     })
 }

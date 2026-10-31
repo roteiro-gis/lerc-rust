@@ -125,3 +125,47 @@ pub fn all() -> Vec<Surface> {
         masked_depth(),
     ]
 }
+
+/// Polynomial-only surfaces (no transcendental functions, so the `f32`
+/// values are identical on every platform) used with the vendored
+/// GDAL-written fixtures.
+pub fn gdal_fixture_depth() -> Surface {
+    const WIDTH: usize = 160;
+    const HEIGHT: usize = 112;
+    let depth = |col: f64, row: f64| {
+        let x = col / WIDTH as f64;
+        let y = row / HEIGHT as f64;
+        let bowl = 9.0 * x * (1.0 - x) * (1.5 - y) * (0.5 + y);
+        bowl + 0.25 * (5.0 * y).floor() - 0.6 + 0.004 * ((col * 3.0 + row * 7.0) % 3.0)
+    };
+    Surface {
+        name: "gdal-fixture-depth",
+        width: WIDTH,
+        height: HEIGHT,
+        pixels: grid(WIDTH, HEIGHT, |col, row| depth(col, row).max(0.0)),
+        mask: Some(
+            (0..WIDTH * HEIGHT)
+                .map(|pixel| u8::from(depth((pixel % WIDTH) as f64, (pixel / WIDTH) as f64) > 0.0))
+                .collect(),
+        ),
+        max_z_error: 0.01,
+    }
+}
+
+/// Centimetre-rounded elevations, all valid, encoded with a millimetre bound.
+pub fn gdal_fixture_elevation() -> Surface {
+    const WIDTH: usize = 160;
+    const HEIGHT: usize = 112;
+    Surface {
+        name: "gdal-fixture-elevation",
+        width: WIDTH,
+        height: HEIGHT,
+        pixels: grid(WIDTH, HEIGHT, |col, row| {
+            let x = col / WIDTH as f64;
+            let y = row / HEIGHT as f64;
+            (100.0 * (210.0 + 14.0 * x * x - 9.0 * x * y + 6.0 * y * y * y)).round() / 100.0
+        }),
+        mask: None,
+        max_z_error: 0.001,
+    }
+}

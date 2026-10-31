@@ -7,6 +7,6 @@ mod lerc2;
 
 pub use lerc2::{
     encode, encode_band_set, encode_band_set_into, encode_into, encoded_band_set_len_upper_bound,
-    encoded_len_upper_bound, EncodeOptions,
+    encoded_len_upper_bound, EncodeOptions, EncoderProfile,
 };
 pub use lerc_core::{BandSetView, MaskView, RasterView};

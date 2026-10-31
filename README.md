@@ -48,6 +48,26 @@ let blob = encode(
 )?;
 ```
 
+### Encoder Profiles
+
+By default the writer produces the smallest blob it can. To reproduce the
+Lerc2 blobs GDAL writes for `COMPRESS=LERC`, `LERC_DEFLATE` or `LERC_ZSTD`
+(for example, to make a GeoTIFF byte-identical to a GDAL-written one), select
+the GDAL profile:
+
+```rust
+use lerc_writer::{EncodeOptions, EncoderProfile};
+
+let options = EncodeOptions::new()
+    .with_max_z_error(0.01)
+    .with_profile(EncoderProfile::Gdal);
+```
+
+Both profiles keep every valid sample within `max_z_error` and decode to the
+same values for single-depth rasters. The GDAL profile always writes Lerc2 v4
+and is byte-identical to GDAL except for lossless 8-bit rasters, where libLerc's
+Huffman tables depend on its C++ standard library; those decode identically.
+
 ### Features
 
 `lerc-reader` enables `ndarray` by default. Disable default features for a

@@ -546,3 +546,204 @@ fn lossy_surfaces_decode_with_liblerc_and_are_no_larger() {
         );
     }
 }
+
+fn assert_gdal_profile_matches<T>(
+    helper: &std::path::Path,
+    name: &str,
+    samples: &[T],
+    mask: Option<&[u8]>,
+    (width, height, depth): (usize, usize, usize),
+    max_z_error: f64,
+) where
+    T: lerc_core::Sample + reference::SampleBytes,
+{
+    let raster =
+        lerc_core::RasterView::new(width as u32, height as u32, depth as u32, samples).unwrap();
+    let mask_view =
+        mask.map(|mask| lerc_core::MaskView::new(width as u32, height as u32, mask).unwrap());
+    let blob = lerc_writer::encode(
+        raster,
+        mask_view,
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(max_z_error)
+            .with_profile(lerc_writer::EncoderProfile::Gdal),
+    )
+    .unwrap();
+    let reference_blob = reference::encode_with_reference(
+        helper,
+        samples,
+        mask,
+        reference::ReferenceEncodeOptions {
+            width,
+            height,
+            depth,
+            max_z_error,
+            codec_version: 4,
+            no_data_value: None,
+        },
+    );
+    // libLerc Huffman-codes lossless 8-bit data. Its code lengths depend on
+    // how the C++ standard library's heap breaks frequency ties, so only the
+    // decoded values are compared there.
+    let huffman_candidate = T::DATA_TYPE.byte_len() == 1 && max_z_error < 1.0;
+    if huffman_candidate {
+        let ours = lerc_reader::decode(&blob).unwrap();
+        let theirs = lerc_reader::decode(&reference_blob).unwrap();
+        assert_eq!(ours.pixels, theirs.pixels, "{name}: decoded values differ");
+        assert_eq!(ours.mask, theirs.mask, "{name}: decoded masks differ");
+        return;
+    }
+    if blob != reference_blob {
+        let first_difference = blob
+            .iter()
+            .zip(&reference_blob)
+            .enumerate()
+            // Skip the Fletcher-32 checksum, which differs whenever anything does.
+            .position(|(offset, (left, right))| !(10..14).contains(&offset) && left != right)
+            .unwrap_or(blob.len().min(reference_blob.len()));
+        panic!(
+            "{name} (max_z_error {max_z_error}): {} bytes vs libLerc {} bytes, first difference at byte {first_difference}",
+            blob.len(),
+            reference_blob.len()
+        );
+    }
+}
+
+fn gdal_profile_type_matrix<T>(helper: &std::path::Path, name: &str, errors: &[f64])
+where
+    T: lerc_core::Sample + reference::SampleBytes,
+{
+    const WIDTH: usize = 40;
+    const HEIGHT: usize = 24;
+    let ramp: Vec<T> = (0..WIDTH * HEIGHT)
+        .map(|index| T::from_f64(((index * 17 + index / 3) % 59) as f64))
+        .collect();
+    // Plateaus with sparse spikes exercise constant, lookup-table and raw blocks.
+    let plateaus: Vec<T> = (0..WIDTH * HEIGHT)
+        .map(|index| {
+            let (col, row) = (index % WIDTH, index / WIDTH);
+            let spike = if (col * 7 + row * 3) % 23 == 0 { 90 } else { 0 };
+            T::from_f64((10 + (col / 8) * 4 + (row / 8) * 2 + spike) as f64)
+        })
+        .collect();
+    let mask: Vec<u8> = (0..WIDTH * HEIGHT)
+        .map(|index| u8::from(index % 5 != 0 && index % 11 != 0))
+        .collect();
+    let depth3: Vec<T> = (0..WIDTH * HEIGHT * 3)
+        .map(|index| T::from_f64(((index * 5 + index / 7) % 41) as f64))
+        .collect();
+    for &max_z_error in errors {
+        for (variant, samples) in [("ramp", &ramp), ("plateaus", &plateaus)] {
+            assert_gdal_profile_matches(
+                helper,
+                &format!("{name} {variant}"),
+                samples,
+                None,
+                (WIDTH, HEIGHT, 1),
+                max_z_error,
+            );
+            assert_gdal_profile_matches(
+                helper,
+                &format!("{name} {variant} masked"),
+                samples,
+                Some(&mask),
+                (WIDTH, HEIGHT, 1),
+                max_z_error,
+            );
+        }
+        assert_gdal_profile_matches(
+            helper,
+            &format!("{name} depth 3"),
+            &depth3,
+            Some(&mask),
+            (WIDTH, HEIGHT, 3),
+            max_z_error,
+        );
+    }
+}
+
+#[test]
+fn gdal_profile_matches_liblerc_bytes() {
+    let Some(helper) = reference::helper_path() else {
+        eprintln!("skipping libLerc parity test because LERC_READER_REFERENCE_HELPER is unset");
+        return;
+    };
+
+    let integer_errors = [0.0, 0.5, 1.0, 3.0];
+    gdal_profile_type_matrix::<i8>(&helper, "i8", &integer_errors);
+    gdal_profile_type_matrix::<u8>(&helper, "u8", &integer_errors);
+    gdal_profile_type_matrix::<i16>(&helper, "i16", &integer_errors);
+    gdal_profile_type_matrix::<u16>(&helper, "u16", &integer_errors);
+    gdal_profile_type_matrix::<i32>(&helper, "i32", &integer_errors);
+    gdal_profile_type_matrix::<u32>(&helper, "u32", &integer_errors);
+    let float_errors = [0.0, 0.001, 0.01, 0.3, 2.0];
+    gdal_profile_type_matrix::<f32>(&helper, "f32", &float_errors);
+    gdal_profile_type_matrix::<f64>(&helper, "f64", &float_errors);
+
+    let huffman: Vec<u8> = (0..256)
+        .map(|index| if index % 64 < 48 { 7 } else { 9 })
+        .collect();
+    assert_gdal_profile_matches(&helper, "u8 Huffman", &huffman, None, (16, 16, 1), 0.5);
+
+    // A few hundred scattered noisy pixels: libLerc doubles the micro-block
+    // size for the mostly empty grid, then stores the values in one sweep
+    // while keeping the doubled size in the header.
+    const SPARSE: usize = 256;
+    let mut state = 0x2545_f491u32;
+    let mut sparse_mask = vec![0u8; SPARSE * SPARSE];
+    let sparse: Vec<f32> = (0..SPARSE * SPARSE)
+        .map(|pixel| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            sparse_mask[pixel] = u8::from(state % 211 == 0);
+            (state % 100_000) as f32 * 0.37
+        })
+        .collect();
+    assert_gdal_profile_matches(
+        &helper,
+        "sparse noisy",
+        &sparse,
+        Some(&sparse_mask),
+        (SPARSE, SPARSE, 1),
+        0.0001,
+    );
+    let sparse_blob = lerc_writer::encode(
+        lerc_core::RasterView::new(SPARSE as u32, SPARSE as u32, 1, &sparse).unwrap(),
+        Some(lerc_core::MaskView::new(SPARSE as u32, SPARSE as u32, &sparse_mask).unwrap()),
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.0001)
+            .with_profile(lerc_writer::EncoderProfile::Gdal),
+    )
+    .unwrap();
+    assert_eq!(
+        lerc_reader::get_blob_info(&sparse_blob)
+            .unwrap()
+            .micro_block_size,
+        16
+    );
+
+    for surface in surfaces::all() {
+        assert_gdal_profile_matches(
+            &helper,
+            surface.name,
+            &surface.pixels,
+            surface.mask.as_deref(),
+            (surface.width, surface.height, 1),
+            surface.max_z_error,
+        );
+        let wide: Vec<f64> = surface
+            .pixels
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect();
+        assert_gdal_profile_matches(
+            &helper,
+            &format!("{} f64", surface.name),
+            &wide,
+            surface.mask.as_deref(),
+            (surface.width, surface.height, 1),
+            surface.max_z_error,
+        );
+    }
+}

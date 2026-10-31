@@ -5,8 +5,10 @@ use super::{
         encode_lut_payload, encode_simple_payload, lut_payload_len, max_value_to_quantize,
         quantize_block, quantized_block_max, reduce_data_type, simple_payload_len,
     },
-    needs_encode_mode_flag, pixel_is_valid, tile_header, write_value_as, ByteSink, RasterAnalysis,
-    RasterSource, VERSION_4, VERSION_5,
+    needs_encode_mode_flag,
+    options::EncoderProfile,
+    pixel_is_valid, tile_header, write_value_as, ByteSink, RasterAnalysis, RasterSource, VERSION_4,
+    VERSION_5,
 };
 
 #[derive(Debug, Default)]
@@ -62,6 +64,7 @@ pub(super) struct TilingOptions {
     pub(super) data_type: DataType,
     pub(super) max_z_error: f64,
     pub(super) micro_block_size: u32,
+    pub(super) profile: EncoderProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -219,7 +222,11 @@ pub(super) fn plan<T: Sample, R: RasterSource<T>>(
         options.depth,
         options.micro_block_size,
     );
-    let diff_supported = supports_diff_tiles(options.data_type, options.max_z_error, options.depth);
+    let gdal_profile = options.profile == EncoderProfile::Gdal;
+    // Lerc2 v4, which the GDAL profile writes, has no difference tiles.
+    let diff_supported =
+        !gdal_profile && supports_diff_tiles(options.data_type, options.max_z_error, options.depth);
+    let all_valid = mask.map_or(true, |mask| mask.iter().all(|&valid| valid != 0));
     let mut scratch = TileScratch::default();
     let mut pixel_values = Vec::with_capacity(grid.depth);
     let mut data_len = 0usize;
@@ -268,11 +275,14 @@ pub(super) fn plan<T: Sample, R: RasterSource<T>>(
                     .len()
                     .checked_mul(options.data_type.byte_len())
                     .ok_or(Error::SizeOverflow("raw block byte count"))?;
+                let try_lut =
+                    !gdal_profile || liblerc_tries_lut(values, all_valid, options.max_z_error);
                 let absolute_plan = choose_absolute_block_plan(
                     values,
                     raw_byte_len,
                     options.data_type,
                     options.max_z_error,
+                    try_lut,
                     &mut scratch.quant,
                 )?;
                 let mut selected_plan = absolute_plan;
@@ -404,13 +414,22 @@ fn choose_absolute_block_plan(
     raw_byte_len: usize,
     base_type: DataType,
     max_z_error: f64,
+    try_lut: bool,
     quant: &mut QuantScratch,
 ) -> Result<BlockPlan> {
     let raw_len = raw_byte_len
         .checked_add(1)
         .ok_or(Error::SizeOverflow("raw block byte count"))?;
-    choose_block_plan(values, Some(raw_len), base_type, max_z_error, false, quant)?
-        .ok_or(Error::Internal("absolute tile plan unexpectedly missing"))
+    choose_block_plan(
+        values,
+        Some(raw_len),
+        base_type,
+        max_z_error,
+        false,
+        try_lut,
+        quant,
+    )?
+    .ok_or(Error::Internal("absolute tile plan unexpectedly missing"))
 }
 
 fn choose_diff_block_plan(
@@ -418,7 +437,15 @@ fn choose_diff_block_plan(
     max_z_error: f64,
     quant: &mut QuantScratch,
 ) -> Result<Option<BlockPlan>> {
-    choose_block_plan(diff_values, None, DataType::I32, max_z_error, true, quant)
+    choose_block_plan(
+        diff_values,
+        None,
+        DataType::I32,
+        max_z_error,
+        true,
+        true,
+        quant,
+    )
 }
 
 /// Picks the smallest representation of one block.
@@ -426,14 +453,17 @@ fn choose_diff_block_plan(
 /// The decision follows libLerc: the block minimum is the
 /// offset, a block whose range rounds to zero quantization steps is stored as
 /// a constant, and other blocks are bit-stuffed in simple or lookup-table
-/// mode, whichever is smaller. Raw storage (`raw_len`, absent for diff blocks)
-/// is used only when nothing else is strictly smaller.
+/// mode, whichever is smaller (lookup tables only when `try_lut`). Raw
+/// storage (`raw_len`, absent for diff blocks) is used only when nothing else
+/// is strictly smaller.
+#[allow(clippy::too_many_arguments)]
 fn choose_block_plan(
     values: &[f64],
     raw_len: Option<usize>,
     base_type: DataType,
     max_z_error: f64,
     is_diff: bool,
+    try_lut: bool,
     quant: &mut QuantScratch,
 ) -> Result<Option<BlockPlan>> {
     let zero = BlockPlan {
@@ -484,13 +514,18 @@ fn choose_block_plan(
         }
         let max_value = quant.quantized.iter().copied().max().unwrap_or(0);
         let simple_len = simple_payload_len(values.len(), max_value)?;
-        quant.sorted.clear();
-        quant.sorted.extend_from_slice(&quant.quantized);
-        quant.sorted.sort_unstable();
-        let (payload_len, lut) = match lut_payload_len(&quant.sorted)? {
-            Some(lut_len) if lut_len < simple_len => (lut_len, true),
-            _ => (simple_len, false),
-        };
+        let mut payload = (simple_len, false);
+        if try_lut {
+            quant.sorted.clear();
+            quant.sorted.extend_from_slice(&quant.quantized);
+            quant.sorted.sort_unstable();
+            if let Some(lut_len) = lut_payload_len(&quant.sorted)? {
+                if lut_len < simple_len {
+                    payload = (lut_len, true);
+                }
+            }
+        }
+        let (payload_len, lut) = payload;
         BlockBody::Bitstuff {
             offset: min,
             offset_type,
@@ -630,6 +665,26 @@ fn min_max(values: &[f64]) -> (f64, f64) {
         max = max.max(value);
     }
     (min, max)
+}
+
+/// libLerc's cheap trigger for evaluating lookup-table mode on a block: more
+/// than four values, a range above three error bounds, and more than half of
+/// the values equal to their predecessor in scan order.
+///
+/// libLerc seeds the predecessor with zero when the whole raster is valid and
+/// with the first value otherwise; the GDAL profile reproduces that.
+fn liblerc_tries_lut(values: &[f64], all_valid: bool, max_z_error: f64) -> bool {
+    if values.len() <= 4 {
+        return false;
+    }
+    let (min, max) = min_max(values);
+    let mut previous = if all_valid { 0.0 } else { values[0] };
+    let mut repeats = 0usize;
+    for &value in &values[usize::from(!all_valid)..] {
+        repeats += usize::from(value == previous);
+        previous = value;
+    }
+    max > min + 3.0 * max_z_error && 2 * repeats > values.len()
 }
 
 fn supports_diff_tiles(data_type: DataType, max_z_error: f64, depth: u32) -> bool {

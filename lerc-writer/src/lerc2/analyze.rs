@@ -5,7 +5,7 @@ use super::{
     mask::{pixel_is_valid, shared_mask_for_band, validate_slice, MaskKind, PreparedMask},
     select_encode_plan,
     tiles::{plan as plan_tiled_body, TilingOptions},
-    BandRasterView, BodyPlan, EncodeOptions, EncodePlan, RasterSource, RemappedRaster,
+    BandRasterView, EncodeOptions, EncodePlan, RasterSource, RemappedRaster,
 };
 
 #[derive(Debug, Clone)]
@@ -144,8 +144,11 @@ pub(super) fn prepare_band_set<'a, T: Sample>(
     }
     let pixel_count = band_set.pixel_count()?;
     for band in &mut prepared {
-        band.mask
-            .prepare_payload(pixel_count, band.analysis.valid_pixel_count as usize)?;
+        band.mask.prepare_payload(
+            pixel_count,
+            band.analysis.valid_pixel_count as usize,
+            options.profile,
+        )?;
     }
     Ok(prepared)
 }
@@ -159,6 +162,7 @@ pub(super) fn prepare_single_raster<'a, T: Sample, R: RasterSource<T>>(
     prepared.mask.prepare_payload(
         raster.pixel_count()?,
         prepared.analysis.valid_pixel_count as usize,
+        options.profile,
     )?;
     Ok(prepared)
 }
@@ -263,6 +267,7 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
         data_type,
         max_z_error,
         micro_block_size,
+        profile: options.profile,
     };
     let tiling = if skip_tiling {
         None
@@ -327,9 +332,7 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
             |_, _| Ok(()),
         )
     })?;
-    if let BodyPlan::Tiled(tiling) = &plan.body {
-        analysis.micro_block_size = tiling.micro_block_size;
-    }
+    analysis.micro_block_size = plan.micro_block_size;
     Ok(PreparedBand {
         mask,
         analysis,

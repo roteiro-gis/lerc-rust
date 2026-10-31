@@ -2,6 +2,8 @@ use std::borrow::Cow;
 
 use lerc_core::{Error, MaskView, Result};
 
+use super::options::EncoderProfile;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) enum MaskKind<'a> {
     None,
@@ -93,6 +95,7 @@ impl<'a> PreparedMask<'a> {
         &mut self,
         pixel_count: usize,
         valid_pixel_count: usize,
+        profile: EncoderProfile,
     ) -> Result<()> {
         let kind = match self.storage {
             MaskStorage::None => MaskKind::None,
@@ -107,7 +110,7 @@ impl<'a> PreparedMask<'a> {
                     .ok_or(Error::Internal("external mask has no data"))?,
             ),
         };
-        self.payload = encode_mask_rle(kind, pixel_count, valid_pixel_count)?;
+        self.payload = encode_mask_rle(kind, pixel_count, valid_pixel_count, profile)?;
         Ok(())
     }
 
@@ -157,6 +160,7 @@ fn encode_mask_rle(
     mask: MaskKind<'_>,
     pixel_count: usize,
     valid_pixel_count: usize,
+    profile: EncoderProfile,
 ) -> Result<Vec<u8>> {
     if valid_pixel_count == 0 || valid_pixel_count == pixel_count {
         return Ok(Vec::new());
@@ -167,7 +171,11 @@ fn encode_mask_rle(
 
     let bitset = pack_mask_bitset(mask, pixel_count)?;
     let mut out = Vec::new();
-    emit_mask_rle_segments(&bitset, |segment| {
+    let emit_segments = match profile {
+        EncoderProfile::Compact => emit_mask_rle_segments,
+        EncoderProfile::Gdal => emit_liblerc_mask_rle_segments,
+    };
+    emit_segments(&bitset, &mut |segment| {
         match segment {
             MaskRleSegment::Literal(bytes) => {
                 out.extend_from_slice(&(bytes.len() as i16).to_le_bytes());
@@ -213,10 +221,9 @@ enum MaskRleSegment<'a> {
     Repeat { value: u8, count: usize },
 }
 
-fn emit_mask_rle_segments<F>(bitset: &[u8], mut emit: F) -> Result<()>
-where
-    F: FnMut(MaskRleSegment<'_>) -> Result<()>,
-{
+type EmitSegment<'e> = dyn FnMut(MaskRleSegment<'_>) -> Result<()> + 'e;
+
+fn emit_mask_rle_segments(bitset: &[u8], emit: &mut EmitSegment<'_>) -> Result<()> {
     let mut literal_start = 0usize;
     let mut offset = 0usize;
 
@@ -257,4 +264,86 @@ where
     emit_mask_literal_chunks(&bitset[literal_start..], &mut |bytes| {
         emit(MaskRleSegment::Literal(bytes))
     })
+}
+
+/// Shortest repeat that libLerc's mask encoder switches to from a literal.
+const LIBLERC_MIN_REPEAT: usize = 5;
+
+/// Run-length encodes the mask bitset exactly as libLerc's `RLE::compress`
+/// (Esri LERC, Apache-2.0) does, so the GDAL profile writes identical masks.
+///
+/// Bytes accumulate as a literal until a run of at least five equal bytes
+/// starts; a run ends at the first different byte. Both kinds of segment are
+/// split at 32_767 bytes. The final byte always closes the current segment.
+fn emit_liblerc_mask_rle_segments(bitset: &[u8], emit: &mut EmitSegment<'_>) -> Result<()> {
+    let Some(&last) = bitset.last() else {
+        return Ok(());
+    };
+    let len = bitset.len();
+    let max_count = i16::MAX as usize;
+    let mut literal_start = 0usize;
+    let mut literal_len = 0usize;
+    let mut repeat_len = 0usize;
+    let mut in_literal = true;
+
+    for index in 0..len - 1 {
+        let value = bitset[index];
+        if value != bitset[index + 1] {
+            if in_literal {
+                literal_len += 1;
+            } else {
+                emit(MaskRleSegment::Repeat {
+                    value,
+                    count: repeat_len + 1,
+                })?;
+                in_literal = true;
+                literal_start = index + 1;
+                literal_len = 0;
+                repeat_len = 0;
+            }
+        } else if !in_literal {
+            repeat_len += 1;
+        } else if index + LIBLERC_MIN_REPEAT < len
+            && bitset[index..index + LIBLERC_MIN_REPEAT]
+                .iter()
+                .all(|&byte| byte == value)
+        {
+            if literal_len > 0 {
+                emit(MaskRleSegment::Literal(
+                    &bitset[literal_start..literal_start + literal_len],
+                ))?;
+            }
+            in_literal = false;
+            literal_len = 0;
+            repeat_len = 1;
+        } else {
+            literal_len += 1;
+        }
+
+        if literal_len == max_count {
+            emit(MaskRleSegment::Literal(
+                &bitset[literal_start..literal_start + literal_len],
+            ))?;
+            literal_start += literal_len;
+            literal_len = 0;
+        }
+        if repeat_len == max_count {
+            emit(MaskRleSegment::Repeat {
+                value,
+                count: repeat_len,
+            })?;
+            repeat_len = 0;
+        }
+    }
+
+    if in_literal {
+        emit(MaskRleSegment::Literal(
+            &bitset[literal_start..literal_start + literal_len + 1],
+        ))
+    } else {
+        emit(MaskRleSegment::Repeat {
+            value: last,
+            count: repeat_len + 1,
+        })
+    }
 }

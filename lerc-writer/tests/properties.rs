@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use lerc_core::{DataType, MaskView, RasterView, Sample};
-use lerc_writer::{encode, EncodeOptions};
+use lerc_writer::{encode, EncodeOptions, EncoderProfile};
 use proptest::prelude::*;
 
 const WIDTH: u32 = 7;
@@ -38,15 +38,23 @@ fn check_roundtrip<T: Sample + std::fmt::Debug>(
     values: &[T],
     validity: &[bool],
     max_z_error: f64,
+    profile: EncoderProfile,
 ) -> Result<(), TestCaseError> {
     let value_count = PIXEL_COUNT * depth;
     let values = &values[..value_count];
     let mask_data: Vec<u8> = validity.iter().map(|&valid| u8::from(valid)).collect();
     let raster = RasterView::new(WIDTH, HEIGHT, depth as u32, values).unwrap();
     let mask = MaskView::new(WIDTH, HEIGHT, &mask_data).unwrap();
+    // The GDAL profile always uses libLerc's 8x8 base micro-blocks.
+    let micro_block_size = if profile == EncoderProfile::Gdal {
+        8
+    } else {
+        4
+    };
     let options = EncodeOptions::new()
         .with_max_z_error(max_z_error)
-        .with_micro_block_size(4);
+        .with_micro_block_size(micro_block_size)
+        .with_profile(profile);
     let blob = encode(raster, Some(mask), options).unwrap();
     let decoded = lerc_reader::decode_to_f64(&blob).unwrap();
     prop_assert_eq!(decoded.pixels.len(), value_count);
@@ -77,7 +85,8 @@ fn f32_lossy_roundtrip_accounts_for_storage_rounding() {
     validity[12] = true;
     validity[26] = true;
 
-    check_roundtrip::<f32>(3, &values, &validity, 0.001).unwrap();
+    check_roundtrip::<f32>(3, &values, &validity, 0.001, EncoderProfile::Compact).unwrap();
+    check_roundtrip::<f32>(3, &values, &validity, 0.001, EncoderProfile::Gdal).unwrap();
 }
 
 macro_rules! roundtrip_property {
@@ -89,8 +98,9 @@ macro_rules! roundtrip_property {
                 values in prop::collection::vec($strategy, PIXEL_COUNT * 3),
                 validity in prop::collection::vec(any::<bool>(), PIXEL_COUNT),
                 max_z_error in prop_oneof![Just(0.0), Just(0.5), Just(0.001)],
+                profile in prop_oneof![Just(EncoderProfile::Compact), Just(EncoderProfile::Gdal)],
             ) {
-                check_roundtrip::<$sample>(depth, &values, &validity, max_z_error)?;
+                check_roundtrip::<$sample>(depth, &values, &validity, max_z_error, profile)?;
             }
         }
     };
