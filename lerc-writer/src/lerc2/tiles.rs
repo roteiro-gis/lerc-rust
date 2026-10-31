@@ -63,6 +63,7 @@ pub(super) struct TilingOptions {
     pub(super) depth: u32,
     pub(super) data_type: DataType,
     pub(super) max_z_error: f64,
+    pub(super) requested_max_z_error: f64,
     pub(super) micro_block_size: u32,
     pub(super) profile: EncoderProfile,
 }
@@ -282,6 +283,7 @@ pub(super) fn plan<T: Sample, R: RasterSource<T>>(
                     raw_byte_len,
                     options.data_type,
                     options.max_z_error,
+                    options.requested_max_z_error,
                     try_lut,
                     &mut scratch.quant,
                 )?;
@@ -297,6 +299,7 @@ pub(super) fn plan<T: Sample, R: RasterSource<T>>(
                     if let Some(diff_plan) = choose_diff_block_plan(
                         &scratch.diff_values_f64,
                         options.max_z_error,
+                        options.requested_max_z_error,
                         &mut scratch.quant,
                     )? {
                         if diff_plan.encoded_len() < selected_plan.encoded_len() {
@@ -362,6 +365,7 @@ pub(super) fn write<T: Sample, R: RasterSource<T>>(
             &scratch.values_f64,
             &scratch.prev_values_f64,
             analysis.max_z_error,
+            analysis.requested_max_z_error,
             &mut scratch.quant,
         )?;
         write_block_plan(
@@ -414,6 +418,7 @@ fn choose_absolute_block_plan(
     raw_byte_len: usize,
     base_type: DataType,
     max_z_error: f64,
+    requested_max_z_error: f64,
     try_lut: bool,
     quant: &mut QuantScratch,
 ) -> Result<BlockPlan> {
@@ -425,6 +430,7 @@ fn choose_absolute_block_plan(
         Some(raw_len),
         base_type,
         max_z_error,
+        requested_max_z_error,
         false,
         try_lut,
         quant,
@@ -435,6 +441,7 @@ fn choose_absolute_block_plan(
 fn choose_diff_block_plan(
     diff_values: &[f64],
     max_z_error: f64,
+    requested_max_z_error: f64,
     quant: &mut QuantScratch,
 ) -> Result<Option<BlockPlan>> {
     choose_block_plan(
@@ -442,6 +449,7 @@ fn choose_diff_block_plan(
         None,
         DataType::I32,
         max_z_error,
+        requested_max_z_error,
         true,
         true,
         quant,
@@ -462,6 +470,7 @@ fn choose_block_plan(
     raw_len: Option<usize>,
     base_type: DataType,
     max_z_error: f64,
+    requested_max_z_error: f64,
     is_diff: bool,
     try_lut: bool,
     quant: &mut QuantScratch,
@@ -497,7 +506,10 @@ fn choose_block_plan(
 
     let (type_code, offset_type) = reduce_data_type(min, base_type)?;
     let body = if (max_quantized + 0.5) as u32 == 0 {
-        // Every value lies within max_z_error of the minimum.
+        // A constant must satisfy the caller's limit, not just the raised grid.
+        if max - min > requested_max_z_error {
+            return Ok(raw);
+        }
         BlockBody::Constant {
             offset: min,
             offset_type,
@@ -508,6 +520,7 @@ fn choose_block_plan(
             values.iter().copied(),
             min,
             max_z_error,
+            requested_max_z_error,
             &mut quant.quantized,
         ) {
             return Ok(raw);
@@ -585,6 +598,7 @@ fn prepare_cached_block_payload(
     values: &[f64],
     prev_values: &[f64],
     max_z_error: f64,
+    requested_max_z_error: f64,
     quant: &mut QuantScratch,
 ) -> Result<()> {
     quant.payload.clear();
@@ -606,6 +620,7 @@ fn prepare_cached_block_payload(
                     .map(|(&value, &previous)| value - previous),
                 *offset,
                 max_z_error,
+                requested_max_z_error,
                 &mut quant.quantized,
             )
         } else {
@@ -613,6 +628,7 @@ fn prepare_cached_block_payload(
                 values.iter().copied(),
                 *offset,
                 max_z_error,
+                requested_max_z_error,
                 &mut quant.quantized,
             )
         };

@@ -747,3 +747,35 @@ fn gdal_profile_matches_liblerc_bytes() {
         );
     }
 }
+
+#[test]
+fn raised_grid_fallbacks_decode_with_liblerc() {
+    let Some(helper) = reference::helper_path() else {
+        eprintln!("skipping libLerc parity test because the helper is unset");
+        return;
+    };
+    let pixels: Vec<f64> = (0..32 * 16)
+        .map(|i| {
+            let step = if (i % 32) / 8 % 2 == 0 { 0.1 } else { 1.0 };
+            2f64.powi(43) + (i % 31) as f64 * step
+        })
+        .collect();
+    for profile in [
+        lerc_writer::EncoderProfile::Compact,
+        lerc_writer::EncoderProfile::Gdal,
+    ] {
+        let blob = lerc_writer::encode(
+            lerc_core::RasterView::new(32, 16, 1, &pixels).unwrap(),
+            None,
+            lerc_writer::EncodeOptions::new()
+                .with_max_z_error(0.001)
+                .with_profile(profile),
+        )
+        .unwrap();
+        assert_reference_decode::<f64>(
+            &helper,
+            &format!("raised-grid-fallback-{profile:?}"),
+            &blob,
+        );
+    }
+}

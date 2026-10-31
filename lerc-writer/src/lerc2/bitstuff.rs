@@ -14,17 +14,18 @@ pub(super) fn max_value_to_quantize(data_type: DataType) -> f64 {
 /// This mirrors libLerc's arithmetic: each value maps to
 /// `trunc((value - offset) / (2 * max_z_error) + 0.5)`, and a decoder rebuilds
 /// it as `offset + q * 2 * max_z_error`. Returns `false` when a reconstructed
-/// value would leave the requested error bound, which can only happen when the
-/// sample magnitude exhausts `f64` precision; callers then store the block raw.
+/// value would leave `requested_max_z_error`, even when the quantization bound
+/// was raised to a coarser grid; callers then store the block raw.
 pub(super) fn quantize_block(
     values: impl IntoIterator<Item = f64>,
     offset: f64,
     max_z_error: f64,
+    requested_max_z_error: f64,
     quantized: &mut Vec<u32>,
 ) -> bool {
     let scale = 1.0 / (2.0 * max_z_error);
     let step = 2.0 * max_z_error;
-    let tolerance = max_z_error + max_z_error.abs() * 1e-12 + 1e-12;
+    let tolerance = requested_max_z_error + requested_max_z_error.abs() * 1e-12 + 1e-12;
     quantized.clear();
     for value in values {
         let quantized_value = ((value - offset) * scale + 0.5) as u32;
