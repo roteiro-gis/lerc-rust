@@ -6,8 +6,8 @@ Use this checklist for coordinated `lerc-rust` workspace releases.
 
 1. Update `[workspace.package].version` in the root `Cargo.toml`.
 2. Update all internal dependency pins to the same version.
-3. Keep user-facing changes under `Unreleased` while preparing the release.
-   When tagging, rename that section to the version and actual release date.
+3. In the release prep PR, rename `Unreleased` to the release version and date.
+   The changelog must be finalized before merging the PR and tagging the release.
 4. Run the standard workspace checks:
 
 ```sh
