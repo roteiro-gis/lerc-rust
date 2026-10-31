@@ -87,7 +87,7 @@ fn encoded_bytes_snapshot_matrix() {
         .unwrap(),
     );
 
-    assert_eq!(hash, 0xb77f_1b09_14c6_a196);
+    assert_eq!(hash, 0x80ce_bed2_4772_40e6);
 }
 
 #[test]

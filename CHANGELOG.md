@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- shrink lossy writer output to libLerc size or below: store blocks whose range is within `max_z_error` as constants instead of raw values, add lookup-table bit-stuffing, retry low-bit-rate rasters with doubled micro-blocks, and raise floating-point error bounds to a coarser decimal grid the values already lie on, following libLerc's encoder decisions
 - fix Lerc1 remainder-tile decoding and inspection for legal grids whose final tile is larger than the base tile, and replace unchecked reader size arithmetic
 - align integer zero-error encoding and multidimensional no-data filtering/remapping with libLerc semantics; constrain micro-block sizes to the libLerc-compatible range 2 through 32
 - fix signed reduced offsets and absolute-range clamping for bit-stuffed v5 difference tiles

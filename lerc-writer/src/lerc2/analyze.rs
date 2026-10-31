@@ -5,7 +5,7 @@ use super::{
     mask::{pixel_is_valid, shared_mask_for_band, validate_slice, MaskKind, PreparedMask},
     select_encode_plan,
     tiles::{plan as plan_tiled_body, TilingOptions},
-    BandRasterView, EncodeOptions, EncodePlan, RasterSource, RemappedRaster,
+    BandRasterView, BodyPlan, EncodeOptions, EncodePlan, RasterSource, RemappedRaster,
 };
 
 #[derive(Debug, Clone)]
@@ -219,6 +219,9 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
     }
 
     let mut max_z_error = effective_max_z_error(data_type, options.max_z_error);
+    if input_no_data_value.is_none() {
+        max_z_error = raise_max_z_error_to_value_grid(raster, mask.data(), data_type, max_z_error);
+    }
     let original_no_data_value = has_mixed_no_data.then_some(options.no_data_value).flatten();
     let mut encoded_no_data_value = has_mixed_no_data.then_some(input_no_data_value).flatten();
     if let Some(no_data_value) = encoded_no_data_value.as_mut() {
@@ -251,22 +254,23 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
     } else {
         None
     };
+    let remapped_raster =
+        RemappedRaster::new(raster, original_no_data_value, encoded_no_data_value);
+    let tiling_options = |micro_block_size| TilingOptions {
+        width: raster.width(),
+        height: raster.height(),
+        depth: raster.depth(),
+        data_type,
+        max_z_error,
+        micro_block_size,
+    };
     let tiling = if skip_tiling {
         None
     } else {
-        let remapped_raster =
-            RemappedRaster::new(raster, original_no_data_value, encoded_no_data_value);
         Some(plan_tiled_body(
             remapped_raster,
             mask.data(),
-            TilingOptions {
-                width: raster.width(),
-                height: raster.height(),
-                depth: raster.depth(),
-                data_type,
-                max_z_error,
-                micro_block_size: options.micro_block_size,
-            },
+            tiling_options(options.micro_block_size),
             |pixel, values| {
                 if let Some(statistics) = statistics.as_mut() {
                     statistics.valid_pixel_count += 1;
@@ -299,7 +303,7 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
         finished_statistics.ok_or(Error::Internal("semantic statistics were not finalized"))?;
     let huffman_histograms = huffman_histograms.map(HistogramBuilder::finish);
 
-    let analysis = RasterAnalysis {
+    let mut analysis = RasterAnalysis {
         data_type,
         width: raster.width(),
         height: raster.height(),
@@ -315,12 +319,94 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
         max_values: finished_statistics.max_values,
         huffman_histograms,
     };
-    let plan = select_encode_plan(&analysis, tiling)?;
+    let plan = select_encode_plan(&analysis, tiling, |micro_block_size| {
+        plan_tiled_body(
+            remapped_raster,
+            mask.data(),
+            tiling_options(micro_block_size),
+            |_, _| Ok(()),
+        )
+    })?;
+    if let BodyPlan::Tiled(tiling) = &plan.body {
+        analysis.micro_block_size = tiling.micro_block_size;
+    }
     Ok(PreparedBand {
         mask,
         analysis,
         plan,
     })
+}
+
+/// Candidate coarser error bounds, as (max_z_error, 1 / quantization step).
+const VALUE_GRID_CANDIDATES: [(f64, f64); 9] = [
+    (0.5, 1.0),
+    (0.25, 2.0),
+    (0.05, 10.0),
+    (0.025, 20.0),
+    (0.005, 100.0),
+    (0.0025, 200.0),
+    (0.0005, 1_000.0),
+    (0.00025, 2_000.0),
+    (0.00005, 10_000.0),
+];
+
+/// Raises a lossy floating-point error bound when every valid value already
+/// sits on a coarser decimal grid.
+///
+/// Data stored at, say, centimetre resolution can be quantized with a step of
+/// 0.01 at no extra loss: each value is within `max_z_error / 2` of a grid
+/// point, and so is the block minimum used as the offset, so the
+/// reconstruction error stays within the requested `max_z_error`. This is
+/// libLerc's `TryRaiseMaxZError` rule; the raised bound is written
+/// to the header.
+fn raise_max_z_error_to_value_grid<T: Sample, R: RasterSource<T>>(
+    raster: R,
+    mask: Option<&[u8]>,
+    data_type: DataType,
+    max_z_error: f64,
+) -> f64 {
+    if !matches!(data_type, DataType::F32 | DataType::F64) || max_z_error <= 0.0 {
+        return max_z_error;
+    }
+    let mut candidates: Vec<(f64, f64, f64)> = VALUE_GRID_CANDIDATES
+        .iter()
+        .filter(|(candidate, _)| *candidate > max_z_error)
+        .map(|&(candidate, factor)| (candidate, factor, 0.0))
+        .collect();
+    let width = raster.width() as usize;
+    let depth = raster.depth() as usize;
+    let Ok(pixel_count) = raster.pixel_count() else {
+        return max_z_error;
+    };
+    let mut any_valid = false;
+    for row_start in (0..pixel_count).step_by(width.max(1)) {
+        for pixel in row_start..(row_start + width).min(pixel_count) {
+            if !pixel_is_valid(mask, pixel) {
+                continue;
+            }
+            any_valid = true;
+            for dim in 0..depth {
+                let value = raster.sample(pixel, dim).to_f64();
+                for (_, factor, round_error) in candidates.iter_mut() {
+                    let scaled = value * *factor;
+                    if scaled == (scaled as i32) as f64 {
+                        break;
+                    }
+                    *round_error = round_error.max(((scaled + 0.5).floor() - scaled).abs());
+                }
+            }
+        }
+        candidates.retain(|(_, factor, round_error)| round_error / factor <= max_z_error / 2.0);
+        if candidates.is_empty() {
+            return max_z_error;
+        }
+    }
+    if !any_valid {
+        return max_z_error;
+    }
+    candidates
+        .first()
+        .map_or(max_z_error, |&(candidate, _, _)| candidate)
 }
 
 fn validate_sample(value: f64) -> Result<()> {

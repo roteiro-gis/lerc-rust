@@ -1,7 +1,10 @@
 use lerc_core::{DataType, Error, Result, Sample};
 
 use super::{
-    bitstuff::{encode_cached_payload, reduce_data_type, try_tile},
+    bitstuff::{
+        encode_lut_payload, encode_simple_payload, lut_payload_len, max_value_to_quantize,
+        quantize_block, quantized_block_max, reduce_data_type, simple_payload_len,
+    },
     needs_encode_mode_flag, pixel_is_valid, tile_header, write_value_as, ByteSink, RasterAnalysis,
     RasterSource, VERSION_4, VERSION_5,
 };
@@ -12,8 +15,7 @@ pub(super) struct TileScratch {
     values_f64: Vec<f64>,
     prev_values_f64: Vec<f64>,
     diff_values_f64: Vec<f64>,
-    quantized: Vec<u32>,
-    bitstuff_payload: Vec<u8>,
+    quant: QuantScratch,
 }
 
 impl TileScratch {
@@ -22,14 +24,32 @@ impl TileScratch {
         self.values_f64.clear();
         self.prev_values_f64.clear();
         self.diff_values_f64.clear();
+        self.quant.clear();
+    }
+}
+
+/// Reusable buffers for quantizing and bit-stuffing one block.
+#[derive(Debug, Default)]
+struct QuantScratch {
+    quantized: Vec<u32>,
+    sorted: Vec<u32>,
+    indexes: Vec<u32>,
+    payload: Vec<u8>,
+}
+
+impl QuantScratch {
+    fn clear(&mut self) {
         self.quantized.clear();
-        self.bitstuff_payload.clear();
+        self.sorted.clear();
+        self.indexes.clear();
+        self.payload.clear();
     }
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct TilingPlan {
     pub(super) version: i32,
+    pub(super) micro_block_size: u32,
     pub(super) data_len: usize,
     blocks: Vec<BlockPlan>,
 }
@@ -60,6 +80,7 @@ enum BlockBody {
         offset_type: DataType,
         type_code: u8,
         payload_len: usize,
+        lut: bool,
     },
 }
 
@@ -252,8 +273,7 @@ pub(super) fn plan<T: Sample, R: RasterSource<T>>(
                     raw_byte_len,
                     options.data_type,
                     options.max_z_error,
-                    &mut scratch.quantized,
-                    &mut scratch.bitstuff_payload,
+                    &mut scratch.quant,
                 )?;
                 let mut selected_plan = absolute_plan;
                 if diff_supported
@@ -267,8 +287,7 @@ pub(super) fn plan<T: Sample, R: RasterSource<T>>(
                     if let Some(diff_plan) = choose_diff_block_plan(
                         &scratch.diff_values_f64,
                         options.max_z_error,
-                        &mut scratch.quantized,
-                        &mut scratch.bitstuff_payload,
+                        &mut scratch.quant,
                     )? {
                         if diff_plan.encoded_len() < selected_plan.encoded_len() {
                             selected_plan = diff_plan;
@@ -286,6 +305,7 @@ pub(super) fn plan<T: Sample, R: RasterSource<T>>(
 
     Ok(TilingPlan {
         version: if used_diff { VERSION_5 } else { VERSION_4 },
+        micro_block_size: options.micro_block_size,
         data_len,
         blocks,
     })
@@ -332,8 +352,7 @@ pub(super) fn write<T: Sample, R: RasterSource<T>>(
             &scratch.values_f64,
             &scratch.prev_values_f64,
             analysis.max_z_error,
-            &mut scratch.quantized,
-            &mut scratch.bitstuff_payload,
+            &mut scratch.quant,
         )?;
         write_block_plan(
             sink,
@@ -341,7 +360,7 @@ pub(super) fn write<T: Sample, R: RasterSource<T>>(
             position.check_code,
             version,
             &scratch.raw_bytes,
-            &scratch.bitstuff_payload,
+            &scratch.quant.payload,
         )
     })?;
 
@@ -385,102 +404,106 @@ fn choose_absolute_block_plan(
     raw_byte_len: usize,
     base_type: DataType,
     max_z_error: f64,
-    quantized: &mut Vec<u32>,
-    payload: &mut Vec<u8>,
+    quant: &mut QuantScratch,
 ) -> Result<BlockPlan> {
     let raw_len = raw_byte_len
         .checked_add(1)
         .ok_or(Error::SizeOverflow("raw block byte count"))?;
-    choose_block_plan(
-        values,
-        Some(raw_len),
-        base_type,
-        max_z_error,
-        false,
-        quantized,
-        payload,
-    )?
-    .ok_or(Error::Internal("absolute tile plan unexpectedly missing"))
+    choose_block_plan(values, Some(raw_len), base_type, max_z_error, false, quant)?
+        .ok_or(Error::Internal("absolute tile plan unexpectedly missing"))
 }
 
 fn choose_diff_block_plan(
     diff_values: &[f64],
     max_z_error: f64,
-    quantized: &mut Vec<u32>,
-    payload: &mut Vec<u8>,
+    quant: &mut QuantScratch,
 ) -> Result<Option<BlockPlan>> {
-    choose_block_plan(
-        diff_values,
-        None,
-        DataType::I32,
-        max_z_error,
-        true,
-        quantized,
-        payload,
-    )
+    choose_block_plan(diff_values, None, DataType::I32, max_z_error, true, quant)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Picks the smallest representation of one block.
+///
+/// The decision follows libLerc: the block minimum is the
+/// offset, a block whose range rounds to zero quantization steps is stored as
+/// a constant, and other blocks are bit-stuffed in simple or lookup-table
+/// mode, whichever is smaller. Raw storage (`raw_len`, absent for diff blocks)
+/// is used only when nothing else is strictly smaller.
 fn choose_block_plan(
     values: &[f64],
     raw_len: Option<usize>,
     base_type: DataType,
     max_z_error: f64,
     is_diff: bool,
-    quantized: &mut Vec<u32>,
-    payload: &mut Vec<u8>,
+    quant: &mut QuantScratch,
 ) -> Result<Option<BlockPlan>> {
+    let zero = BlockPlan {
+        is_diff,
+        body: BlockBody::ZeroOrEmpty,
+    };
     if values.is_empty() {
-        return Ok(Some(BlockPlan {
-            is_diff,
-            body: BlockBody::ZeroOrEmpty,
-        }));
+        return Ok(Some(zero));
     }
-
     let (min, max) = min_max(values);
     if min == 0.0 && max == 0.0 {
-        return Ok(Some(BlockPlan {
-            is_diff,
-            body: BlockBody::ZeroOrEmpty,
-        }));
-    }
-    if min == max {
-        let (type_code, offset_type) = reduce_data_type(min, base_type)?;
-        return Ok(Some(BlockPlan {
-            is_diff,
-            body: BlockBody::Constant {
-                offset: min,
-                offset_type,
-                type_code,
-            },
-        }));
+        return Ok(Some(zero));
     }
 
-    if let Some(bitstuff) = try_tile(values, min, max, max_z_error, base_type, quantized, payload)?
-    {
-        let plan = BlockPlan {
-            is_diff,
-            body: BlockBody::Bitstuff {
-                offset: bitstuff.offset,
-                offset_type: bitstuff.offset_type,
-                type_code: bitstuff.type_code,
-                payload_len: bitstuff.payload_len,
-            },
-        };
-        if match raw_len {
-            Some(raw_len) => plan.encoded_len() < raw_len,
-            None => true,
-        } {
-            return Ok(Some(plan));
-        }
-    }
-
-    Ok(raw_len.map(|raw_len| BlockPlan {
+    let raw = raw_len.map(|raw_len| BlockPlan {
         is_diff: false,
         body: BlockBody::Raw {
             byte_len: raw_len - 1,
         },
-    }))
+    });
+    let max_quantized = if max_z_error > 0.0 {
+        quantized_block_max(min, max, max_z_error)
+    } else if min == max {
+        0.0
+    } else {
+        return Ok(raw);
+    };
+    if max_quantized.is_nan() || max_quantized > max_value_to_quantize(base_type) {
+        return Ok(raw);
+    }
+
+    let (type_code, offset_type) = reduce_data_type(min, base_type)?;
+    let body = if (max_quantized + 0.5) as u32 == 0 {
+        // Every value lies within max_z_error of the minimum.
+        BlockBody::Constant {
+            offset: min,
+            offset_type,
+            type_code,
+        }
+    } else {
+        if !quantize_block(
+            values.iter().copied(),
+            min,
+            max_z_error,
+            &mut quant.quantized,
+        ) {
+            return Ok(raw);
+        }
+        let max_value = quant.quantized.iter().copied().max().unwrap_or(0);
+        let simple_len = simple_payload_len(values.len(), max_value)?;
+        quant.sorted.clear();
+        quant.sorted.extend_from_slice(&quant.quantized);
+        quant.sorted.sort_unstable();
+        let (payload_len, lut) = match lut_payload_len(&quant.sorted)? {
+            Some(lut_len) if lut_len < simple_len => (lut_len, true),
+            _ => (simple_len, false),
+        };
+        BlockBody::Bitstuff {
+            offset: min,
+            offset_type,
+            type_code,
+            payload_len,
+            lut,
+        }
+    };
+    let plan = BlockPlan { is_diff, body };
+    Ok(match raw {
+        Some(raw) if raw.encoded_len() <= plan.encoded_len() => Some(raw),
+        _ => Some(plan),
+    })
 }
 
 fn write_block_plan(
@@ -527,42 +550,53 @@ fn prepare_cached_block_payload(
     values: &[f64],
     prev_values: &[f64],
     max_z_error: f64,
-    quantized: &mut Vec<u32>,
-    payload: &mut Vec<u8>,
+    quant: &mut QuantScratch,
 ) -> Result<()> {
-    payload.clear();
+    quant.payload.clear();
     if let BlockBody::Bitstuff {
         offset,
         payload_len,
+        lut,
         ..
     } = &plan.body
     {
-        if plan.is_diff {
+        let in_bounds = if plan.is_diff {
             if values.len() != prev_values.len() {
                 return Err(Error::Internal("diff input lengths do not match"));
             }
-            encode_cached_payload(
+            quantize_block(
                 values
                     .iter()
                     .zip(prev_values)
                     .map(|(&value, &previous)| value - previous),
-                values.len(),
                 *offset,
                 max_z_error,
-                quantized,
-                payload,
+                &mut quant.quantized,
+            )
+        } else {
+            quantize_block(
+                values.iter().copied(),
+                *offset,
+                max_z_error,
+                &mut quant.quantized,
+            )
+        };
+        if !in_bounds || quant.quantized.len() != values.len() {
+            return Err(Error::Internal(
+                "cached bit-stuffed tile no longer quantizes within bounds",
+            ));
+        }
+        if *lut {
+            encode_lut_payload(
+                &quant.quantized,
+                &mut quant.sorted,
+                &mut quant.indexes,
+                &mut quant.payload,
             )?;
         } else {
-            encode_cached_payload(
-                values.iter().copied(),
-                values.len(),
-                *offset,
-                max_z_error,
-                quantized,
-                payload,
-            )?;
+            encode_simple_payload(&quant.quantized, &mut quant.payload)?;
         }
-        if payload.len() != *payload_len {
+        if quant.payload.len() != *payload_len {
             return Err(Error::Internal(
                 "cached bit-stuffed tile payload length changed",
             ));

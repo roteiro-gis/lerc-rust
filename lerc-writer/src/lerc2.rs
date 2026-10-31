@@ -29,6 +29,8 @@ const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
 const VERSION_4: i32 = 4;
 const VERSION_5: i32 = 5;
 const VERSION_6: i32 = 6;
+/// Largest micro-block size accepted by `lerc-reader`.
+const MAX_MICRO_BLOCK_SIZE: u32 = 32;
 
 #[derive(Debug, Clone)]
 struct EncodePlan {
@@ -587,7 +589,11 @@ fn write_body<T: Sample, R: RasterSource<T>>(
     }
 }
 
-fn select_encode_plan(analysis: &RasterAnalysis, tiling: Option<TilingPlan>) -> Result<EncodePlan> {
+fn select_encode_plan(
+    analysis: &RasterAnalysis,
+    tiling: Option<TilingPlan>,
+    retile: impl FnOnce(u32) -> Result<TilingPlan>,
+) -> Result<EncodePlan> {
     if analysis.valid_pixel_count == 0 || analysis.z_min == analysis.z_max {
         return Ok(EncodePlan {
             version: version_with_no_data(analysis, VERSION_4),
@@ -601,37 +607,51 @@ fn select_encode_plan(analysis: &RasterAnalysis, tiling: Option<TilingPlan>) -> 
         });
     }
 
-    let tiling = tiling.ok_or(Error::Internal(
+    let mut tiling = tiling.ok_or(Error::Internal(
         "non-constant raster is missing its fused tile plan",
     ))?;
 
-    let mut best_version = tiling.version;
-    let mut best_non_one_len = tiling
-        .data_len
-        .checked_add(usize::from(needs_encode_mode_flag(
-            analysis.data_type,
-            analysis.max_z_error,
-            version_with_no_data(analysis, tiling.version),
-        )))
-        .ok_or(Error::SizeOverflow("tiled body byte count"))?;
-    let mut selected_huffman = None;
-
-    if let Some(huffman) = build_huffman_plan(analysis)? {
-        let huffman_total_len = huffman
-            .data_len
-            .checked_add(1)
-            .ok_or(Error::SizeOverflow("Huffman payload byte count"))?;
-        if huffman_total_len < best_non_one_len {
-            best_non_one_len = huffman_total_len;
-            best_version = version_with_no_data(analysis, VERSION_4);
-            selected_huffman = Some(huffman);
-        }
-    }
+    let huffman = build_huffman_plan(analysis)?;
+    let huffman_len = huffman.as_ref().map(|huffman| huffman.data_len);
+    let mut selected_huffman = huffman.filter(|huffman| huffman.data_len < tiling.data_len);
 
     let one_sweep_len = (analysis.valid_pixel_count as usize)
         .checked_mul(analysis.depth as usize)
         .and_then(|len| len.checked_mul(analysis.data_type.byte_len()))
         .ok_or(Error::SizeOverflow("one-sweep byte count"))?;
+
+    if should_try_larger_micro_blocks(analysis, &tiling, huffman_len, one_sweep_len) {
+        let larger = retile(tiling.micro_block_size * 2)?;
+        let best_len = selected_huffman
+            .as_ref()
+            .map_or(tiling.data_len, |huffman| huffman.data_len);
+        if larger.data_len <= best_len {
+            tiling = larger;
+            selected_huffman = None;
+        }
+    }
+
+    let (best_version, best_non_one_len) = match &selected_huffman {
+        Some(huffman) => (
+            VERSION_4,
+            huffman
+                .data_len
+                .checked_add(1)
+                .ok_or(Error::SizeOverflow("Huffman payload byte count"))?,
+        ),
+        None => (
+            tiling.version,
+            tiling
+                .data_len
+                .checked_add(usize::from(needs_encode_mode_flag(
+                    analysis.data_type,
+                    analysis.max_z_error,
+                    version_with_no_data(analysis, tiling.version),
+                )))
+                .ok_or(Error::SizeOverflow("tiled body byte count"))?,
+        ),
+    };
+
     if one_sweep_len <= best_non_one_len {
         return Ok(EncodePlan {
             version: version_with_no_data(analysis, VERSION_4),
@@ -648,6 +668,33 @@ fn select_encode_plan(analysis: &RasterAnalysis, tiling: Option<TilingPlan>) -> 
         version: version_with_no_data(analysis, best_version),
         body: best_body,
     })
+}
+
+/// Decides whether to re-plan the tiles with micro-blocks of twice the size.
+///
+/// Larger blocks halve the per-block header overhead, which dominates once
+/// most blocks compress to a few bits per pixel. This uses libLerc's
+/// trigger: the tiled body is below 1.5 bits per pixel, bit-stuffing
+/// is effective, Huffman coding is not far ahead, and the raster spans more
+/// than one block. The larger grid is kept only when it is no bigger.
+fn should_try_larger_micro_blocks(
+    analysis: &RasterAnalysis,
+    tiling: &TilingPlan,
+    huffman_len: Option<usize>,
+    one_sweep_len: usize,
+) -> bool {
+    let micro_block_size = tiling.micro_block_size;
+    if micro_block_size * 2 > MAX_MICRO_BLOCK_SIZE {
+        return false;
+    }
+    let sample_count = analysis.width as f64 * analysis.height as f64 * f64::from(analysis.depth);
+    let tiled_bits = tiling.data_len as f64 * 8.0;
+    tiled_bits < sample_count * 1.5
+        && (tiling.data_len as f64) < 4.0 * one_sweep_len as f64
+        && huffman_len.map_or(true, |huffman_len| {
+            (tiling.data_len as f64) < 2.0 * huffman_len as f64
+        })
+        && (analysis.height > micro_block_size || analysis.width > micro_block_size)
 }
 
 fn write_one_sweep_body<T: Sample, R: RasterSource<T>>(

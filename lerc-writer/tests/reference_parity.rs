@@ -4,6 +4,8 @@ use ndarray::ArrayD;
 
 #[path = "../../test-support/reference.rs"]
 mod reference;
+#[path = "../../test-support/surfaces.rs"]
+mod surfaces;
 
 const LIBLERC_HUFFMAN_FIXTURE: &[u8] =
     include_bytes!("../../testdata/interoperability/liblerc-v4-u8-huffman.lerc2");
@@ -487,5 +489,60 @@ fn generated_blobs_match_liblerc_decode_hashes() {
             _ => unreachable!(),
         }
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn lossy_surfaces_decode_with_liblerc_and_are_no_larger() {
+    let Some(helper) = reference::helper_path() else {
+        eprintln!("skipping libLerc parity test because LERC_READER_REFERENCE_HELPER is unset");
+        return;
+    };
+
+    for surface in surfaces::all() {
+        let raster = lerc_core::RasterView::new(
+            surface.width as u32,
+            surface.height as u32,
+            1,
+            &surface.pixels,
+        )
+        .unwrap();
+        let mask = surface.mask.as_deref().map(|mask| {
+            lerc_core::MaskView::new(surface.width as u32, surface.height as u32, mask).unwrap()
+        });
+        let blob = lerc_writer::encode(
+            raster,
+            mask,
+            lerc_writer::EncodeOptions::new().with_max_z_error(surface.max_z_error),
+        )
+        .unwrap();
+        assert_reference_decode::<f32>(&helper, surface.name, &blob);
+
+        let reference_blob = reference::encode_with_reference(
+            &helper,
+            &surface.pixels,
+            surface.mask.as_deref(),
+            reference::ReferenceEncodeOptions {
+                width: surface.width,
+                height: surface.height,
+                depth: 1,
+                max_z_error: surface.max_z_error,
+                codec_version: 4,
+                no_data_value: None,
+            },
+        );
+        eprintln!(
+            "{}: lerc-writer {} bytes, libLerc {} bytes",
+            surface.name,
+            blob.len(),
+            reference_blob.len()
+        );
+        assert!(
+            blob.len() <= reference_blob.len(),
+            "{}: {} bytes, libLerc {}",
+            surface.name,
+            blob.len(),
+            reference_blob.len()
+        );
     }
 }

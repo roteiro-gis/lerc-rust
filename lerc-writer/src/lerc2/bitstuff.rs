@@ -1,130 +1,145 @@
 use lerc_core::{bits_required, DataType, Error, Result};
 
-#[derive(Debug, Clone)]
-pub(super) struct BitstuffTile {
-    pub(super) offset: f64,
-    pub(super) offset_type: DataType,
-    pub(super) type_code: u8,
-    pub(super) payload_len: usize,
+/// Largest quantized block range that is bit-stuffed rather than stored raw,
+/// matching libLerc's limit for each data type.
+pub(super) fn max_value_to_quantize(data_type: DataType) -> f64 {
+    match data_type {
+        DataType::I8 | DataType::U8 | DataType::I16 | DataType::U16 => ((1u32 << 15) - 1) as f64,
+        DataType::I32 | DataType::U32 | DataType::F32 | DataType::F64 => ((1u32 << 30) - 1) as f64,
+    }
 }
 
-pub(super) fn try_tile(
-    values: &[f64],
-    offset: f64,
-    max_value: f64,
-    max_z_error: f64,
-    base_type: DataType,
-    quantized: &mut Vec<u32>,
-    payload: &mut Vec<u8>,
-) -> Result<Option<BitstuffTile>> {
-    if max_z_error <= 0.0 {
-        return Ok(None);
-    }
-    let scale = 2.0 * max_z_error;
-    let nmax_f = ((max_value - offset) / scale).ceil();
-    if !nmax_f.is_finite() || !(0.0..=(u32::MAX as f64)).contains(&nmax_f) {
-        return Ok(None);
-    }
-    let nmax = nmax_f as u32;
-    if nmax == 0 {
-        return Ok(None);
-    }
-
-    let epsilon = max_z_error.abs() * 1e-12 + 1e-12;
-    quantized.clear();
-    quantized.reserve(values.len());
-    let mut max_quantized = 0u32;
-    for &value in values {
-        let quantized_value = ((value - offset) / scale).round().clamp(0.0, nmax as f64) as u32;
-        let reconstructed = if quantized_value < nmax {
-            offset + quantized_value as f64 * scale
-        } else {
-            max_value
-        };
-        if (reconstructed - value).abs() > max_z_error + epsilon {
-            return Ok(None);
-        }
-        max_quantized = max_quantized.max(quantized_value);
-        quantized.push(quantized_value);
-    }
-
-    let bits = bits_required(max_quantized as usize);
-    if bits == 0 || bits > 31 {
-        return Ok(None);
-    }
-
-    let (count_code, count_bytes) = count_field(values.len())?;
-    let (type_code, offset_type) = reduce_data_type(offset, base_type)?;
-    payload.clear();
-    let bit_bytes = values
-        .len()
-        .checked_mul(bits as usize)
-        .ok_or(Error::SizeOverflow("bit-stuffed payload bit count"))?
-        .div_ceil(8);
-    payload.reserve(1 + count_bytes + bit_bytes);
-    payload.push((count_code << 6) | bits);
-    append_count(payload, values.len(), count_bytes)?;
-    pack_lsb_bits_into(quantized, bits, payload)?;
-    Ok(Some(BitstuffTile {
-        offset,
-        offset_type,
-        type_code,
-        payload_len: payload.len(),
-    }))
-}
-
-pub(super) fn encode_cached_payload(
+/// Quantizes block values against `offset` (the block minimum).
+///
+/// This mirrors libLerc's arithmetic: each value maps to
+/// `trunc((value - offset) / (2 * max_z_error) + 0.5)`, and a decoder rebuilds
+/// it as `offset + q * 2 * max_z_error`. Returns `false` when a reconstructed
+/// value would leave the requested error bound, which can only happen when the
+/// sample magnitude exhausts `f64` precision; callers then store the block raw.
+pub(super) fn quantize_block(
     values: impl IntoIterator<Item = f64>,
-    value_count: usize,
     offset: f64,
     max_z_error: f64,
     quantized: &mut Vec<u32>,
-    payload: &mut Vec<u8>,
-) -> Result<()> {
-    if max_z_error <= 0.0 {
-        return Err(Error::Internal(
-            "cached bit-stuffed tile requires positive max_z_error",
-        ));
-    }
-
-    let scale = 2.0 * max_z_error;
+) -> bool {
+    let scale = 1.0 / (2.0 * max_z_error);
+    let step = 2.0 * max_z_error;
+    let tolerance = max_z_error + max_z_error.abs() * 1e-12 + 1e-12;
     quantized.clear();
-    quantized.reserve(value_count);
-    let mut max_quantized = 0u32;
     for value in values {
-        let quantized_value = ((value - offset) / scale).round();
-        if !quantized_value.is_finite() || !(0.0..=(u32::MAX as f64)).contains(&quantized_value) {
-            return Err(Error::Internal(
-                "cached bit-stuffed tile quantized value is out of range",
-            ));
+        let quantized_value = ((value - offset) * scale + 0.5) as u32;
+        if (offset + f64::from(quantized_value) * step - value).abs() > tolerance {
+            return false;
         }
-        let quantized_value = quantized_value as u32;
-        max_quantized = max_quantized.max(quantized_value);
         quantized.push(quantized_value);
     }
-    if quantized.len() != value_count {
-        return Err(Error::Internal(
-            "cached bit-stuffed tile value count changed",
-        ));
-    }
+    true
+}
 
+/// Number of quantization levels a block spans, rounded like the reference
+/// encoder. Zero means every value lies within `max_z_error` of the block
+/// minimum, so the block can be stored as a constant.
+pub(super) fn quantized_block_max(min: f64, max: f64, max_z_error: f64) -> f64 {
+    (max - min) * (1.0 / (2.0 * max_z_error))
+}
+
+/// Encoded size of a bit-stuffed payload in simple mode.
+pub(super) fn simple_payload_len(count: usize, max_quantized: u32) -> Result<usize> {
+    let (_, count_bytes) = count_field(count)?;
+    let bits = bits_required(max_quantized as usize) as usize;
+    count
+        .checked_mul(bits)
+        .map(|bits| 1 + count_bytes + bits.div_ceil(8))
+        .ok_or(Error::SizeOverflow("bit-stuffed payload bit count"))
+}
+
+/// Encoded size of a bit-stuffed payload in lookup-table mode, or `None` when
+/// the block has too many distinct values for a Lerc2 lookup table.
+///
+/// `sorted` must hold the block's quantized values in ascending order.
+pub(super) fn lut_payload_len(sorted: &[u32]) -> Result<Option<usize>> {
+    let Some(&max_quantized) = sorted.last() else {
+        return Ok(None);
+    };
+    let lut_len = sorted.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    if lut_len == 0 || lut_len >= MAX_LUT_LEN {
+        return Ok(None);
+    }
+    let (_, count_bytes) = count_field(sorted.len())?;
+    let value_bits = bits_required(max_quantized as usize) as usize;
+    let index_bits = bits_required(lut_len) as usize;
+    let index_bytes = sorted
+        .len()
+        .checked_mul(index_bits)
+        .ok_or(Error::SizeOverflow("lookup-table index bit count"))?
+        .div_ceil(8);
+    Ok(Some(
+        1 + count_bytes + 1 + (lut_len * value_bits).div_ceil(8) + index_bytes,
+    ))
+}
+
+/// Writes a simple-mode bit-stuffed payload for already quantized values.
+pub(super) fn encode_simple_payload(quantized: &[u32], payload: &mut Vec<u8>) -> Result<()> {
+    let max_quantized = quantized.iter().copied().max().unwrap_or(0);
     let bits = bits_required(max_quantized as usize);
     if bits == 0 || bits > 31 {
-        return Err(Error::Internal(
-            "cached bit-stuffed tile has an invalid bit width",
-        ));
+        return Err(Error::Internal("bit-stuffed tile has an invalid bit width"));
     }
-    let (count_code, count_bytes) = count_field(value_count)?;
-    let bit_bytes = value_count
-        .checked_mul(bits as usize)
-        .ok_or(Error::SizeOverflow("bit-stuffed payload bit count"))?
-        .div_ceil(8);
+    let (count_code, count_bytes) = count_field(quantized.len())?;
     payload.clear();
-    payload.reserve(1 + count_bytes + bit_bytes);
+    payload.reserve(1 + count_bytes + (quantized.len() * bits as usize).div_ceil(8));
     payload.push((count_code << 6) | bits);
-    append_count(payload, value_count, count_bytes)?;
+    append_count(payload, quantized.len(), count_bytes)?;
     pack_lsb_bits_into(quantized, bits, payload)
 }
+
+/// Writes a lookup-table bit-stuffed payload: the distinct non-zero quantized
+/// values in ascending order, followed by one table index per value.
+///
+/// `sorted` is scratch space; it is overwritten with the sorted values.
+pub(super) fn encode_lut_payload(
+    quantized: &[u32],
+    sorted: &mut Vec<u32>,
+    indexes: &mut Vec<u32>,
+    payload: &mut Vec<u8>,
+) -> Result<()> {
+    sorted.clear();
+    sorted.extend_from_slice(quantized);
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.first() != Some(&0) {
+        return Err(Error::Internal(
+            "lookup-table tile does not start at its offset",
+        ));
+    }
+    let lut = &sorted[1..];
+    let lut_len = lut.len();
+    if lut_len == 0 || lut_len >= MAX_LUT_LEN {
+        return Err(Error::Internal(
+            "lookup-table tile has an invalid table length",
+        ));
+    }
+    let value_bits = bits_required(lut[lut_len - 1] as usize);
+    let index_bits = bits_required(lut_len);
+    indexes.clear();
+    for &value in quantized {
+        let index = sorted
+            .binary_search(&value)
+            .map_err(|_| Error::Internal("lookup-table value is missing"))?;
+        indexes.push(index as u32);
+    }
+    let (count_code, count_bytes) = count_field(quantized.len())?;
+    payload.clear();
+    payload.push((count_code << 6) | (1 << 5) | value_bits);
+    append_count(payload, quantized.len(), count_bytes)?;
+    payload.push((lut_len + 1) as u8);
+    pack_lsb_bits_into(lut, value_bits, payload)?;
+    pack_lsb_bits_into(indexes, index_bits, payload)
+}
+
+/// Lerc2 stores the table length, including the implicit zero, in one byte;
+/// libLerc caps tables below 255 entries.
+const MAX_LUT_LEN: usize = 255;
 
 pub(super) fn write_raw_block(out: &mut Vec<u8>, values: &[u32]) -> Result<()> {
     let max_value = values.iter().copied().max().unwrap_or(0);
