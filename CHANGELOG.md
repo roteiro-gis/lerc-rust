@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- make `EncoderProfile::Gdal` write libLerc's Huffman blobs for lossless 8-bit rasters byte for byte: code lengths from libLerc's heap (as libstdc++ and the MSVC STL order ties), canonical codes, the wrap-around symbol range and code table version 4, and no Huffman coding where libLerc declines it (one used symbol, or codes longer than 32 bits); `EncoderProfile::Compact` output is unchanged
+- set the bit-mask padding bits past the last pixel in `EncoderProfile::Gdal` blobs, as libLerc does, for masked rasters whose pixel count is not a multiple of 8
+- add `ErrorBound` and `EncodeOptions::with_error_bound`: `ErrorBound::Unchecked`, with `EncoderProfile::Gdal` only, skips the reconstruction check against the requested `max_z_error`, as libLerc does, so blocks the check would store raw are written as libLerc writes them; the encoder then enforces no bound after quantization, and decoded errors can exceed the request by about one ulp of the block's magnitude (0.03125 at 2^47); `ErrorBound::Checked` remains the default
+
 ## 0.5.2 - 2026-10-31
 
 - fix signed 8-bit delta-Huffman decoding so negative values wrap in the signed range instead of saturating to 127

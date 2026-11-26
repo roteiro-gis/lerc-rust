@@ -63,10 +63,31 @@ let options = EncodeOptions::new()
     .with_profile(EncoderProfile::Gdal);
 ```
 
-Both profiles keep every valid sample within `max_z_error` and decode to the
-same values for single-depth rasters. The GDAL profile always writes Lerc2 v4
-and is byte-identical to GDAL except for lossless 8-bit rasters, where libLerc's
-Huffman tables depend on its C++ standard library; those decode identically.
+Both profiles keep every valid sample within `max_z_error`, unless
+`ErrorBound::Unchecked` is selected (below), and decode to the same values for
+single-depth rasters. The GDAL profile always writes Lerc2 v4
+and, for the cases covered by the test suite, is byte-identical to libLerc's
+codec v4, which GDAL calls, lossless 8-bit Huffman blobs included. The
+exceptions:
+
+- A block whose reconstruction would leave `max_z_error` through `f64`
+  rounding is stored raw, where libLerc bit-stuffs it; this happens with
+  Float64 data next to a far-off value, such as a `-9999` nodata sentinel.
+  `.with_error_bound(ErrorBound::Unchecked)` drops that check and writes
+  libLerc's blocks. The encoder then enforces no bound after quantization:
+  decoded errors are libLerc's, the header's bound plus up to about one ulp of
+  the block's largest magnitude (1.8e-12 near 1e4, but 0.03125 at 2^47, 31
+  times a requested 0.001).
+- Huffman code lengths follow `std::priority_queue` as libstdc++ and the MSVC
+  STL order equal frequencies (Linux and Windows builds). libc++ (macOS) breaks
+  ties the other way; emulated over 16,123 histograms, a third get other code
+  lengths, at the same sizes, so such blobs differ but decode identically.
+- A Huffman blob ends with a 4-byte word reserved for the decoder's
+  read-ahead, which libLerc's `Lerc2::EncodeHuffman` skips without writing.
+  This crate writes zeros. libLerc 4.1.0 and later zero the output buffer
+  first, so GDAL built with them writes zeros too and its blobs are identical,
+  checksum included. With libLerc 4.0.x, including the copy GDAL bundles in
+  `third_party/LercLib`, the word holds whatever the output buffer held.
 
 ### Features
 

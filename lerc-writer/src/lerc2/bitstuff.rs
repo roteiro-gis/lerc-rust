@@ -15,21 +15,24 @@ pub(super) fn max_value_to_quantize(data_type: DataType) -> f64 {
 /// `trunc((value - offset) / (2 * max_z_error) + 0.5)`, and a decoder rebuilds
 /// it as `offset + q * 2 * max_z_error`. Returns `false` when a reconstructed
 /// value would leave `requested_max_z_error`, even when the quantization bound
-/// was raised to a coarser grid; callers then store the block raw.
+/// was raised to a coarser grid; callers then store the block raw. `None`
+/// (`ErrorBound::Unchecked`) checks nothing, as libLerc.
 pub(super) fn quantize_block(
     values: impl IntoIterator<Item = f64>,
     offset: f64,
     max_z_error: f64,
-    requested_max_z_error: f64,
+    requested_max_z_error: Option<f64>,
     quantized: &mut Vec<u32>,
 ) -> bool {
     let scale = 1.0 / (2.0 * max_z_error);
     let step = 2.0 * max_z_error;
-    let tolerance = requested_max_z_error + requested_max_z_error.abs() * 1e-12 + 1e-12;
+    let tolerance =
+        requested_max_z_error.map(|requested| requested + requested.abs() * 1e-12 + 1e-12);
     quantized.clear();
     for value in values {
         let quantized_value = ((value - offset) * scale + 0.5) as u32;
-        if (offset + f64::from(quantized_value) * step - value).abs() > tolerance {
+        let error = (offset + f64::from(quantized_value) * step - value).abs();
+        if tolerance.is_some_and(|tolerance| error > tolerance) {
             return false;
         }
         quantized.push(quantized_value);

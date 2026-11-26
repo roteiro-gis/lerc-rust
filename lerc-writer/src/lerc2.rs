@@ -22,7 +22,7 @@ use mask::{
     validate_slice as validate_mask_slice, MaskKind, PreparedMask,
 };
 use options::validate as validate_encode_options;
-pub use options::{EncodeOptions, EncoderProfile};
+pub use options::{EncodeOptions, EncoderProfile, ErrorBound};
 use tiles::{write as write_tiled_body, TileScratch, TilingPlan};
 
 const MAGIC_LERC2: &[u8; 6] = b"Lerc2 ";
