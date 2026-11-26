@@ -114,3 +114,99 @@ fn constant_blocks_validate_the_original_bound_after_a_grid_raise() {
         }
     }
 }
+
+/// One 8 x 8 Float64 block: a far-off value (-9999) next to values on a 0.01
+/// grid. libLerc bit-stuffs it, and 100.29 decodes as 100.30000000000109,
+/// 1.09e-12 past `max_z_error`; the checked bound stores the block raw.
+fn far_off_value_block() -> Vec<f64> {
+    let mut values = vec![100.29f64; 64];
+    values[0] = -9999.0;
+    values[63] = 101.0;
+    values
+}
+
+fn encode_far_off_block(error_bound: lerc_writer::ErrorBound) -> Vec<u8> {
+    lerc_writer::encode(
+        lerc_core::RasterView::new(8, 8, 1, &far_off_value_block()).unwrap(),
+        None,
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.01)
+            .with_profile(lerc_writer::EncoderProfile::Gdal)
+            .with_error_bound(error_bound),
+    )
+    .unwrap()
+}
+
+fn max_error(blob: &[u8], values: &[f64]) -> f64 {
+    let decoded = lerc_reader::decode_to_f64(blob).unwrap();
+    decoded
+        .pixels
+        .iter()
+        .zip(values)
+        .map(|(decoded, value)| (decoded - value).abs())
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn unchecked_error_bound_bit_stuffs_blocks_the_checked_bound_stores_raw() {
+    let values = far_off_value_block();
+    let checked = encode_far_off_block(lerc_writer::ErrorBound::Checked);
+    let unchecked = encode_far_off_block(lerc_writer::ErrorBound::Unchecked);
+    // Raw storage: 64 doubles behind the block header.
+    assert_eq!(checked.len(), 599);
+    assert!(max_error(&checked, &values) <= 0.01);
+    // libLerc's 114-byte blob, which overshoots by f64 rounding only.
+    assert_eq!(unchecked.len(), 114);
+    let error = max_error(&unchecked, &values);
+    assert!(error > 0.01 && error <= 0.01 + 2e-12, "{error}");
+}
+
+#[test]
+fn unchecked_error_bound_requires_the_gdal_profile() {
+    let values = far_off_value_block();
+    let result = lerc_writer::encode(
+        lerc_core::RasterView::new(8, 8, 1, &values).unwrap(),
+        None,
+        lerc_writer::EncodeOptions::new()
+            .with_max_z_error(0.01)
+            .with_error_bound(lerc_writer::ErrorBound::Unchecked),
+    );
+    assert!(matches!(result, Err(lerc_core::Error::InvalidArgument(_))));
+    assert_eq!(
+        lerc_writer::EncodeOptions::new().error_bound,
+        lerc_writer::ErrorBound::Checked
+    );
+}
+
+/// #50's large-magnitude case, `2^47 + k * 0.1` at a requested 0.001: the
+/// header bound is raised to the 0.05 grid. Checked, every block that would
+/// miss the request is stored raw. Unchecked, the encoder enforces nothing and
+/// the samples decode up to one ulp of 2^47 (0.03125) off, 31 times the
+/// request, as libLerc decodes its own blob of the same input.
+#[test]
+fn unchecked_error_bound_gives_up_the_bound_by_an_ulp_of_the_magnitude() {
+    let values: Vec<f64> = (0..32 * 16)
+        .map(|i| {
+            let step = if (i % 32) / 8 % 2 == 0 { 0.1 } else { 1.0 };
+            2f64.powi(47) + (i % 31) as f64 * step
+        })
+        .collect();
+    let encode = |error_bound| {
+        lerc_writer::encode(
+            lerc_core::RasterView::new(32, 16, 1, &values).unwrap(),
+            None,
+            lerc_writer::EncodeOptions::new()
+                .with_max_z_error(0.001)
+                .with_profile(lerc_writer::EncoderProfile::Gdal)
+                .with_error_bound(error_bound),
+        )
+        .unwrap()
+    };
+    let checked = encode(lerc_writer::ErrorBound::Checked);
+    let unchecked = encode(lerc_writer::ErrorBound::Unchecked);
+    assert!(max_error(&checked, &values) <= 0.001);
+    let ulp = 2f64.powi(47 - 52);
+    assert_eq!(ulp, 0.03125);
+    assert_eq!(max_error(&unchecked, &values), ulp);
+    assert!(unchecked.len() < checked.len());
+}

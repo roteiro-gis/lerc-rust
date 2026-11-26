@@ -5,7 +5,7 @@ use super::{
     mask::{pixel_is_valid, shared_mask_for_band, validate_slice, MaskKind, PreparedMask},
     select_encode_plan,
     tiles::{plan as plan_tiled_body, TilingOptions},
-    BandRasterView, EncodeOptions, EncodePlan, RasterSource, RemappedRaster,
+    BandRasterView, EncodeOptions, EncodePlan, ErrorBound, RasterSource, RemappedRaster,
 };
 
 #[derive(Debug, Clone)]
@@ -16,8 +16,9 @@ pub(super) struct RasterAnalysis {
     pub(super) depth: u32,
     pub(super) valid_pixel_count: u32,
     pub(super) max_z_error: f64,
-    /// Reconstruction limit, kept separate from the raised header bound.
-    pub(super) requested_max_z_error: f64,
+    /// Reconstruction limit, kept separate from the raised header bound;
+    /// `None` with `ErrorBound::Unchecked`.
+    pub(super) requested_max_z_error: Option<f64>,
     pub(super) micro_block_size: u32,
     pub(super) z_min: f64,
     pub(super) z_max: f64,
@@ -241,7 +242,11 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
     }
 
     // No-data remapping may tighten the limit; a grid raise must never relax it.
-    let requested_max_z_error = options.max_z_error.min(max_z_error);
+    // `ErrorBound::Unchecked` drops the reconstruction check, as libLerc has none.
+    let requested_max_z_error = match options.error_bound {
+        ErrorBound::Checked => Some(options.max_z_error.min(max_z_error)),
+        ErrorBound::Unchecked => None,
+    };
     let mut statistics = Some(statistics);
     let mut finished_statistics = if input_no_data_value.is_some() {
         Some(finish_statistics(

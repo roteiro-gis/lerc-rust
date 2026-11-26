@@ -63,7 +63,7 @@ pub(super) struct TilingOptions {
     pub(super) depth: u32,
     pub(super) data_type: DataType,
     pub(super) max_z_error: f64,
-    pub(super) requested_max_z_error: f64,
+    pub(super) requested_max_z_error: Option<f64>,
     pub(super) micro_block_size: u32,
     pub(super) profile: EncoderProfile,
 }
@@ -418,7 +418,7 @@ fn choose_absolute_block_plan(
     raw_byte_len: usize,
     base_type: DataType,
     max_z_error: f64,
-    requested_max_z_error: f64,
+    requested_max_z_error: Option<f64>,
     try_lut: bool,
     quant: &mut QuantScratch,
 ) -> Result<BlockPlan> {
@@ -441,7 +441,7 @@ fn choose_absolute_block_plan(
 fn choose_diff_block_plan(
     diff_values: &[f64],
     max_z_error: f64,
-    requested_max_z_error: f64,
+    requested_max_z_error: Option<f64>,
     quant: &mut QuantScratch,
 ) -> Result<Option<BlockPlan>> {
     choose_block_plan(
@@ -470,7 +470,7 @@ fn choose_block_plan(
     raw_len: Option<usize>,
     base_type: DataType,
     max_z_error: f64,
-    requested_max_z_error: f64,
+    requested_max_z_error: Option<f64>,
     is_diff: bool,
     try_lut: bool,
     quant: &mut QuantScratch,
@@ -507,7 +507,7 @@ fn choose_block_plan(
     let (type_code, offset_type) = reduce_data_type(min, base_type)?;
     let body = if (max_quantized + 0.5) as u32 == 0 {
         // A constant must satisfy the caller's limit, not just the raised grid.
-        if max - min > requested_max_z_error {
+        if requested_max_z_error.is_some_and(|requested| max - min > requested) {
             return Ok(raw);
         }
         BlockBody::Constant {
@@ -598,7 +598,7 @@ fn prepare_cached_block_payload(
     values: &[f64],
     prev_values: &[f64],
     max_z_error: f64,
-    requested_max_z_error: f64,
+    requested_max_z_error: Option<f64>,
     quant: &mut QuantScratch,
 ) -> Result<()> {
     quant.payload.clear();

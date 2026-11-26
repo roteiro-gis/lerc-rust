@@ -12,6 +12,36 @@ pub struct EncodeOptions {
     pub no_data_value: Option<f64>,
     /// How the encoder chooses among valid encodings.
     pub profile: EncoderProfile,
+    /// Whether reconstructed values are checked against `max_z_error`.
+    pub error_bound: ErrorBound,
+}
+
+/// Whether the encoder checks every reconstructed value against the requested
+/// `max_z_error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ErrorBound {
+    /// Every reconstructed value is checked against the requested
+    /// `max_z_error`, with a slack of `max_z_error * 1e-12 + 1e-12` for the
+    /// check's own rounding. A block whose reconstruction
+    /// `offset + q * 2 * max_z_error` would leave it, through `f64` rounding
+    /// or after a raise of the header bound to a coarser grid, is stored raw,
+    /// as is a constant block whose range exceeds it. Decoders may then still
+    /// round the value to the output type.
+    #[default]
+    Checked,
+    /// No check: blocks are bit-stuffed or stored as constants wherever
+    /// libLerc would, and the encoder enforces no error bound after
+    /// quantization. The decoded error is then libLerc's: up to the header's
+    /// bound (the requested `max_z_error`, or the coarser grid it was raised
+    /// to) plus about one ulp of the block's largest magnitude, the `f64`
+    /// spacing there. Near 1e4 that is 1.8e-12; at 2^47 it is 0.03125, so
+    /// `2^47 + k * 0.1` at a requested 0.001 decodes up to 0.03125 off, 31
+    /// times the request, exactly as libLerc decodes its own blob. With
+    /// [`EncoderProfile::Gdal`], the blobs are then GDAL's for these blocks
+    /// too, typically Float64 data on a decimal grid next to a far-off value
+    /// such as a `-9999` nodata sentinel. Requires [`EncoderProfile::Gdal`].
+    Unchecked,
 }
 
 /// Selects how the encoder chooses among encodings that all honour
@@ -48,7 +78,8 @@ pub enum EncoderProfile {
     /// The profile always writes Lerc2 v4 with 8x8 base micro-blocks and
     /// rejects `no_data_value`, which v4 cannot store. A block whose
     /// quantized values would break `max_z_error` through `f64` rounding,
-    /// which libLerc does not check, is stored raw instead.
+    /// which libLerc does not check, is stored raw instead, unless
+    /// [`ErrorBound::Unchecked`] is selected.
     Gdal,
 }
 
@@ -60,6 +91,7 @@ impl EncodeOptions {
             micro_block_size: 8,
             no_data_value: None,
             profile: EncoderProfile::Compact,
+            error_bound: ErrorBound::Checked,
         }
     }
 
@@ -84,6 +116,13 @@ impl EncodeOptions {
     /// Selects the encoder profile. See [`EncoderProfile`].
     pub const fn with_profile(mut self, profile: EncoderProfile) -> Self {
         self.profile = profile;
+        self
+    }
+
+    /// Selects whether reconstructed values are checked against
+    /// `max_z_error`. See [`ErrorBound`].
+    pub const fn with_error_bound(mut self, error_bound: ErrorBound) -> Self {
+        self.error_bound = error_bound;
         self
     }
 
@@ -117,6 +156,11 @@ pub(super) fn validate(options: EncodeOptions) -> Result<()> {
     {
         return Err(Error::InvalidArgument(
             "no_data_value must be finite when provided",
+        ));
+    }
+    if options.error_bound == ErrorBound::Unchecked && options.profile != EncoderProfile::Gdal {
+        return Err(Error::InvalidArgument(
+            "ErrorBound::Unchecked requires the GDAL encoder profile",
         ));
     }
     if options.profile == EncoderProfile::Gdal {

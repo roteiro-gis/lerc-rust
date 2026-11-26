@@ -966,4 +966,118 @@ fn raised_grid_fallbacks_decode_with_liblerc() {
             &blob,
         );
     }
+
+    // Without the reconstruction check, the GDAL profile writes libLerc's
+    // blob, which keeps the raised grid in every block, and decodes with
+    // libLerc's error: up to one ulp of the magnitude past the request.
+    for exponent in [43, 47] {
+        let pixels: Vec<f64> = (0..32 * 16)
+            .map(|i| {
+                let step = if (i % 32) / 8 % 2 == 0 { 0.1 } else { 1.0 };
+                2f64.powi(exponent) + (i % 31) as f64 * step
+            })
+            .collect();
+        let blob = lerc_writer::encode(
+            lerc_core::RasterView::new(32, 16, 1, &pixels).unwrap(),
+            None,
+            lerc_writer::EncodeOptions::new()
+                .with_max_z_error(0.001)
+                .with_profile(lerc_writer::EncoderProfile::Gdal)
+                .with_error_bound(lerc_writer::ErrorBound::Unchecked),
+        )
+        .unwrap();
+        let reference_blob = reference::encode_with_reference(
+            &helper,
+            &pixels,
+            None,
+            reference::ReferenceEncodeOptions {
+                width: 32,
+                height: 16,
+                depth: 1,
+                max_z_error: 0.001,
+                codec_version: 4,
+                no_data_value: None,
+            },
+        );
+        assert!(
+            blob == reference_blob,
+            "2^{exponent}: {} bytes vs libLerc {}",
+            blob.len(),
+            reference_blob.len()
+        );
+    }
+}
+
+/// Float64 on decimal grids next to far-off values (nodata sentinels), lossy:
+/// with `ErrorBound::Unchecked` the GDAL profile writes libLerc's blobs byte for
+/// byte; the checked bound stores some blocks raw, so its blobs differ.
+#[test]
+fn gdal_profile_unchecked_error_bound_matches_liblerc_bytes() {
+    let Some(helper) = reference::helper_path() else {
+        eprintln!("skipping libLerc parity test because LERC_READER_REFERENCE_HELPER is unset");
+        return;
+    };
+    let (width, height) = (300usize, 200usize);
+    let (mut cases, mut checked_differs) = (0usize, 0usize);
+    for grid in [0.01, 0.001] {
+        for sentinel in [-9999.0, -32768.0, 1.0e6, -3.4e38] {
+            let values: Vec<f64> = (0..width * height)
+                .map(|i| {
+                    let (x, y) = ((i % width) as f64, (i / width) as f64);
+                    let in_hole =
+                        (40..60).contains(&(i / width)) && (50..90).contains(&(i % width));
+                    if in_hole || i / width >= height - 10 || i % 97 == 0 {
+                        sentinel
+                    } else {
+                        let v = 100.0
+                            + 0.013 * x
+                            + 0.007 * y
+                            + 2.0 * (x / 17.0).sin() * (y / 23.0).cos();
+                        (v / grid).round() * grid
+                    }
+                })
+                .collect();
+            for max_z_error in [0.001, 0.005, 0.01, 0.05, 0.1, 0.5] {
+                let raster =
+                    lerc_core::RasterView::new(width as u32, height as u32, 1, &values).unwrap();
+                let options = lerc_writer::EncodeOptions::new()
+                    .with_max_z_error(max_z_error)
+                    .with_profile(lerc_writer::EncoderProfile::Gdal);
+                let liblerc = lerc_writer::encode(
+                    raster,
+                    None,
+                    options.with_error_bound(lerc_writer::ErrorBound::Unchecked),
+                )
+                .unwrap();
+                let checked = lerc_writer::encode(raster, None, options).unwrap();
+                let reference_blob = reference::encode_with_reference(
+                    &helper,
+                    &values,
+                    None,
+                    reference::ReferenceEncodeOptions {
+                        width,
+                        height,
+                        depth: 1,
+                        max_z_error,
+                        codec_version: 4,
+                        no_data_value: None,
+                    },
+                );
+                let name = format!("grid {grid}, sentinel {sentinel}, max_z_error {max_z_error}");
+                assert!(
+                    liblerc == reference_blob,
+                    "{name}: {} bytes vs libLerc {} bytes",
+                    liblerc.len(),
+                    reference_blob.len()
+                );
+                checked_differs += usize::from(checked != reference_blob);
+                cases += 1;
+            }
+        }
+    }
+    assert!(
+        checked_differs > 0,
+        "no case exercises the checked bound's raw fallback"
+    );
+    eprintln!("{cases} Float64 sentinel rasters identical to libLerc; the checked bound differs in {checked_differs}");
 }
