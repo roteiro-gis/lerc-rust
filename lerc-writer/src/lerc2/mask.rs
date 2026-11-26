@@ -169,7 +169,15 @@ fn encode_mask_rle(
         return Ok(Vec::new());
     };
 
-    let bitset = pack_mask_bitset(mask, pixel_count)?;
+    let mut bitset = pack_mask_bitset(mask, pixel_count)?;
+    if profile == EncoderProfile::Gdal {
+        // libLerc starts its bit mask all valid and clears the invalid pixels,
+        // so the bits past the last pixel stay set.
+        let used = pixel_count % 8;
+        if let (true, Some(last)) = (used != 0, bitset.last_mut()) {
+            *last |= 0xFF >> used;
+        }
+    }
     let mut out = Vec::new();
     let emit_segments = match profile {
         EncoderProfile::Compact => emit_mask_rle_segments,

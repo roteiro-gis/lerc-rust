@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- set the bit-mask padding bits past the last pixel in `EncoderProfile::Gdal` blobs, as libLerc does, for masked rasters whose pixel count is not a multiple of 8
+
 ## 0.5.2 - 2026-10-31
 
 - fix signed 8-bit delta-Huffman decoding so negative values wrap in the signed range instead of saturating to 127
