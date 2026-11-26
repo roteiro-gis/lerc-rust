@@ -3,6 +3,7 @@ use std::collections::BinaryHeap;
 
 use lerc_core::{DataType, Error, Result, Sample};
 
+use super::options::EncoderProfile;
 use super::{bitstuff::write_raw_block, pixel_is_valid, ByteSink, RasterAnalysis, RasterSource};
 
 #[derive(Debug, Clone)]
@@ -17,12 +18,14 @@ pub(super) struct HuffmanPlan {
 #[derive(Debug, Clone)]
 pub(super) struct HuffmanHistograms {
     alphabet: HuffmanAlphabet,
+    profile: EncoderProfile,
     plain: [u64; 256],
     delta: [u64; 256],
 }
 
 pub(super) struct HistogramBuilder {
     alphabet: HuffmanAlphabet,
+    profile: EncoderProfile,
     width: usize,
     depth: usize,
     previous_values: Vec<i32>,
@@ -75,7 +78,12 @@ impl HuffmanAlphabet {
 }
 
 impl HistogramBuilder {
-    pub(super) fn new(data_type: DataType, width: usize, depth: usize) -> Result<Option<Self>> {
+    pub(super) fn new(
+        data_type: DataType,
+        width: usize,
+        depth: usize,
+        profile: EncoderProfile,
+    ) -> Result<Option<Self>> {
         let Some(alphabet) = HuffmanAlphabet::for_data_type(data_type) else {
             return Ok(None);
         };
@@ -84,6 +92,7 @@ impl HistogramBuilder {
             .ok_or(Error::SizeOverflow("Huffman predictor row length"))?;
         Ok(Some(Self {
             alphabet,
+            profile,
             width,
             depth,
             previous_values: vec![0; depth],
@@ -136,6 +145,7 @@ impl HistogramBuilder {
     pub(super) fn finish(self) -> HuffmanHistograms {
         HuffmanHistograms {
             alphabet: self.alphabet,
+            profile: self.profile,
             plain: self.plain,
             delta: self.delta,
         }
@@ -224,8 +234,12 @@ pub(super) fn build_plan(analysis: &RasterAnalysis) -> Result<Option<HuffmanPlan
     let Some(histograms) = analysis.huffman_histograms.as_ref() else {
         return Ok(None);
     };
-    let plain = build_candidate_from_hist(&histograms.plain)?;
-    let delta = build_candidate_from_hist(&histograms.delta)?;
+    let build = |hist: &[u64; 256]| match histograms.profile {
+        EncoderProfile::Compact => build_candidate_from_hist(hist),
+        EncoderProfile::Gdal => build_liblerc_candidate(hist),
+    };
+    let plain = build(&histograms.plain)?;
+    let delta = build(&histograms.delta)?;
     let selected = match (plain, delta) {
         (Some(plain), Some(delta)) if plain.data_len <= delta.data_len => {
             Some((HuffmanMode::Plain, plain))
@@ -323,6 +337,17 @@ fn build_candidate_from_hist(hist: &[u64; 256]) -> Result<Option<HuffmanCandidat
         return Ok(None);
     };
     let table_bytes = build_table_bytes(&codes)?;
+    candidate(hist, table_bytes, codes)
+}
+
+/// The candidate's size: the code table, then the bit-stuffed codes of every
+/// sample in 32-bit words, plus the word libLerc's decode lookup table may read
+/// ahead (`Huffman::ComputeCompressedSize`).
+fn candidate(
+    hist: &[u64; 256],
+    table_bytes: Vec<u8>,
+    codes: Vec<Option<HuffmanCode>>,
+) -> Result<Option<HuffmanCandidate>> {
     let payload_bits = hist
         .iter()
         .zip(&codes)
@@ -338,19 +363,16 @@ fn build_candidate_from_hist(hist: &[u64; 256]) -> Result<Option<HuffmanCandidat
             acc.checked_add(symbol_bits)
                 .ok_or(Error::SizeOverflow("Huffman payload bit count"))
         })?;
-    let payload_data_bytes = payload_bits
+    let data_len = payload_bits
         .div_ceil(32)
         .checked_add(1)
         .and_then(|words| words.checked_mul(4))
+        .and_then(|len| len.checked_add(table_bytes.len()))
         .ok_or(Error::SizeOverflow("Huffman payload byte count"))?;
-    let payload_bytes = payload_data_bytes
-        .checked_add(table_bytes.len())
-        .ok_or(Error::SizeOverflow("Huffman payload byte count"))?;
-
     Ok(Some(HuffmanCandidate {
         table_bytes,
         codes,
-        data_len: payload_bytes,
+        data_len,
     }))
 }
 
@@ -470,10 +492,364 @@ fn build_table_bytes(codes: &[Option<HuffmanCode>]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Builds the Huffman candidate libLerc builds for `hist` (`Huffman::ComputeCodes`,
+/// `ConvertCodesToCanonical` and `WriteCodeTable` in Esri LERC 4, Apache-2.0),
+/// for the GDAL profile: the code lengths of its heap-built tree, canonical
+/// codes, the shortest wrap-around symbol range, and code table version 4.
+/// `None` where libLerc declines Huffman coding: fewer than two used symbols,
+/// or a code longer than 32 bits.
+fn build_liblerc_candidate(hist: &[u64; 256]) -> Result<Option<HuffmanCandidate>> {
+    let Some(lengths) = liblerc_code_lengths(hist)? else {
+        return Ok(None);
+    };
+    let codes = canonical_codes(&lengths);
+    let Some((first, end)) = liblerc_symbol_range(&lengths) else {
+        return Ok(None);
+    };
+    let table_bytes = build_wrapped_table_bytes(&codes, first, end)?;
+    candidate(hist, table_bytes, codes)
+}
+
+/// A node of libLerc's Huffman heap: its weight is the negated frequency, so
+/// `std::priority_queue<Node, std::vector<Node>, std::less<Node>>` pops the
+/// least frequent first.
+#[derive(Debug, Clone, Copy)]
+struct HeapNode {
+    weight: i64,
+    node: usize,
+}
+
+/// `std::priority_queue`'s heap over a vector, as libstdc++ and the MSVC STL
+/// implement `push_heap` and `pop_heap`. Equal weights leave the heap in the
+/// order these algorithms produce, which decides the code lengths of
+/// equally frequent symbols; other standard libraries may order ties otherwise.
+struct StdHeap {
+    nodes: Vec<HeapNode>,
+}
+
+impl StdHeap {
+    fn less(a: HeapNode, b: HeapNode) -> bool {
+        a.weight < b.weight
+    }
+
+    /// Moves `value` up from `hole` (`std::__push_heap`).
+    fn sift_up(&mut self, mut hole: usize, value: HeapNode) {
+        while hole > 0 {
+            let parent = (hole - 1) / 2;
+            if !Self::less(self.nodes[parent], value) {
+                break;
+            }
+            self.nodes[hole] = self.nodes[parent];
+            hole = parent;
+        }
+        self.nodes[hole] = value;
+    }
+
+    fn push(&mut self, value: HeapNode) {
+        self.nodes.push(value);
+        let hole = self.nodes.len() - 1;
+        self.sift_up(hole, value);
+    }
+
+    /// Removes the top (`std::pop_heap` then `pop_back`): the hole at the top
+    /// moves down to a leaf along the larger children, and the last element
+    /// moves up from there (`std::__adjust_heap`).
+    fn pop(&mut self) -> Option<HeapNode> {
+        let top = *self.nodes.first()?;
+        let value = self.nodes.pop()?;
+        let len = self.nodes.len();
+        if len == 0 {
+            return Some(top);
+        }
+        let mut hole = 0usize;
+        let mut child = 0usize;
+        while child < (len - 1) / 2 {
+            child = 2 * (child + 1);
+            if Self::less(self.nodes[child], self.nodes[child - 1]) {
+                child -= 1;
+            }
+            self.nodes[hole] = self.nodes[child];
+            hole = child;
+        }
+        if len % 2 == 0 && child == (len - 2) / 2 {
+            child = 2 * (child + 1);
+            self.nodes[hole] = self.nodes[child - 1];
+            hole = child - 1;
+        }
+        self.sift_up(hole, value);
+        Some(top)
+    }
+}
+
+/// A node of libLerc's Huffman tree: a symbol, or child 0 and child 1.
+enum TreeNode {
+    Leaf(u16),
+    Pair(usize, usize),
+}
+
+/// The code length of each symbol of libLerc's Huffman tree for `hist`, or
+/// `None` where libLerc gives up (fewer than two used symbols, or a code
+/// longer than 32 bits).
+///
+/// Counts are `u64` and weights `i64`; libLerc's are `int`, so above about
+/// 2^31 samples in one histogram libLerc's arithmetic overflows and the two
+/// can differ. Lerc2 tiles never get there.
+fn liblerc_code_lengths(hist: &[u64; 256]) -> Result<Option<[u8; 256]>> {
+    let mut tree: Vec<TreeNode> = Vec::with_capacity(511);
+    let mut heap = StdHeap {
+        nodes: Vec::with_capacity(256),
+    };
+    for (symbol, &count) in hist.iter().enumerate() {
+        if count > 0 {
+            let weight = i64::try_from(count)
+                .map_err(|_| Error::SizeOverflow("Huffman symbol frequency as i64"))?;
+            tree.push(TreeNode::Leaf(symbol as u16));
+            heap.push(HeapNode {
+                weight: -weight,
+                node: tree.len() - 1,
+            });
+        }
+    }
+    if heap.nodes.len() < 2 {
+        return Ok(None);
+    }
+    while heap.nodes.len() > 1 {
+        let (Some(child0), Some(child1)) = (heap.pop(), heap.pop()) else {
+            return Err(Error::Internal("Huffman heap lost a node"));
+        };
+        let weight = child0
+            .weight
+            .checked_add(child1.weight)
+            .ok_or(Error::SizeOverflow("Huffman tree weight"))?;
+        tree.push(TreeNode::Pair(child0.node, child1.node));
+        heap.push(HeapNode {
+            weight,
+            node: tree.len() - 1,
+        });
+    }
+    let root = heap
+        .pop()
+        .ok_or(Error::Internal("Huffman heap lost its root"))?
+        .node;
+    let mut lengths = [0u8; 256];
+    let mut stack = vec![(root, 0u8)];
+    while let Some((node, depth)) = stack.pop() {
+        match tree.get(node) {
+            Some(TreeNode::Leaf(symbol)) => lengths[*symbol as usize] = depth,
+            Some(TreeNode::Pair(child0, child1)) => {
+                // libLerc's `TreeToLUT` refuses codes longer than 32 bits.
+                if depth == 32 {
+                    return Ok(None);
+                }
+                stack.push((*child1, depth + 1));
+                stack.push((*child0, depth + 1));
+            }
+            None => return Err(Error::Internal("Huffman tree node is out of bounds")),
+        }
+    }
+    Ok(Some(lengths))
+}
+
+/// libLerc's canonical codes for `lengths` (`ConvertCodesToCanonical`):
+/// symbols ordered by decreasing code length, then increasing symbol, the
+/// longest code being 0.
+fn canonical_codes(lengths: &[u8; 256]) -> Vec<Option<HuffmanCode>> {
+    let mut order: Vec<usize> = (0..lengths.len()).filter(|&s| lengths[s] > 0).collect();
+    order.sort_unstable_by(|&a, &b| lengths[b].cmp(&lengths[a]).then(a.cmp(&b)));
+    let mut codes = vec![None; lengths.len()];
+    let Some(&longest) = order.first() else {
+        return codes;
+    };
+    let mut bit_len = lengths[longest];
+    let mut code = 0u32;
+    for symbol in order {
+        let delta = bit_len - lengths[symbol];
+        // `bit_len` is at most 32, so a shift of 32 empties the code as
+        // libLerc's 32-bit shift would.
+        code = code.checked_shr(u32::from(delta)).unwrap_or(0);
+        bit_len -= delta;
+        codes[symbol] = Some(HuffmanCode {
+            bit_len,
+            bits: code,
+        });
+        code = code.wrapping_add(1);
+    }
+    codes
+}
+
+/// The symbol range libLerc's code table covers (`Huffman::GetRange`): from
+/// the first to the last used symbol, or, when shorter, the range that wraps
+/// around the end of the alphabet past its longest run of unused symbols.
+/// `end` may exceed the alphabet size; symbols wrap modulo it.
+fn liblerc_symbol_range(lengths: &[u8; 256]) -> Option<(usize, usize)> {
+    let size = lengths.len();
+    let first = lengths.iter().position(|&len| len > 0)?;
+    let last = lengths.iter().rposition(|&len| len > 0)?;
+    let (mut start, mut end) = (first, last + 1);
+    let (mut gap_start, mut gap_len) = (0usize, 0usize);
+    let mut j = 0usize;
+    while j < size {
+        while j < size && lengths[j] > 0 {
+            j += 1;
+        }
+        let k0 = j;
+        while j < size && lengths[j] == 0 {
+            j += 1;
+        }
+        if j - k0 > gap_len {
+            (gap_start, gap_len) = (k0, j - k0);
+        }
+    }
+    if size - gap_len < end - start {
+        start = gap_start + gap_len;
+        end = gap_start + size;
+    }
+    (start < end).then_some((start, end))
+}
+
+/// libLerc's code table (`Huffman::WriteCodeTable`): version 4, the alphabet
+/// size, the symbol range `[start, end)` wrapping modulo the size, the code
+/// lengths over the range, bit-stuffed, then the codes.
+fn build_wrapped_table_bytes(
+    codes: &[Option<HuffmanCode>],
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>> {
+    let size = codes.len();
+    let symbol = |i: usize| if i < size { i } else { i - size };
+    let code_lengths: Vec<u32> = (start..end)
+        .map(|i| codes[symbol(i)].map_or(0, |code| u32::from(code.bit_len)))
+        .collect();
+    let as_i32 = |value: usize| {
+        i32::try_from(value).map_err(|_| Error::SizeOverflow("Huffman code table field"))
+    };
+    let mut out = Vec::new();
+    out.extend_from_slice(&4i32.to_le_bytes());
+    out.extend_from_slice(&as_i32(size)?.to_le_bytes());
+    out.extend_from_slice(&as_i32(start)?.to_le_bytes());
+    out.extend_from_slice(&as_i32(end)?.to_le_bytes());
+    write_raw_block(&mut out, &code_lengths)?;
+
+    let mut writer = MsbBitWriter::default();
+    for code in (start..end).filter_map(|i| codes[symbol(i)]) {
+        writer.push_bits(code.bits, code.bit_len);
+    }
+    out.extend_from_slice(&writer.into_aligned_bytes());
+    Ok(out)
+}
+
 fn words_to_le_bytes(words: &[u32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(words.len() * 4);
     for &word in words {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fibonacci_histogram(symbols: usize) -> [u64; 256] {
+        let mut hist = [0u64; 256];
+        let (mut a, mut b) = (1u64, 1u64);
+        for slot in hist.iter_mut().take(symbols) {
+            *slot = a;
+            (a, b) = (b, a + b);
+        }
+        hist
+    }
+
+    #[test]
+    fn liblerc_codes_stop_at_32_bits() {
+        let lengths = liblerc_code_lengths(&fibonacci_histogram(33))
+            .unwrap()
+            .unwrap();
+        assert_eq!(lengths.iter().copied().max(), Some(32));
+        assert_eq!(
+            liblerc_code_lengths(&fibonacci_histogram(34)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn liblerc_declines_a_single_symbol() {
+        let mut hist = [0u64; 256];
+        hist[9] = 100;
+        assert_eq!(liblerc_code_lengths(&hist).unwrap(), None);
+        assert!(build_liblerc_candidate(&hist).unwrap().is_none());
+    }
+
+    #[test]
+    fn canonical_codes_order_by_length_then_symbol() {
+        let mut lengths = [0u8; 256];
+        lengths[3] = 1;
+        lengths[1] = 2;
+        lengths[7] = 3;
+        lengths[200] = 3;
+        let codes = canonical_codes(&lengths);
+        let code = |s: usize| codes[s].map(|c| (c.bit_len, c.bits));
+        // Longest first, from 0: 7 -> 000, 200 -> 001; then 1 -> 01, 3 -> 1.
+        assert_eq!(code(7), Some((3, 0b000)));
+        assert_eq!(code(200), Some((3, 0b001)));
+        assert_eq!(code(1), Some((2, 0b01)));
+        assert_eq!(code(3), Some((1, 0b1)));
+    }
+
+    #[test]
+    fn liblerc_range_wraps_past_the_longest_gap() {
+        let mut lengths = [0u8; 256];
+        for symbol in [254, 255, 0, 1, 2] {
+            lengths[symbol] = 3;
+        }
+        assert_eq!(liblerc_symbol_range(&lengths), Some((254, 259)));
+        let mut lengths = [0u8; 256];
+        lengths[10] = 1;
+        lengths[20] = 1;
+        assert_eq!(liblerc_symbol_range(&lengths), Some((10, 21)));
+        assert_eq!(liblerc_symbol_range(&[0u8; 256]), None);
+    }
+
+    /// The tied frequencies of `liblerc-v4-u8-huffman-ties.lerc2`. libLerc
+    /// 4.2.0 and rasterio 1.5.2's libLerc (both MSVC STL) write these lengths;
+    /// libc++'s pop order would give symbols 0 and 18 lengths 3 and 2.
+    #[test]
+    fn liblerc_code_lengths_pin_the_tie_order() {
+        let counts = [320u64, 120, 320, 320, 320, 240, 40, 160, 80];
+        let mut hist = [0u64; 256];
+        for (i, &count) in counts.iter().enumerate() {
+            hist[i * 9] = count;
+        }
+        let lengths = liblerc_code_lengths(&hist).unwrap().unwrap();
+        let used: Vec<u8> = (0..counts.len()).map(|i| lengths[i * 9]).collect();
+        assert_eq!(used, [2, 4, 3, 3, 3, 3, 5, 3, 5]);
+    }
+
+    /// Equal weights leave the heap in libstdc++'s and the MSVC STL's order.
+    #[test]
+    fn std_heap_pops_ties_in_std_order() {
+        let mut heap = StdHeap { nodes: Vec::new() };
+        for node in 0..7 {
+            heap.push(HeapNode { weight: -1, node });
+        }
+        let mut order = Vec::new();
+        while let Some(top) = heap.pop() {
+            order.push(top.node);
+        }
+        // libc++'s pop order would be [0, 1, 3, 6, 5, 4, 2].
+        assert_eq!(order, [0, 2, 5, 6, 4, 1, 3]);
+    }
+
+    #[test]
+    fn std_heap_pops_in_weight_order() {
+        let mut heap = StdHeap { nodes: Vec::new() };
+        for (node, weight) in [-5i64, -1, -3, -1, -2, -8, -1].into_iter().enumerate() {
+            heap.push(HeapNode { weight, node });
+        }
+        let mut weights = Vec::new();
+        while let Some(top) = heap.pop() {
+            weights.push(top.weight);
+        }
+        assert_eq!(weights, [-1, -1, -1, -2, -3, -5, -8]);
+    }
 }

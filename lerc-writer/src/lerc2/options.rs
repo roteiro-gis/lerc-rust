@@ -33,9 +33,17 @@ pub enum EncoderProfile {
     /// GDAL encodes through libLerc's codec v4, and this profile makes the
     /// same choices: the error-bound raise for decimal-grid data, block
     /// offsets, constant/raw/simple/lookup-table block modes with libLerc's
-    /// lookup-table trigger, the doubled micro-block retry, and the Huffman
-    /// and one-sweep fallbacks. The output decodes to the same values as
-    /// GDAL's and, for the cases covered by the test suite, is byte-identical.
+    /// lookup-table trigger, the doubled micro-block retry, the one-sweep
+    /// fallback, libLerc's Huffman tables for lossless 8-bit data (code
+    /// lengths from its heap, canonical codes, wrap-around symbol ranges, code
+    /// table version 4), and its bit-mask padding. The output decodes to the
+    /// same values as GDAL's and, for the cases covered by the test suite, is
+    /// byte-identical, with these exceptions. Huffman code lengths of equally
+    /// frequent symbols follow `std::priority_queue` as libstdc++ and the MSVC
+    /// STL implement it; libc++ breaks ties otherwise. A Huffman blob's last 4
+    /// bytes, which libLerc reserves for its decoder's read-ahead without
+    /// writing them, are zeros here, as libLerc 4.1.0 and later leave them;
+    /// libLerc 4.0.x leaves whatever the output buffer held.
     ///
     /// The profile always writes Lerc2 v4 with 8x8 base micro-blocks and
     /// rejects `no_data_value`, which v4 cannot store. A block whose
