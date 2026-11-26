@@ -22,12 +22,17 @@ pub fn fixture(manifest_dir: &str, relative_path: &str) -> PathBuf {
 }
 
 pub fn write_temp_bytes(prefix: &str, extension: &str, bytes: &[u8]) -> PathBuf {
+    // Parallel tests and processes can read the same clock tick (100 ns on
+    // Windows): the process id and a per-process counter keep names unique.
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let mut path = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    path.push(format!("{prefix}-{nanos}.{extension}"));
+    let pid = std::process::id();
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.push(format!("{prefix}-{pid}-{count}-{nanos}.{extension}"));
     std::fs::write(&path, bytes).unwrap();
     path
 }

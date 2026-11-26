@@ -554,7 +554,8 @@ fn assert_gdal_profile_matches<T>(
     mask: Option<&[u8]>,
     (width, height, depth): (usize, usize, usize),
     max_z_error: f64,
-) where
+) -> Vec<u8>
+where
     T: lerc_core::Sample + reference::SampleBytes,
 {
     let raster =
@@ -582,17 +583,6 @@ fn assert_gdal_profile_matches<T>(
             no_data_value: None,
         },
     );
-    // libLerc Huffman-codes lossless 8-bit data. Its code lengths depend on
-    // how the C++ standard library's heap breaks frequency ties, so only the
-    // decoded values are compared there.
-    let huffman_candidate = T::DATA_TYPE.byte_len() == 1 && max_z_error < 1.0;
-    if huffman_candidate {
-        let ours = lerc_reader::decode(&blob).unwrap();
-        let theirs = lerc_reader::decode(&reference_blob).unwrap();
-        assert_eq!(ours.pixels, theirs.pixels, "{name}: decoded values differ");
-        assert_eq!(ours.mask, theirs.mask, "{name}: decoded masks differ");
-        return;
-    }
     if blob != reference_blob {
         let first_difference = blob
             .iter()
@@ -607,6 +597,7 @@ fn assert_gdal_profile_matches<T>(
             reference_blob.len()
         );
     }
+    blob
 }
 
 fn gdal_profile_type_matrix<T>(helper: &std::path::Path, name: &str, errors: &[f64])
@@ -744,6 +735,203 @@ fn gdal_profile_matches_liblerc_bytes() {
             surface.mask.as_deref(),
             (surface.width, surface.height, 1),
             surface.max_z_error,
+        );
+    }
+}
+
+/// How a Lerc2 v4 blob of 8-bit samples codes its pixels: `None` for a
+/// constant or empty blob, else libLerc's image encode mode (0 tiles,
+/// 1 delta Huffman, 2 Huffman), or 3 for one-sweep storage.
+fn eight_bit_encode_mode(blob: &[u8]) -> Option<u8> {
+    let int = |offset: usize| i32::from_le_bytes(blob[offset..offset + 4].try_into().unwrap());
+    let double = |offset: usize| f64::from_le_bytes(blob[offset..offset + 8].try_into().unwrap());
+    assert_eq!(int(6), 4, "Lerc2 v4");
+    let depth = int(22) as usize;
+    if int(26) == 0 || double(50) == double(58) {
+        return None;
+    }
+    let pos = 70 + int(66) as usize;
+    let pos = if blob.len() > pos + 2 * depth {
+        pos + 2 * depth
+    } else {
+        return None;
+    };
+    if blob[pos] != 0 {
+        return Some(3);
+    }
+    Some(blob[pos + 1])
+}
+
+/// A deterministic xorshift32 stream.
+struct Xorshift(u32);
+
+impl Xorshift {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        self.0
+    }
+}
+
+/// Lossless 8-bit rasters, where libLerc tries Huffman coding: the GDAL
+/// profile writes libLerc's blobs byte for byte, Huffman tables included
+/// (code lengths from libLerc's heap, canonical codes, wrap-around ranges,
+/// table version 4), and declines Huffman where libLerc does.
+#[test]
+fn gdal_profile_huffman_matches_liblerc_bytes() {
+    let Some(helper) = reference::helper_path() else {
+        eprintln!("skipping libLerc parity test because LERC_READER_REFERENCE_HELPER is unset");
+        return;
+    };
+    let sizes = [
+        (1usize, 1usize),
+        (2, 1),
+        (3, 5),
+        (8, 8),
+        (16, 16),
+        (31, 17),
+        (64, 48),
+        (127, 129),
+        (300, 200),
+        (512, 512),
+    ];
+    // Value generators over (column, row, band, random): every symbol, a few
+    // symbols, smooth surfaces, and values around both ends of the range.
+    type Generator = fn(usize, usize, usize, u32) -> i32;
+    let generators: [(&str, Generator); 14] = [
+        ("uniform", |_, _, _, r| (r % 256) as i32),
+        ("two symbols", |_, _, _, r| if r % 3 == 0 { 7 } else { 9 }),
+        (
+            "two symbols equal",
+            |_, _, _, r| if r % 2 == 0 { 7 } else { 200 },
+        ),
+        ("three symbols", |_, _, _, r| [3, 4, 250][(r % 3) as usize]),
+        ("five symbols", |_, _, _, r| (r % 5) as i32 * 11),
+        ("seventeen symbols", |_, _, _, r| (r % 17) as i32 + 100),
+        ("half the symbols", |_, _, _, r| (r % 128) as i32 * 2),
+        ("geometric", |_, _, _, r| {
+            (r | 1).trailing_zeros() as i32 * 9
+        }),
+        ("gradient", |c, rw, b, _| {
+            ((3 * c + 2 * rw + 5 * b) % 256) as i32
+        }),
+        ("gradient with noise", |c, rw, b, r| {
+            ((3 * c + 2 * rw + 5 * b) as u32 + r % 5) as i32 % 256
+        }),
+        (
+            "alternating",
+            |c, rw, _, _| if (c + rw) % 2 == 0 { 40 } else { 41 },
+        ),
+        ("around 0", |c, rw, _, r| {
+            (256 + (c as i32 % 7) - 3 + (r % 3) as i32 - (rw as i32 % 2)) % 256
+        }),
+        ("around 128", |c, _, _, r| {
+            125 + (c as i32 % 4) + (r % 3) as i32
+        }),
+        ("constant rows", |_, rw, _, _| (rw * 37 % 256) as i32),
+    ];
+    type MaskRule = fn(usize, usize, u32) -> bool;
+    let masks: [(&str, MaskRule); 4] = [
+        ("all valid", |_, _, _| true),
+        ("half", |_, _, r| r % 2 == 0),
+        ("sparse", |_, _, r| r % 19 == 0),
+        ("stripes", |c, rw, _| (c / 3 + rw) % 4 != 0),
+    ];
+    let (mut cases, mut huffman) = (0usize, 0usize);
+    for &(width, height) in &sizes {
+        for depth in [1usize, 3] {
+            if depth == 3 && width * height > 300 * 200 {
+                continue;
+            }
+            for (generator_index, (generator_name, generator)) in generators.iter().enumerate() {
+                for (mask_index, (mask_name, mask_fn)) in masks.iter().enumerate() {
+                    if mask_index > 0 && generator_index % 3 != mask_index % 3 {
+                        continue;
+                    }
+                    let mut random =
+                        Xorshift(0x9e37_79b9 ^ (width * 31 + height * 7 + depth) as u32);
+                    let pixel_count = width * height;
+                    let mask: Vec<u8> = (0..pixel_count)
+                        .map(|p| u8::from(mask_fn(p % width, p / width, random.next())))
+                        .collect();
+                    let values: Vec<i32> = (0..pixel_count * depth)
+                        .map(|i| {
+                            let pixel = i / depth;
+                            generator(pixel % width, pixel / width, i % depth, random.next())
+                        })
+                        .collect();
+                    let mask = (mask_index > 0).then_some(mask);
+                    let name =
+                        format!("{generator_name}, {mask_name}, {width} x {height} x {depth}");
+                    let unsigned: Vec<u8> = values.iter().map(|&v| v as u8).collect();
+                    let signed: Vec<i8> = values.iter().map(|&v| (v - 128) as i8).collect();
+                    for max_z_error in [0.0, 0.5] {
+                        let shape = (width, height, depth);
+                        let blob = assert_gdal_profile_matches(
+                            &helper,
+                            &format!("u8 {name}"),
+                            &unsigned,
+                            mask.as_deref(),
+                            shape,
+                            max_z_error,
+                        );
+                        huffman += usize::from(matches!(eight_bit_encode_mode(&blob), Some(1 | 2)));
+                        let blob = assert_gdal_profile_matches(
+                            &helper,
+                            &format!("i8 {name}"),
+                            &signed,
+                            mask.as_deref(),
+                            shape,
+                            max_z_error,
+                        );
+                        huffman += usize::from(matches!(eight_bit_encode_mode(&blob), Some(1 | 2)));
+                        cases += 2;
+                    }
+                }
+            }
+        }
+    }
+    // A large share of the cases are Huffman-coded, so the comparison above
+    // covers the tables; in the others libLerc declines Huffman, and so must the
+    // profile.
+    assert!(
+        huffman * 3 > cases,
+        "{huffman} of {cases} blobs Huffman-coded"
+    );
+    eprintln!(
+        "{huffman} of {cases} lossless 8-bit blobs Huffman-coded, all identical to libLerc's"
+    );
+
+    // Fibonacci frequencies give the longest codes: 33 symbols reach libLerc's
+    // 32-bit limit, and 34 exceed it, where libLerc gives up on that histogram.
+    for symbols in [33usize, 34] {
+        let mut counts = vec![1u64, 1];
+        while counts.len() < symbols {
+            counts.push(counts[counts.len() - 1] + counts[counts.len() - 2]);
+        }
+        let total = counts.iter().sum::<u64>() as usize;
+        let width = 4096usize;
+        let height = total.div_ceil(width);
+        let mut values: Vec<u8> = counts
+            .iter()
+            .enumerate()
+            .flat_map(|(symbol, &count)| std::iter::repeat((symbol * 7) as u8).take(count as usize))
+            .collect();
+        // Pad with the most frequent symbol, then shuffle, so that the plain
+        // histogram keeps its Fibonacci shape and deltas do not dominate.
+        values.resize(width * height, ((symbols - 1) * 7) as u8);
+        let mut random = Xorshift(0x1234_5678);
+        for i in (1..values.len()).rev() {
+            values.swap(i, random.next() as usize % (i + 1));
+        }
+        assert_gdal_profile_matches(
+            &helper,
+            &format!("Fibonacci {symbols}"),
+            &values,
+            None,
+            (width, height, 1),
+            0.0,
         );
     }
 }

@@ -258,7 +258,7 @@ fn prepare_raster<'a, T: Sample, R: RasterSource<T>>(
         .as_ref()
         .is_some_and(FinishedStatistics::uses_constant_body);
     let mut huffman_histograms = if !skip_tiling && encoded_no_data_value == input_no_data_value {
-        HistogramBuilder::new(data_type, raster.width() as usize, depth)?
+        HistogramBuilder::new(data_type, raster.width() as usize, depth, options.profile)?
     } else {
         None
     };

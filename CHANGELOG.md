@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- make `EncoderProfile::Gdal` write libLerc's Huffman blobs for lossless 8-bit rasters byte for byte: code lengths from libLerc's heap (as libstdc++ and the MSVC STL order ties), canonical codes, the wrap-around symbol range and code table version 4, and no Huffman coding where libLerc declines it (one used symbol, or codes longer than 32 bits); `EncoderProfile::Compact` output is unchanged
+- set the bit-mask padding bits past the last pixel in `EncoderProfile::Gdal` blobs, as libLerc does, for masked rasters whose pixel count is not a multiple of 8
+
 ## 0.5.2 - 2026-10-31
 
 - fix signed 8-bit delta-Huffman decoding so negative values wrap in the signed range instead of saturating to 127
